@@ -1,0 +1,308 @@
+/* 확장 도구 버튼: 엔트리 "모양 가져오기 · 저장하기" 묶음 왼쪽에 같은 모양으로 둔다.
+   자리가 모자라면 "도구 ▾" 하나로 접고 누르면 아래로 펼친다. */
+#entryPainter .evr-tools { float: left; position: relative; padding-top: 4px; }
+#entryPainter .evr-tools-list { display: flex; gap: 8px; }
+#entryPainter .evr-tool, #entryPainter .evr-tools-more {
+  display: inline-flex; align-items: center; box-sizing: border-box; height: 32px; margin: 0;
+  padding: 0 12px; border: 1px solid #e2e2e2; border-radius: 4px; background: #fff; color: #555;
+  font-family: NanumGothicOTF, NanumGothic, sans-serif; font-size: 14px; font-weight: 700;
+  letter-spacing: -0.3px; white-space: nowrap; cursor: pointer;
+}
+#entryPainter .evr-tool[aria-pressed="true"] { border-color: #4f80ff; background: #4f80ff; color: #fff; }
+#entryPainter .evr-tool:disabled { opacity: .5; cursor: wait; }
+#entryPainter .evr-tools-more { display: none; }
+#entryPainter .evr-tools[data-compact="true"] .evr-tools-more { display: inline-flex; }
+#entryPainter .evr-tools[data-compact="true"]:has(.evr-tool[aria-pressed="true"]) .evr-tools-more {
+  border-color: #4f80ff; color: #4f80ff;
+}
+#entryPainter .evr-tools[data-compact="true"] .evr-tools-list {
+  display: none; position: absolute; top: 40px; right: 0; z-index: 110; flex-direction: column;
+  gap: 4px; padding: 6px; border: 1px solid #e2e2e2; border-radius: 6px; background: #fff;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .15);
+}
+#entryPainter .evr-tools[data-compact="true"][data-open="true"] .evr-tools-list { display: flex; }
+#entryPainter .evr-overlay { position: absolute; z-index: 99; overflow: visible; touch-action: none; }
+#entryPainter .evr-costume-onion-overlay {
+  position: absolute; z-index: 98; overflow: visible; pointer-events: none;
+}
+#entryPainter .evr-costume-onion-overlay[hidden] { display: none; }
+#entryPainter .evr-costume-onion-overlay image[data-side="previous"] {
+  filter: sepia(1) saturate(4) hue-rotate(-25deg);
+}
+#entryPainter .evr-costume-onion-overlay image[data-side="next"] {
+  filter: sepia(1) saturate(3) hue-rotate(140deg);
+}
+/* 기준 모양(고정): 앞(빨강)·뒤(파랑)와 구별되게 주황 */
+#entryPainter .evr-costume-onion-overlay image[data-side="pinned"] {
+  filter: sepia(1) saturate(6) hue-rotate(5deg) brightness(1.05);
+}
+/* 뼈대 모드: 엔트리 "비트맵 | 벡터" 버튼과 같은 규격으로 묶음 바로 뒤에 붙여 세 번째 칸처럼 보이게 한다.
+   묶음 안에는 넣지 않는다(다른 확장이 사이에 끼면 따로 선 버튼 모양으로 돌아감). */
+#entryPainter .evr-mode-wrap { float: left; padding-top: 4px; margin-right: 8px; }
+#entryPainter .modeSpace + .evr-mode-wrap { margin-left: -8px; }
+#entryPainter .evr-bone-mode {
+  display: inline-flex; align-items: center; box-sizing: border-box; height: 32px; margin: 0;
+  padding: 0 10px; border: 1px solid #4f80ff; border-radius: 4px; background: #fff;
+  color: #4f80ff; font-family: inherit; font-size: 14px; letter-spacing: normal;
+  vertical-align: top; cursor: pointer;
+}
+#entryPainter .modeSpace + .evr-mode-wrap .evr-bone-mode { border-left-width: 0; border-radius: 0 4px 4px 0; }
+#entryPainter .modeSpace:has(+ .evr-mode-wrap) > button:last-of-type {
+  border-top-right-radius: 0; border-bottom-right-radius: 0;
+}
+#entryPainter .evr-bone-mode svg { flex: none; fill: currentColor; stroke: currentColor; }
+#entryPainter .evr-bone-mode span { margin-left: 7px; line-height: 32px; }
+/* 위 막대 자리가 모자라면(rig.js fitTools) 글자를 숨기고 아이콘만 둔다. */
+#entryPainter .evr-mode-wrap[data-narrow="true"] .evr-bone-mode span { display: none; }
+#entryPainter .evr-bone-mode[aria-pressed="true"] { background: #4f80ff; color: #fff; }
+#entryPainter .evr-bone-mode:disabled { opacity: .45; cursor: default; }
+/* 뼈대 모드가 켜져 있는 동안 "벡터" 칸은 꺼진 색으로 보여 세 칸 중 하나만 켜진 것처럼 한다. */
+#entryPainter:has(.evr-bone-mode[aria-pressed="true"]) .modeSpace > button,
+#entryPainter:has(.evr-bone-mode[aria-pressed="true"]) .modeSpace > button .label {
+  background-color: #fff !important; color: #4f80ff !important;
+}
+#entryPainter:has(.evr-bone-mode[aria-pressed="true"]) .modeSpace > button svg { fill: #4f80ff !important; }
+#entryPainter .evr-rig-surface { fill: transparent; cursor: crosshair; }
+#entryPainter .evr-overlay[data-cursor="pick"] .evr-rig-surface { cursor: pointer; }
+#entryPainter .evr-rig-bone { stroke-width: 4; stroke-linecap: round; pointer-events: none; opacity: .85; }
+#entryPainter .evr-rig-joint { stroke: #fff; stroke-width: 2; cursor: grab;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .35)); }
+#entryPainter .evr-rig-joint[data-selected="true"] { stroke: #222; stroke-width: 2.5; }
+#entryPainter .evr-rig-joint[data-root="true"] { cursor: move; }
+/* 고른 레이어는 실선, 누르면 고를 수 있는 레이어는 점선 테두리 */
+#entryPainter .evr-rig-piece { fill: none; stroke-width: 2; stroke-dasharray: 6 4; pointer-events: none; }
+#entryPainter .evr-rig-piece[data-kind="current"] { stroke-width: 2.5; stroke-dasharray: none; }
+#entryPainter .evr-rig-top, #entryPainter .evr-rig-layers-box {
+  position: absolute; z-index: 102; box-sizing: border-box; font: 12px/1.4 NanumGothic, HelveticaNeue, AppleSDGothicNeo-Regular, sans-serif;
+  text-align: left; letter-spacing: normal; color-scheme: light;
+  color: #2c3a4b; background: rgba(255, 255, 255, .94); border: 1px solid #d8dfe9;
+  border-radius: 8px; box-shadow: 0 2px 10px rgba(29, 53, 84, .12);
+}
+#entryPainter .evr-rig-top {
+  top: 8px; left: 8px; right: 228px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px 8px;
+}
+/* 단추 옆 자리가 좁으면(220px 미만) 안내는 다음 줄로 내려간다 */
+#entryPainter .evr-rig-hint { flex: 1 1 220px; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: #5c708c; }
+#entryPainter .evr-rig-top button {
+  flex: none; padding: 4px 9px; border: 1px solid #e2e2e2; border-radius: 4px;
+  background: #fff; color: #555; font: 700 12px/1.2 NanumGothicOTF, NanumGothic, sans-serif; cursor: pointer;
+}
+#entryPainter .evr-rig-top button:disabled {
+  opacity: .4; cursor: default;
+}
+/* 레이어 상자는 내용 높이만큼만 차지한다(넘치면 목록 안에서 스크롤). */
+#entryPainter .evr-rig-layers-box {
+  top: 8px; right: 8px; width: 212px; max-height: calc(100% - 16px); display: flex;
+  flex-direction: column; padding: 6px 8px 8px;
+}
+#entryPainter .evr-rig-layers-head {
+  display: block; width: 100%; padding: 2px 0 6px; border: 0; background: none;
+  color: inherit; font: 700 12px/1.4 NanumGothicOTF, NanumGothic, sans-serif; text-align: left; cursor: pointer;
+}
+#entryPainter .evr-rig-layers-box[data-folded="true"] { padding-bottom: 2px; }
+#entryPainter .evr-rig-layers-box[data-folded="true"] .evr-rig-layers { display: none; }
+#entryPainter .evr-rig-layers { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex;
+  flex-direction: column; gap: 3px; }
+#entryPainter .evr-rig-layers p { margin: 0; color: #6b7a8c; }
+#entryPainter .evr-rig-layer {
+  display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 6px;
+  border: 1px solid transparent; border-radius: 4px; background: #f7f9fc; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+}
+#entryPainter .evr-rig-layer:hover { border-color: #e2e2e2; }
+#entryPainter .evr-rig-layer[data-picked="true"] { border-color: #222; background: #fff; }
+#entryPainter .evr-rig-swatch { flex: none; width: 12px; height: 12px; border-radius: 50%;
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, .7); }
+#entryPainter .evr-rig-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+#entryPainter .evr-rig-bone-label { flex: none; color: #6b7a8c; font-size: 11px; }
+/* 뼈대 단계 [뼈 만들기] [자세 잡기]: 지금 단계를 늘 보이게 한다. IK도 켜짐이 보이는 단추. */
+#entryPainter .evr-rig-stage { flex: none; display: inline-flex; border: 1px solid #4f80ff; border-radius: 5px; overflow: hidden; }
+#entryPainter .evr-rig-top .evr-rig-stage button { border: 0; border-radius: 0; padding: 4px 10px; background: #fff; color: #4f80ff; }
+#entryPainter .evr-rig-top button[aria-pressed="true"] { background: #4f80ff; color: #fff; border-color: #4f80ff; }
+#entryPainter .evr-rig-top button[hidden] { display: none !important; }
+/* 뼈 만들기: 흐린 덮개 위에 고른 레이어의 휘기 전 모양 */
+#entryPainter .evr-rig-veil { fill: #fff; opacity: .78; pointer-events: none; }
+#entryPainter .evr-rig-rest { pointer-events: none; }
+#entryPainter .evr-overlay[data-stage="setup"] .evr-rig-joint { cursor: move; }
+#entryPainter .evr-rig-bone-hit { stroke: transparent; stroke-width: 14; stroke-linecap: round; pointer-events: stroke; cursor: grab; }
+#entryPainter .evr-rig-plus { cursor: copy; filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .35)); }
+#entryPainter .evr-rig-plus path { stroke: #fff; stroke-width: 2; stroke-linecap: round; fill: none; pointer-events: none; }
+#entryPainter .evr-rig-preview { stroke-width: 4; stroke-linecap: round; stroke-dasharray: 6 5; opacity: .9; pointer-events: none; }
+#entryPainter .evr-rig-preview-joint { stroke: #fff; stroke-width: 2; pointer-events: none; }
+#entryPainter .evr-pivot-overlay {
+  position: absolute; z-index: 101; overflow: visible; pointer-events: none;
+}
+#entryPainter .evr-pivot-overlay[data-adjusting="true"] { pointer-events: all; cursor: move; }
+#entryPainter .evr-center-move-surface { fill: transparent; pointer-events: none; }
+#entryPainter .evr-pivot-overlay[data-adjusting="true"] .evr-center-move-surface {
+  pointer-events: all;
+}
+#entryPainter .evr-center-cross { pointer-events: none; }
+#entryPainter .evr-center-cross line {
+  stroke: #657b98; stroke-width: 2; stroke-linecap: round;
+  paint-order: stroke; filter: drop-shadow(0 0 1px #fff);
+}
+#entryPainter .evr-center-cross circle {
+  fill: #fff; fill-opacity: .5; stroke: #657b98; stroke-width: 2;
+  filter: drop-shadow(0 0 1px #fff);
+}
+#entryPainter .evr-pivot-position { color: #5c708c; }
+
+/* 스프라이트 나누기 창 (엔트리 모양 추가하기 창처럼 화면 가운데 띄움) */
+.evr-slicer-backdrop {
+  position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center;
+  justify-content: center; background: rgba(20, 28, 40, .45); font: 13px/1.45 sans-serif;
+}
+.evr-slicer {
+  display: flex; flex-direction: column; width: min(1040px, calc(100vw - 32px));
+  height: min(680px, calc(100vh - 32px)); border-radius: 10px; background: #fff;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .3); color: #2c3a4b; overflow: hidden;
+  text-align: left; color-scheme: light; letter-spacing: normal;
+}
+/* 뒤에서 도는 작업(픽셀 아트 SVG 바꿔 끼우기) 진행 표시 */
+.evr-toast {
+  position: fixed; left: 16px; bottom: 16px; z-index: 100001; padding: 8px 12px;
+  border-radius: 6px; background: rgba(44, 58, 75, .92); color: #fff;
+  font: 13px/1.4 sans-serif; pointer-events: none;
+}
+/* 모양 편집기 화면 이동: 스페이스를 누르고 있으면 잡기 손, 끄는 동안 쥔 손(엔트리 도구 커서보다 우선) */
+#entryPainter .canvas_area.evr-pan-ready, #entryPainter .canvas_area.evr-pan-ready * { cursor: grab !important; }
+#entryPainter .canvas_area.evr-panning, #entryPainter .canvas_area.evr-panning * { cursor: grabbing !important; }
+/* 모양 그림을 불러오는 동안 편집기를 덮는다(그 사이 그리거나 저장하면 이전 모양 그림이 섞인다). */
+.evr-load-cover {
+  position: absolute; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+  background: rgba(255, 255, 255, .6); color: #2c3a4b; font: 13px/1.4 sans-serif; cursor: progress;
+}
+/* 오브젝트 추가하기 창의 "스프라이트 나누기" 탭: 탭 아래 내용 자리를 덮는다(top은 스크립트가 정함). */
+.evr-sheet-panel {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 20; display: flex;
+  box-sizing: border-box; padding: 0 16px 16px; font: 13px/1.45 sans-serif;
+}
+.evr-slicer.evr-slicer-embed {
+  width: 100%; height: 100%; border: 1px solid #e3e8ef; border-radius: 8px; box-shadow: none;
+}
+/* 엔트리 전역 스타일은 input·select·button의 모양(appearance)·배경·외곽선을 지우고, 창(popup_wrap) 안
+   button의 테두리를 0으로 만든다. 그래서 체크박스가 0×0으로 사라지고 선택 상자 화살표와 중심 버튼 테두리가
+   안 보였다. 엔트리 규칙보다 구체적이도록 .evr-slicer를 앞에 붙여 직접 그린다. */
+.evr-slicer * { box-sizing: border-box; }
+.evr-slicer input, .evr-slicer select, .evr-slicer button { font: inherit; color: #2c3a4b; }
+.evr-slicer button:focus-visible, .evr-slicer input:focus-visible, .evr-slicer select:focus-visible {
+  outline: 2px solid #4f80ff; outline-offset: 1px;
+}
+.evr-slicer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid #e3e8ef;
+}
+.evr-slicer-head h2 { margin: 0; font-size: 16px; }
+.evr-slicer .evr-slicer-x {
+  padding: 0 4px; border: 0; background: none; font-size: 22px; line-height: 1; color: #6b7a8c; cursor: pointer;
+}
+.evr-slicer-body { display: flex; flex: 1; min-height: 0; }
+/* 미리보기: 위 도구 줄, 가운데 시트(캔버스가 칸을 채우고 보이는 부분만 그림), 아래 조작 안내 */
+.evr-slicer-stage { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.evr-slicer-tools {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 8px 10px;
+  border-bottom: 1px solid #e3e8ef; background: #fff;
+}
+.evr-slicer-group { display: flex; gap: 4px; }
+.evr-slicer .evr-slicer-tool {
+  height: 28px; min-width: 28px; padding: 0 9px; border: 1px solid #c3cdd9; border-radius: 5px;
+  background: #fff; font-size: 12px; line-height: 26px; white-space: nowrap; cursor: pointer;
+}
+.evr-slicer .evr-slicer-tool:hover:not(:disabled) { border-color: #4f80ff; background: #eef3ff; }
+.evr-slicer .evr-slicer-tool:disabled { border-color: #e1e6ed; background: #f5f7fa; color: #a9b3c0; cursor: default; }
+.evr-slicer-view {
+  position: relative; flex: 1; min-height: 0; overflow: hidden; outline: none; touch-action: none;
+  background-color: #eef1f5;
+  background-image: linear-gradient(45deg, #dde2e9 25%, transparent 25%),
+    linear-gradient(-45deg, #dde2e9 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #dde2e9 75%),
+    linear-gradient(-45deg, transparent 75%, #dde2e9 75%);
+  background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+.evr-slicer-view:focus-visible { box-shadow: inset 0 0 0 2px #4f80ff; }
+.evr-slicer-view canvas { position: absolute; left: 0; top: 0; display: block; width: 100%; height: 100%; }
+.evr-slicer-hint {
+  margin: 0; padding: 6px 10px; border-top: 1px solid #e3e8ef; background: #fff; color: #6b7a8c; font-size: 12px;
+}
+.evr-slicer-side {
+  width: 270px; flex: none; overflow-y: auto; padding: 4px 14px 12px;
+  border-left: 1px solid #e3e8ef; scrollbar-width: thin; scrollbar-color: #c3cdd9 transparent;
+}
+.evr-slicer-section { padding: 10px 0; border-bottom: 1px solid #eef1f5; }
+.evr-slicer-section h3 { margin: 0 0 6px; font-size: 13px; }
+.evr-slicer-section [hidden] { display: none; }
+.evr-slicer-field {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 5px 0;
+}
+.evr-slicer .evr-slicer-field input[type="number"], .evr-slicer .evr-slicer-field input[type="text"],
+.evr-slicer .evr-slicer-field select {
+  width: 120px; height: 30px; padding: 0 8px; border: 1px solid #b9c4d2; border-radius: 4px;
+  background-color: #fff;
+}
+.evr-slicer .evr-slicer-field select {
+  width: 150px; padding-right: 26px; cursor: pointer;
+  background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%236b7a8c' stroke-width='1.6'/%3E%3C/svg%3E") no-repeat right 9px center;
+}
+.evr-slicer .evr-slicer-field input:focus, .evr-slicer .evr-slicer-field select:focus { border-color: #4f80ff; }
+/* 체크박스는 켜기·끄기 스위치로 그린다 */
+.evr-slicer input[type="checkbox"] {
+  -webkit-appearance: none; appearance: none; position: relative; flex: none; width: 36px; height: 20px;
+  margin: 0; padding: 0; border: 0; border-radius: 10px; background: #b9c4d2; cursor: pointer;
+  transition: background-color .15s;
+}
+.evr-slicer input[type="checkbox"]::before {
+  content: ''; position: absolute; left: 2px; top: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .3); transition: transform .15s;
+}
+.evr-slicer input[type="checkbox"]:checked { background: #4f80ff; }
+.evr-slicer input[type="checkbox"]:checked::before { transform: translateX(16px); }
+.evr-slicer-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.evr-slicer .evr-slicer-row button { white-space: nowrap; }
+.evr-slicer .evr-slicer-row button, .evr-slicer .evr-slicer-foot button {
+  height: 32px; padding: 0 14px; border: 1px solid #b9c4d2; border-radius: 5px; background: #fff; cursor: pointer;
+}
+.evr-slicer .evr-slicer-row button:hover, .evr-slicer .evr-slicer-foot button:hover:not(:disabled) {
+  border-color: #4f80ff; background: #eef3ff;
+}
+.evr-slicer-note { margin: 4px 0 0; color: #6b7a8c; font-size: 12px; }
+.evr-slicer-pivot { display: grid; grid-template-columns: repeat(3, 26px); gap: 4px; }
+.evr-slicer .evr-slicer-pivot button {
+  width: 26px; height: 26px; padding: 0; border: 2px solid #9aa8ba; border-radius: 50%; background: #fff;
+  cursor: pointer;
+}
+.evr-slicer .evr-slicer-pivot button:hover { border-color: #4f80ff; }
+.evr-slicer .evr-slicer-pivot button[aria-pressed="true"] {
+  border-color: #4f80ff; background: #4f80ff; box-shadow: inset 0 0 0 3px #fff;
+}
+.evr-slicer-foot {
+  display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid #e3e8ef;
+}
+.evr-slicer-status { flex: 1; color: #6b7a8c; }
+.evr-slicer .evr-slicer-foot .evr-slicer-create {
+  border-color: #4f80ff; background: #4f80ff; color: #fff; font-weight: 600;
+}
+.evr-slicer .evr-slicer-foot .evr-slicer-create:hover:not(:disabled) { border-color: #3d6ef0; background: #3d6ef0; }
+.evr-slicer .evr-slicer-foot .evr-slicer-create:disabled { opacity: .45; cursor: default; }
+/* 모양 맞추기 창: 아래 모양 띠(지금 모양 파란 테두리, 고른 모양 옅은 파랑, 기준 주황 표시, 옮긴 모양 번호 주황) */
+/* 중심 맞추기 창: 나누기 창보다 작게 */
+.evr-slicer.evr-center { width: min(760px, calc(100vw - 32px)); height: min(520px, calc(100vh - 32px)); }
+.evr-aligner-strip {
+  display: flex; flex: none; gap: 4px; overflow-x: auto; padding: 6px 10px; border-top: 1px solid #e3e8ef;
+  background: #f7f9fc; scrollbar-width: thin; scrollbar-color: #c3cdd9 transparent;
+}
+.evr-slicer .evr-aligner-frame {
+  position: relative; flex: none; width: 56px; height: 66px; padding: 0; border: 2px solid transparent;
+  border-radius: 5px; background: #fff; cursor: pointer;
+}
+.evr-aligner-frame canvas { display: block; width: 48px; height: 48px; margin: 2px auto 0; image-rendering: pixelated; }
+.evr-aligner-frame span { display: block; font-size: 10px; line-height: 12px; color: #6b7a8c; text-align: center; }
+.evr-slicer .evr-aligner-frame.is-selected { border-color: #a9c1ff; background: #eef3ff; }
+.evr-slicer .evr-aligner-frame.is-current { border-color: #4f80ff; }
+.evr-aligner-frame.is-ref::after {
+  content: '기준'; position: absolute; top: -2px; right: -2px; padding: 0 3px; border-radius: 3px;
+  background: #ff8c00; color: #fff; font-size: 9px; line-height: 13px;
+}
+.evr-aligner-frame.is-moved span { color: #e05a00; font-weight: 600; }

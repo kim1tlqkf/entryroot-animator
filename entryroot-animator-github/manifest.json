@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "엔트리루트 애니메이터",
+  "version": "1.0.0",
+  "description": "엔트리용 비공식 확장. 모양 편집기에 뼈대 변형, 모양 어니언스킨, 스프라이트 시트 나누기, 중심 맞추기를 더합니다.",
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "content_scripts": [{
+    "matches": ["https://playentry.org/ws/*"],
+    "run_at": "document_idle",
+    "world": "MAIN",
+    "js": ["vendor/IK-browser.js", "vendor/warp.js", "vendor/delaunator.min.js", "vendor/gl-matrix-min.js", "rig.js"],
+    "css": ["rig.css"]
+  }]
+}
