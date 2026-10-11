@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- 크롬 웹스토어 작은 홍보 이미지 440×280. 이름이 정해지면 .title 글을 바꿔 다시 그린다(store/render_promo.js). -->
+<style>
+  html, body { margin: 0; width: 440px; height: 280px; overflow: hidden; }
+  body { background: linear-gradient(135deg, #1b2350 0%, #283a8c 100%); font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; color: #fff; word-break: keep-all; }
+  .wrap { display: flex; align-items: center; gap: 18px; height: 100%; padding: 0 26px 0 18px; box-sizing: border-box; }
+  img { width: 150px; height: 150px; flex: none; filter: drop-shadow(0 6px 14px rgba(0, 0, 0, .35)); }
+  .title { font-size: 28px; font-weight: 800; line-height: 1.2; letter-spacing: -0.8px; }
+  .lead { margin-top: 10px; font-size: 14px; font-weight: 700; line-height: 1.4; }
+  .tags { margin-top: 6px; font-size: 12.5px; line-height: 1.5; font-weight: 600; opacity: .9; }
+  .note { margin-top: 10px; font-size: 11.5px; opacity: .75; }
+</style>
+<div class="wrap">
+  <img src="../icons/icon.svg" alt="">
+  <div>
+    <div class="title">엔트리루트<br>애니메이터</div>
+    <div class="lead">엔트리 모양에 뼈대를 넣어 움직이기</div>
+    <div class="tags">어니언스킨 · 시트 나누기 · 중심 맞추기</div>
+    <div class="note">엔트리용 비공식 확장</div>
+  </div>
+</div>

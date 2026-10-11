@@ -54,6 +54,10 @@
 #entryPainter .evr-bone-mode span { margin-left: 7px; line-height: 32px; }
 /* 위 막대 자리가 모자라면(rig.js fitTools) 글자를 숨기고 아이콘만 둔다. */
 #entryPainter .evr-mode-wrap[data-narrow="true"] .evr-bone-mode span { display: none; }
+/* 좁은 화면: 도구 목록 안의 뼈대(위쪽 뼈대 버튼이 엔트리 버튼에 가려질 때 쓰는 길) */
+#entryPainter .evr-tools .evr-bone-menu { display: none; }
+#entryPainter .evr-tools[data-bone-in-menu="true"] .evr-bone-menu { display: inline-flex; }
+#entryPainter .evr-bone-menu:disabled { opacity: .45; cursor: default; }
 #entryPainter .evr-bone-mode[aria-pressed="true"] { background: #4f80ff; color: #fff; }
 #entryPainter .evr-bone-mode:disabled { opacity: .45; cursor: default; }
 /* 뼈대 모드가 켜져 있는 동안 "벡터" 칸은 꺼진 색으로 보여 세 칸 중 하나만 켜진 것처럼 한다. */
@@ -306,3 +310,41 @@
   background: #ff8c00; color: #fff; font-size: 9px; line-height: 13px;
 }
 .evr-aligner-frame.is-moved span { color: #e05a00; font-weight: 600; }
+
+/* 벡터 붓·지우개·채우기 옵션 줄 끝: 부드럽게 · 보정(손떨림) / 영역 채우기 · 틈 막기. 엔트리 전역 규칙이 input·button 모양을 지우므로 직접 그린다. */
+/* 엔트리 옵션 줄은 inline-block 칸들이 위 맞춤으로 늘어선 한 줄(넘치면 옆으로 넘김)이라 같은 방식으로 둔다 */
+#entryPainter .evr-brush-opts {
+  display: inline-block; vertical-align: top; box-sizing: border-box; height: 72px;
+  margin-left: 12px; padding: 0 12px 0 16px; border-left: 1px solid #e2e2e2;
+  font-family: NanumGothicOTF, NanumGothic, sans-serif; font-size: 12px; color: #555; white-space: nowrap;
+}
+#entryPainter .evr-brush-title { display: block; margin: 14px 0 8px; font-size: 13px; font-weight: 700; color: #2c313d; }
+#entryPainter .evr-brush-row { display: flex; align-items: center; gap: 6px; }
+#entryPainter .evr-brush-toggle {
+  height: 26px; margin: 0; padding: 0 9px; box-sizing: border-box; border: 1px solid #e2e2e2; border-radius: 13px;
+  background: #fff; color: #555; font: inherit; font-weight: 700; cursor: pointer;
+}
+#entryPainter .evr-brush-toggle[aria-pressed="true"] { border-color: #4f80ff; background: #4f80ff; color: #fff; }
+#entryPainter .evr-brush-level { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+#entryPainter .evr-brush-level b { min-width: 1.6em; color: #4f80ff; text-align: left; }
+#entryPainter .evr-brush-opts[data-off="true"] .evr-brush-level { opacity: .4; pointer-events: none; }
+#entryPainter .evr-brush-level input[type="range"] {
+  -webkit-appearance: none; appearance: none; width: 64px; height: 18px; margin: 0; padding: 0;
+  background: transparent; cursor: pointer;
+}
+#entryPainter .evr-brush-level input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px; background: #d6deef;
+}
+#entryPainter .evr-brush-level input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 14px; height: 14px; margin-top: -5px;
+  border: 2px solid #fff; border-radius: 50%; background: #4f80ff; box-shadow: 0 0 0 1px #4f80ff;
+}
+
+/* 고른 도형 투명도: 그림 칸 왼쪽 위에 뜨는 작은 상자(선택 도구로 고른 것이 있을 때만) */
+#entryPainter .evr-opacity-opts {
+  position: absolute; left: 12px; top: 12px; z-index: 30; display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; border: 1px solid #e2e2e2; border-radius: 8px; background: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .12); font-family: NanumGothicOTF, NanumGothic, sans-serif; font-size: 12px; color: #555;
+}
+#entryPainter .evr-opacity-title { font-size: 13px; font-weight: 700; color: #2c313d; }
+#entryPainter .evr-opacity-opts .evr-brush-level b { min-width: 2.6em; }

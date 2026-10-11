@@ -4942,6 +4942,610 @@
     painterSpace = false;
     document.querySelector('#entryPainter .canvas_area')?.classList.remove('evr-pan-ready');
   });
+  // ---- 벡터 붓(엔트리 옵션 이름 "펜") 부드럽게 ----
+  // 엔트리 벡터 붓(entry-paint 260921)은 끄는 동안 찍힌 점 사이를 직선 막대+원으로 이어 붙여 합친다. 새 점은 앞 점에서
+  // 3+굵기/5만큼 떨어져야 찍히는데 이 거리가 그림 좌표라 확대할수록 화면에서 듬성해지고(1600%면 16배), 끌기 처리가
+  // throttle로 묶여 빠른 획은 점이 더 빠진다. 그래서 곡선이 꺾은선이 된다.
+  // 켜 두면 "획 모양 만들기"만 바꾼다: 브라우저가 주는 촘촘한 입력(PointerEvent.getCoalescedEvents)을 화면 좌표에서
+  // 1€ 필터(Casiez·Roussel·Vogel, CHI 2012, 저자 구현 1eurofilter)로 손떨림만 거르고, perfect-freehand getStroke로
+  // 굵기만큼 바깥선을 만든 뒤 paper.js simplify(곡선 맞춤)로 점 수를 줄인다. 누를 때 검사, 같은 색 붓 획 합치기,
+  // 되돌리기 기록은 엔트리 onMouseUp이 우리가 돌려준 모양으로 그대로 한다.
+  // 벡터 지우개도 같은 붓 조각($r)으로 지울 모양을 만든 뒤 그 모양을 그림에서 빼므로(onMouseUp: end → remove →
+  // erasePath), 같은 방식으로 지울 모양만 바꾼다. 비트맵 붓·지우개는 건드리지 않는다.
+  // 설정은 붓·지우개가 같이 쓰고 이 탭에서만 기억한다(새로 고치면 처음 값).
+  const smoothBrush = { on: true, level: 1 };
+  // 손떨림 보정 단계(0=끔)별 1€ 최소 차단 주파수(Hz, 낮을수록 많이 거름)와 빠르게 그릴 때 지연을 줄이는 beta(화면 px 기준).
+  // 저자 절차(먼저 beta=0에서 느린 떨림이 사라질 mincutoff, 그다음 빠를 때 지연이 줄게 beta)대로 모의 시험으로 골랐다:
+  // 120Hz 입력·반지름 150px 원·굵기 10에서 1단계는 느린 떨림(σ0.5px) 4.6→0.8px, 빠른 획(1200px/s) 안쪽 밀림 1.2px.
+  // 단계가 클수록 떨림은 더 거르지만 빠른 획이 더 안쪽으로 밀린다(4단계 6px). 떨림 모형은 흰 잡음이라 실제 손과는 다를 수 있다.
+  const BRUSH_MIN_CUTOFF = [0, 12, 8, 4, 2, 1];
+  const BRUSH_BETA = 0.001;
+  const BRUSH_SIMPLIFY_PX = 0.5; // 곡선 맞춤 허용 오차(화면 px). 그림 좌표로는 배율로 나눈다.
+  const BRUSH_MIN_STEP_PX = 0.5; // 이보다 가까운 입력 점은 버린다(화면 px)
+  // 점 간격 하한 = 붓 지름의 10%(래스터 붓의 "간격 = 지름의 %"와 같은 손잡이). 크게 확대해 굵은 붓이 화면을 덮을 때
+  // 점이 지름보다 훨씬 촘촘하면 작은 떨림에도 진행 방향이 크게 흔들려 바깥선이 톱니·고리가 된다(1600%·떨림 시험에서 확인).
+  const BRUSH_SPACING = 0.1;
+  // paper는 마우스 이벤트로 받는 경우가 있어 포인터 번호가 안 보인다. 같은 누르기의 포인터 이벤트를 따로 기억해 둔다.
+  let lastPointerDown = null;
+  document.addEventListener('pointerdown', event => { lastPointerDown = event; }, true);
+  function vectorTool(ep, mode) {
+    return ep?.paper?.tools?.find(tool => tool.MY_MODE?.toolMode === mode &&
+      tool.MY_MODE?.graphicsMode === 'VECTOR') || null;
+  }
+  const SMOOTH_TOOLS = { BRUSH: '부드러운 붓', ERASER: '부드러운 지우개' };
+  class SmoothStroke {
+    constructor(ep, layer, event, color, width, erase = false) {
+      this.paper = ep.paper;
+      this.view = ep.project.view;
+      this.width = width;
+      this.points = [];
+      this.last = null; // 마지막으로 받은 점(화면 px, 거른 값)
+      this.lastRaw = null; // 마지막 실제 입력(그림 좌표) — 끝점 보정용
+      this.native = false;
+      this.frame = 0;
+      const level = smoothBrush.level;
+      this.filters = level > 0 ? [0, 1].map(() =>
+        new window.oneEuroFilter.OneEuroFilter(120, BRUSH_MIN_CUTOFF[level], BRUSH_BETA)) : null;
+      const down = event.event?.pointerType ? event.event :
+        lastPointerDown && Math.abs(lastPointerDown.timeStamp - (event.event?.timeStamp ?? -1e9)) < 100 ? lastPointerDown :
+          event.event;
+      this.pointerId = down?.pointerId;
+      // 화면 → 그림 좌표 바꿈이 paper와 크게 어긋나면(캔버스 CSS 크기 조정 등) 누른 점 기준으로 맞춘다.
+      // 1.5 화면 px 미만은 맞추지 않는다: 포인터 이벤트는 소수 좌표, paper가 받는 마우스 이벤트는 정수라 그만큼은 늘 다르다.
+      const mine = down && this.toProject(down.clientX, down.clientY);
+      this.offset = mine ? event.point.subtract(mine) : null;
+      if (this.offset && this.offset.length * this.view.zoom < 1.5) this.offset = null;
+      this.path = new this.paper.Path({ fillColor: color, insert: false });
+      // 지우개: 엔트리는 끄는 동안 흰 모양만 보여 주고 놓을 때 지운다. 미리보기를 "뚫기"(destination-out)로 그려 끄는 동안
+      // 그 자리가 바로 지워져 보이게 한다. 실제 지우기(놓을 때 이 모양을 그림에서 빼기)와 되돌리기 기록은 엔트리가 그대로 한다.
+      if (erase) {
+        this.path.blendMode = 'destination-out';
+        // 그림 레이어만 따로 합성되게(불투명도 1 미만이면 paper가 레이어를 따로 그려 얹는다) 해서, 뚫기가 아래 바둑판 배경까지
+        // 뚫지 않게 한다. 놓으면 원래 값으로 돌린다.
+        this.layer = layer;
+        this.layerOpacity = layer.opacity;
+        layer.opacity = Math.min(layer.opacity, .99999);
+      }
+      layer.addChild(this.path);
+      this.onMove = e => this.capture(e);
+      this.onUp = e => { if (this.pointerId == null || e.pointerId === this.pointerId) this.stop(); };
+      document.addEventListener('pointermove', this.onMove, true);
+      document.addEventListener('pointerup', this.onUp, true);
+      document.addEventListener('pointercancel', this.onUp, true);
+      this.add(down, event.point);
+      this.schedule();
+    }
+    toProject(clientX, clientY, rect = this.view.element.getBoundingClientRect()) {
+      let point = this.view.viewToProject(new this.paper.Point(clientX - rect.left, clientY - rect.top));
+      if (this.offset) point = point.add(this.offset);
+      return point;
+    }
+    add(e, fallback, rect = this.view.element.getBoundingClientRect()) {
+      if (!e || !Number.isFinite(e.clientX)) {
+        if (fallback) this.points.push([fallback.x, fallback.y, .5]);
+        return;
+      }
+      let x = e.clientX - rect.left, y = e.clientY - rect.top;
+      this.lastRaw = this.toProject(e.clientX, e.clientY, rect);
+      // 실제 입력이 처음 누른 곳에서 얼마나 움직였나(화면 px) — 2px 미만이면 점 찍기로 본다
+      this.rawStart ||= [e.clientX, e.clientY];
+      this.rawMove = Math.max(this.rawMove || 0, Math.hypot(e.clientX - this.rawStart[0], e.clientY - this.rawStart[1]));
+      if (this.filters) {
+        const t = e.timeStamp / 1000;
+        x = this.filters[0].filter(x, t);
+        y = this.filters[1].filter(y, t);
+      }
+      const minStep = Math.max(BRUSH_MIN_STEP_PX, this.width * this.view.zoom * BRUSH_SPACING);
+      if (this.last && Math.hypot(x - this.last[0], y - this.last[1]) < minStep) return;
+      this.last = [x, y];
+      const point = this.view.viewToProject(new this.paper.Point(x, y));
+      const at = this.offset ? point.add(this.offset) : point;
+      this.points.push([at.x, at.y, .5]);
+    }
+    capture(e) {
+      if (this.pointerId != null && e.pointerId !== this.pointerId) return;
+      const samples = e.getCoalescedEvents?.(), rect = this.view.element.getBoundingClientRect();
+      for (const sample of samples?.length ? samples : [e]) this.add(sample, null, rect);
+      this.native = true;
+      this.schedule();
+    }
+    // 엔트리 끌기(throttle)·놓기에서 부른다. 바로 입력을 받는 동안엔 엔트리 점은 쓰지 않는다.
+    move(event) {
+      if (!this.native) { this.add(event.event, event.point); this.schedule(); }
+    }
+    outline(last) {
+      return window.perfectFreehand.getStroke(this.points, { size: this.width, thinning: 0,
+        smoothing: .5, streamline: 0, simulatePressure: false, last });
+    }
+    schedule() {
+      if (this.frame) return;
+      this.frame = requestAnimationFrame(() => {
+        this.frame = 0;
+        if (!this.path.parent) return;
+        this.path.segments = this.outline(false);
+        this.path.closed = true;
+      });
+    }
+    stop() {
+      if (this.layer) { this.layer.opacity = this.layerOpacity; this.layer = null; }
+      document.removeEventListener('pointermove', this.onMove, true);
+      document.removeEventListener('pointerup', this.onUp, true);
+      document.removeEventListener('pointercancel', this.onUp, true);
+    }
+    end() {
+      this.stop();
+      cancelAnimationFrame(this.frame);
+      this.frame = 0;
+      const first = this.points[0];
+      if (!first) return this.path;
+      if (!(this.rawMove >= 2)) {
+        // 누르고 바로 떼면 엔트리 원래 붓처럼 지름 = 굵기인 동그란 점
+        const dot = new this.paper.Path.Circle({ center: [first[0], first[1]], radius: this.width / 2, insert: false });
+        this.path.segments = dot.segments;
+        this.path.closed = true;
+        return this.path;
+      }
+      // 끝점 보정: 손을 뗀 실제 위치까지 잇는다(손떨림 보정이나 점 간격 하한 때문에 끝이 덜 그려지지 않게)
+      const tail = this.points[this.points.length - 1];
+      const zoom = this.view.zoom; // 그리는 중에 휠로 확대할 수 있어 끝날 때 배율로 판단
+      if (this.lastRaw && Math.hypot(this.lastRaw.x - tail[0], this.lastRaw.y - tail[1]) * zoom >= BRUSH_MIN_STEP_PX)
+        this.points.push([this.lastRaw.x, this.lastRaw.y, tail[2]]);
+      return this.finish(this.outline(true), zoom);
+    }
+    // perfect-freehand 바깥선은 스스로 교차한다(README "Flattening"). 교차가 남은 모양은 엔트리가 같은 색 획을 합치거나
+    // 지우개로 뺄 때(paper 불리언) 겹친 쪽 조각이 통째로 사라졌다(굵기가 변하는 획, 실제 엔트리에서 최대 6800화소). README가 권하는
+    // 대로 polygon-clipping union으로 교차 없는 다각형(구멍 포함)으로 편 뒤 넘긴다. 곡선 맞춤(simplify)이 다시 교차를
+    // 만들면 그 고리는 맞추기 전 다각형을 쓴다.
+    finish(outline, zoom) {
+      const faces = window.polygonClipping ? window.polygonClipping.union([outline]) : [[outline]];
+      const rings = faces.flat().filter(ring => ring.length >= 3);
+      const paths = rings.map(ring => {
+        const raw = new this.paper.Path({ segments: ring, closed: true, insert: false });
+        if (raw.segments.length <= 4) return raw;
+        const fit = raw.clone({ insert: false });
+        fit.simplify(BRUSH_SIMPLIFY_PX / zoom);
+        return fit.getIntersections().length ? raw : fit;
+      });
+      if (paths.length <= 1) {
+        this.path.segments = paths[0]?.segments || [];
+        this.path.closed = true;
+        return this.path;
+      }
+      // 고리가 여럿(갈라진 조각·구멍)이면 한 덩어리 복합 경로로. 구멍은 바깥과 반대 방향이라 nonzero 채우기에서 빈다.
+      const item = new this.paper.CompoundPath({ children: paths, fillColor: this.path.fillColor, insert: false });
+      this.path.replaceWith(item);
+      this.path = item;
+      return item;
+    }
+  }
+  // 붓·지우개 도구의 누르기만 감싼다. 엔트리가 시작 원을 만든 직후 그걸 끝내 꺼내 지우고(엔트리 쪽 붓 조각 상태 비움),
+  // 같은 레이어에 우리 획을 시작한다. 끄기·놓기(붓은 합치기, 지우개는 빼기)·되돌리기 기록은 엔트리 코드가 우리
+  // 획(brushItemMaker)으로 그대로 한다.
+  function ensureSmoothBrush(painter) {
+    const ep = painter?.entryPaint;
+    for (const mode of Object.keys(SMOOTH_TOOLS)) {
+      const tool = vectorTool(ep, mode);
+      if (tool && !tool.__evrSmooth && typeof tool.onMouseDown === 'function') wrapSmoothTool(ep, tool, mode);
+    }
+  }
+  function wrapSmoothTool(ep, tool, mode) {
+    const original = tool.onMouseDown;
+    tool.__evrSmooth = true;
+    tool.onMouseDown = function (event) {
+      // 앞 획이 놓기 없이 남아 있으면(포인터 취소, 끄는 중 다른 버튼 누름 등) 붓은 그 자리에서 마감해 붓 획으로 남기고,
+      // 지우개는 미리보기만 지운다(엔트리 원래 도구도 이때 놓기 처리를 못 한다).
+      const stale = tool.brushItemMaker;
+      if (stale instanceof SmoothStroke) {
+        try {
+          const path = stale.end();
+          if (mode === 'ERASER') path?.remove();
+          else if (path?.parent) path.data.isBrushItem = true;
+        } catch (error) { console.warn('[entry-vector-rig] 부드러운 붓', error); }
+        tool.brushItemMaker = null;
+      }
+      const result = original.call(this, event);
+      const old = tool.brushItemMaker;
+      if (!smoothBrush.on || !old || old instanceof SmoothStroke ||
+          !window.perfectFreehand?.getStroke || !window.oneEuroFilter?.OneEuroFilter) return result;
+      try {
+        // 시작 원은 엔트리가 지금 색·굵기(지우개는 지우개 크기)로 만든 것이라(반지름 = 굵기/2) 여기서 그대로 읽는다.
+        const seed = old.end(), layer = seed?.parent;
+        const color = seed?.fillColor?.clone(), size = seed?.bounds;
+        // 원 하나면 가로 = 세로 = 굵기. 엔트리 쪽에 끝나지 않은 붓 조각이 남아 있었으면 합쳐진 모양이라 짧은 변을 쓴다.
+        const width = size && (Math.abs(size.width - size.height) < .01 ? size.width : Math.min(size.width, size.height));
+        if (size && Math.abs(size.width - size.height) >= .01) console.warn('[entry-vector-rig] 붓 시작 모양이 원이 아님', size);
+        seed?.remove();
+        tool.brushItemMaker = layer && color && width > 0 ? new SmoothStroke(ep, layer, event, color, width, mode === 'ERASER') : null;
+        tool.minDistance = 1;
+      } catch (error) {
+        console.warn('[entry-vector-rig] 부드러운 붓', error);
+        tool.brushItemMaker = null;
+      }
+      return result;
+    };
+  }
+  // 붓·지우개 옵션 줄(엔트리 아래쪽 "펜 | 윤곽선 굵기 | 채우기 색상" 등) 끝에 부드럽게·보정을 붙인다. 벡터일 때만.
+  function ensureBrushOptions(painter) {
+    const ep = painter?.entryPaint, active = ep?.paper?.tool;
+    const mode = Object.keys(SMOOTH_TOOLS).find(key => active && active === vectorTool(ep, key));
+    const bar = document.querySelector('#entryPainter .bottom_area > div');
+    let box = document.querySelector('#entryPainter .evr-stroke-opts');
+    if (!mode || !bar) { box?.remove(); return; }
+    if (!box) box = buildBrushOptions();
+    const title = box.querySelector('.evr-brush-title');
+    if (title.textContent !== SMOOTH_TOOLS[mode]) title.textContent = SMOOTH_TOOLS[mode];
+    // 엔트리 옵션 줄은 넘치면 옆으로 넘기는(화살표) 한 줄이고 끝 표식(#rightObserver)으로 끝을 안다 — 그 앞에 둔다.
+    const end = bar.querySelector(':scope > #rightObserver');
+    if (box.parentElement !== bar || (end && box.nextElementSibling !== end)) bar.insertBefore(box, end || null);
+    syncBrushOptions(box);
+  }
+  function buildBrushOptions() {
+    const box = document.createElement('div');
+    box.className = 'evr-brush-opts evr-stroke-opts';
+    const smooth = button('부드럽게', () => { smoothBrush.on = !smoothBrush.on; syncBrushOptions(box); },
+      { class: 'evr-brush-toggle evr-brush-smooth',
+        title: '확장: 촘촘한 입력으로 받아 매끄러운 곡선으로 그리고 지움(끄면 엔트리 원래 붓·지우개)' });
+    const level = document.createElement('label');
+    level.className = 'evr-brush-level';
+    level.title = '손떨림 보정: 끔~5. 클수록 떨림을 많이 거르지만 선이 조금 늦게 따라옴';
+    const text = document.createElement('span');
+    text.textContent = '보정';
+    const range = document.createElement('input');
+    Object.assign(range, { type: 'range', min: '0', max: String(BRUSH_MIN_CUTOFF.length - 1), step: '1' });
+    range.addEventListener('input', () => { smoothBrush.level = Number(range.value); syncBrushOptions(box); });
+    const value = document.createElement('b');
+    level.append(text, range, value);
+    // 엔트리 옵션처럼 위에 이름, 아래에 조작
+    const title = document.createElement('span');
+    title.className = 'evr-brush-title';
+    title.textContent = '부드러운 붓';
+    const row = document.createElement('div');
+    row.className = 'evr-brush-row';
+    row.append(smooth, level);
+    box.append(title, row);
+    // 보정 막대에서 쓰는 방향키 등만 엔트리 단축키(문서 keydown)로 넘어가지 않게. 다른 키(Ctrl+Z 등)는 그대로 둔다.
+    range.addEventListener('keydown', event => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key))
+        event.stopPropagation();
+    });
+    return box;
+  }
+  function syncBrushOptions(box) {
+    const pressed = (node, on) => {
+      if (node.getAttribute('aria-pressed') !== String(on)) node.setAttribute('aria-pressed', String(on));
+    };
+    pressed(box.querySelector('.evr-brush-smooth'), smoothBrush.on);
+    const range = box.querySelector('input');
+    if (Number(range.value) !== smoothBrush.level) range.value = String(smoothBrush.level);
+    const label = smoothBrush.level ? String(smoothBrush.level) : '끔';
+    const value = box.querySelector('.evr-brush-level b');
+    if (value.textContent !== label) value.textContent = label;
+    if (box.dataset.off !== String(!smoothBrush.on)) box.dataset.off = String(!smoothBrush.on);
+  }
+  // ---- 영역 채우기(벡터·비트맵) ----
+  // 엔트리 채우기(entry-paint 260921)는 벡터에서는 누른 도형 하나의 색만 바꿔 선으로 둘러싼 빈 곳은 못 채우고, 비트맵에서는
+  // 똑같은 색(허용 오차 없음)이 이어진 곳만 채워 선 사이 틈으로 새어 나간다. 켜 두면 이비스페인트 버킷처럼 보이는 그림 전체를
+  // 기준으로 누른 곳과 비슷한 색이 이어진 영역을 찾아, 선 쪽으로 1.5px(이비스 "확장" 기본값) 넓혀 선 아래에 채운다.
+  // 틈 막기: 경계(누른 곳 색과 다른 화소)를 모폴로지 닫힘(원판 반지름 = 틈 막기, 팽창 뒤 침식)으로 이어 붙인 뒤 채운다.
+  // 반지름의 두 배보다 좁은 틈이 막힌다. 거리는 Felzenszwalb·Huttenlocher(2012) 거리 변환으로 잰다. 벡터 결과는
+  // d3-contour(마칭 스퀘어)로 영역 윤곽을 따 경로로 만든다. 되돌리기 기록은 엔트리 채우기의 누르기 처리가 그대로 남긴다.
+  // 단위는 그림 px(벡터는 그림 좌표, 비트맵은 그림 화소)라 확대해도 결과가 같다.
+  const regionFill = { on: true, gap: 4 };
+  const FILL_GAP_MAX = 12;
+  const FILL_EXPAND = 1.5;
+  const FILL_TOLERANCE = 32; // 0~255. 누른 곳 색과 이보다 더 다르면 경계(미리 곱한 RGBA의 가장 큰 차이)
+  const FILL_MAX_PIXELS = 4e6; // 벡터 기준 그림 화소 수 상한(확대가 커도 이 안에서 해상도를 정함)
+  // Felzenszwalb·Huttenlocher 1차원 제곱 거리 변환(아래 포락선)
+  function edt1d(f, n, d, v, z) {
+    let k = 0;
+    v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
+    for (let q = 1; q < n; q++) {
+      let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+      k++; v[k] = q; z[k] = s; z[k + 1] = Infinity;
+    }
+    k = 0;
+    for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]; }
+  }
+  // feature(1)인 화소까지 거리의 제곱
+  function distanceSq(feature, w, h) {
+    const out = new Float64Array(w * h), n = Math.max(w, h);
+    for (let i = 0; i < w * h; i++) out[i] = feature[i] ? 0 : 1e20;
+    const f = new Float64Array(n), d = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y++) f[y] = out[y * w + x];
+      edt1d(f, h, d, v, z);
+      for (let y = 0; y < h; y++) out[y * w + x] = d[y];
+    }
+    for (let y = 0, row = 0; y < h; y++, row += w) {
+      for (let x = 0; x < w; x++) f[x] = out[row + x];
+      edt1d(f, w, d, v, z);
+      for (let x = 0; x < w; x++) out[row + x] = d[x];
+    }
+    return out;
+  }
+  const withinSq = (dist, r) => {
+    const out = new Uint8Array(dist.length), r2 = r * r;
+    for (let i = 0; i < dist.length; i++) out[i] = dist[i] <= r2 ? 1 : 0;
+    return out;
+  };
+  // 모폴로지 닫힘: 반지름 r 원판으로 팽창한 뒤 침식
+  function closeMask(mask, w, h, r) {
+    const grown = withinSq(distanceSq(mask, w, h), r), outside = new Uint8Array(grown.length);
+    for (let i = 0; i < grown.length; i++) outside[i] = 1 - grown[i];
+    const away = distanceSq(outside, w, h), r2 = r * r, closed = new Uint8Array(grown.length);
+    for (let i = 0; i < grown.length; i++) closed[i] = mask[i] || (grown[i] && away[i] > r2) ? 1 : 0;
+    return closed;
+  }
+  // 4방향으로 이어진 칸 채우기
+  function floodFrom(block, w, h, sx, sy) {
+    const out = new Uint8Array(w * h), start = sy * w + sx;
+    if (block[start]) return null;
+    const stack = [start];
+    out[start] = 1;
+    while (stack.length) {
+      const i = stack.pop(), x = i % w;
+      if (x > 0 && !out[i - 1] && !block[i - 1]) { out[i - 1] = 1; stack.push(i - 1); }
+      if (x < w - 1 && !out[i + 1] && !block[i + 1]) { out[i + 1] = 1; stack.push(i + 1); }
+      if (i >= w && !out[i - w] && !block[i - w]) { out[i - w] = 1; stack.push(i - w); }
+      if (i + w < out.length && !out[i + w] && !block[i + w]) { out[i + w] = 1; stack.push(i + w); }
+    }
+    return out;
+  }
+  // RGBA 화소(미리 곱하지 않은 값)에서 (sx, sy)를 누른 영역. gap·expand는 화소 단위.
+  function fillRegion(data, w, h, sx, sy, gap, expand) {
+    const s = (sy * w + sx) * 4, sa = data[s + 3] / 255;
+    const seed = [data[s] * sa, data[s + 1] * sa, data[s + 2] * sa, data[s + 3]];
+    const barrier = new Uint8Array(w * h);
+    for (let i = 0, p = 0; i < barrier.length; i++, p += 4) {
+      const a = data[p + 3] / 255;
+      const diff = Math.max(Math.abs(data[p] * a - seed[0]), Math.abs(data[p + 1] * a - seed[1]),
+        Math.abs(data[p + 2] * a - seed[2]), Math.abs(data[p + 3] - seed[3]));
+      barrier[i] = diff > FILL_TOLERANCE ? 1 : 0;
+    }
+    // 틈 막기로 누른 곳까지 막히면(틈보다 좁은 칸을 누름) 막지 않고 채운다
+    let region = gap >= 1 ? floodFrom(closeMask(barrier, w, h, gap), w, h, sx, sy) : null;
+    region ||= floodFrom(barrier, w, h, sx, sy);
+    if (region && expand > 0) region = withinSq(distanceSq(region, w, h), expand);
+    return region;
+  }
+  function fillColorOf(paper, value) {
+    const color = new paper.Color(value || '#000000');
+    return [color.red * 255, color.green * 255, color.blue * 255, (color.alpha ?? 1) * 255];
+  }
+  // 벡터: 그림 레이어 전체를 무대 크기 그림으로 그려 영역을 찾고, 윤곽을 경로로 만들어 누른 곳의 도형 바로 위(그 위 선들 아래)에 넣는다
+  function vectorRegionFill(ep, tool, event) {
+    const found = paintLayer(ep);
+    if (!found?.stage || !window.__evrD3Contour) return false;
+    const { layer, stage } = found, paper = ep.paper, view = ep.project.view;
+    const s = Math.max(.25, Math.min(Math.max(1, view.zoom), Math.sqrt(FILL_MAX_PIXELS / (stage.width * stage.height))));
+    const w = Math.ceil(stage.width * s), h = Math.ceil(stage.height * s);
+    const sx = Math.floor((event.point.x - stage.left) * s), sy = Math.floor((event.point.y - stage.top) * s);
+    if (sx < 0 || sy < 0 || sx >= w || sy >= h) return false;
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const guides = layer.getItems({ match: item => item.visible && item.data?.guideItem });
+    guides.forEach(item => { item.visible = false; });
+    let raster = null;
+    try { if (layer.children.length) raster = layer.rasterize({ resolution: 72 * s, insert: false }); }
+    finally { guides.forEach(item => { item.visible = true; }); }
+    if (raster?.canvas && raster.bounds.width > 0 && raster.bounds.height > 0)
+      ctx.drawImage(raster.canvas, (raster.bounds.left - stage.left) * s, (raster.bounds.top - stage.top) * s,
+        raster.bounds.width * s, raster.bounds.height * s);
+    const region = fillRegion(ctx.getImageData(0, 0, w, h).data, w, h, sx, sy, regionFill.gap * s, FILL_EXPAND * s);
+    if (!region) return false;
+    const values = new Float64Array(region);
+    const shape = window.__evrD3Contour.contours().size([w, h]).thresholds([.5])(values)[0];
+    const rings = (shape?.coordinates || []).flat().filter(ring => ring.length >= 4);
+    if (!rings.length) return false;
+    const paths = rings.map(ring => {
+      const raw = new paper.Path({ segments: ring.map(([x, y]) => [stage.left + x / s, stage.top + y / s]), closed: true, insert: false });
+      if (raw.segments.length <= 8) return raw;
+      const fit = raw.clone({ insert: false });
+      fit.simplify(.8 / s); // 화소 계단만 펴는 정도(그림 화소의 0.8)
+      return fit.getIntersections().length ? raw : fit;
+    });
+    const item = paths.length === 1 ? paths[0] : new paper.CompoundPath({ children: paths, insert: false });
+    item.fillColor = new paper.Color(tool.fillColor || '#000000');
+    item.strokeColor = null;
+    // 누른 곳에 칠해져 있던 가장 위 도형 바로 위에 둔다(그보다 위의 선은 그대로 위에). 빈 곳이면 맨 아래.
+    const hit = layer.hitTest(event.point, { fill: true, stroke: true, segments: false, tolerance: 0,
+      match: result => !result.item.data?.guideItem });
+    const under = hit?.item;
+    if (under && under.parent) {
+      if (under.parent !== layer) item.transform(under.parent.globalMatrix.inverted());
+      item.insertAbove(under);
+    } else layer.insertChild(0, item);
+    return true;
+  }
+  // 비트맵: 그림(래스터) 화소에서 바로 영역을 찾아, 이미 있는 화소 아래로(destination-over) 칠한다
+  function bitmapRegionFill(ep, tool, event) {
+    const raster = paintLayer(ep)?.layer.children[0];
+    if (!(raster instanceof ep.paper.Raster) || !raster.width || !raster.height) return null;
+    const w = raster.width, h = raster.height;
+    const local = raster.globalToLocal(event.point).add(new ep.paper.Point(w / 2, h / 2));
+    const sx = Math.floor(local.x), sy = Math.floor(local.y);
+    if (sx < 0 || sy < 0 || sx >= w || sy >= h) return null;
+    const perUnit = w / raster.bounds.width; // 그림 좌표 1당 화소
+    const image = raster.getImageData(new ep.paper.Rectangle(0, 0, w, h)), d = image.data;
+    const region = fillRegion(d, w, h, sx, sy, regionFill.gap * perUnit, FILL_EXPAND * perUnit);
+    if (!region) return null;
+    const [R, G, B, A] = fillColorOf(ep.paper, tool.fillColor), fa0 = A / 255;
+    for (let i = 0, p = 0; i < region.length; i++, p += 4) {
+      if (!region[i]) continue;
+      const da = d[p + 3] / 255;
+      if (da >= 1) continue;
+      const fa = fa0 * (1 - da), oa = da + fa;
+      if (oa <= 0) continue;
+      d[p] = (d[p] * da + R * fa) / oa; d[p + 1] = (d[p + 1] * da + G * fa) / oa;
+      d[p + 2] = (d[p + 2] * da + B * fa) / oa; d[p + 3] = oa * 255;
+    }
+    raster.setImageData(image, new ep.paper.Point(0, 0));
+    const q = (sy * w + sx) * 4;
+    return `rgba(${d[q]},${d[q + 1]},${d[q + 2]},${d[q + 3] / 255})`;
+  }
+  function ensureRegionFill(painter) {
+    const ep = painter?.entryPaint;
+    for (const graphics of ['VECTOR', 'BITMAP']) {
+      const tool = ep?.paper?.tools?.find(item => item.MY_MODE?.toolMode === 'FILL' && item.MY_MODE?.graphicsMode === graphics);
+      if (!tool || tool.__evrRegionFill || typeof tool.onMouseDown !== 'function') continue;
+      tool.__evrRegionFill = true;
+      const down = tool.onMouseDown;
+      tool.__evrOriginalDown = down; // 투명도 등에서 되돌리기 기록만 남길 때 쓴다
+      if (graphics === 'VECTOR') {
+        // 영역 채우기일 때는 엔트리의 "마우스를 올린 도형 색 미리 바꾸기"를 하지 않는다(누르면 그 도형을 칠해 버림)
+        const move = tool.onMouseMove;
+        if (typeof move === 'function') tool.onMouseMove = function (event) { if (!regionFill.on) return move.call(this, event); };
+        tool.__evrClearHover = () => { try { move?.call(tool, { point: new ep.paper.Point(-1e7, -1e7), item: null }); } catch {} };
+        tool.onMouseDown = function (event) {
+          if (regionFill.on) {
+            try { vectorRegionFill(ep, tool, event); } catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
+          }
+          // 영역 채우기일 때 엔트리 쪽은 고를 도형이 없어 되돌리기 기록만 남긴다
+          return down.call(this, event);
+        };
+      } else {
+        tool.onMouseDown = function (event) {
+          if (!regionFill.on) return down.call(this, event);
+          let seedColor = null;
+          try { seedColor = bitmapRegionFill(ep, tool, event); } catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
+          if (!seedColor) return down.call(this, event);
+          // 엔트리 비트맵 채우기는 누른 곳이 이미 그 색이면 아무것도 안 하고 되돌리기 기록만 남긴다 — 그 길로 기록만 남긴다
+          const color = tool.fillColor;
+          tool.fillColor = seedColor;
+          try { return down.call(this, event); } finally { tool.fillColor = color; }
+        };
+      }
+    }
+  }
+  // 채우기 옵션 줄 끝에 영역 채우기·틈 막기
+  function ensureFillOptions(painter) {
+    const ep = painter?.entryPaint, active = ep?.paper?.tool;
+    const isFill = active?.MY_MODE?.toolMode === 'FILL';
+    const bar = document.querySelector('#entryPainter .bottom_area > div');
+    let box = document.querySelector('#entryPainter .evr-fill-opts');
+    if (!isFill || !bar) { box?.remove(); return; }
+    if (!box) box = buildFillOptions(ep);
+    const end = bar.querySelector(':scope > #rightObserver');
+    if (box.parentElement !== bar || (end && box.nextElementSibling !== end)) bar.insertBefore(box, end || null);
+    syncFillOptions(box);
+  }
+  function buildFillOptions(ep) {
+    const box = document.createElement('div');
+    box.className = 'evr-brush-opts evr-fill-opts';
+    const title = document.createElement('span');
+    title.className = 'evr-brush-title';
+    title.textContent = '영역 채우기';
+    const toggle = button('영역 채우기', () => {
+      regionFill.on = !regionFill.on;
+      // 켜는 순간 엔트리가 미리 바꿔 둔 도형 색을 되돌린다
+      if (regionFill.on) ep.paper.tools.forEach(tool => tool.__evrClearHover?.());
+      syncFillOptions(box);
+    }, { class: 'evr-brush-toggle evr-fill-toggle',
+      title: '확장: 선으로 둘러싼 곳을 눌러 채움(보이는 그림 전체 기준, 선 아래로 1.5px 넓혀 채움). 끄면 엔트리 원래 채우기' });
+    const level = document.createElement('label');
+    level.className = 'evr-brush-level';
+    level.title = '틈 막기: 이 값의 두 배보다 좁은 선 사이 틈은 막힌 것으로 보고 채움(그림 px). 끔이면 틈으로 새어 나감';
+    const text = document.createElement('span');
+    text.textContent = '틈 막기';
+    const range = document.createElement('input');
+    Object.assign(range, { type: 'range', min: '0', max: String(FILL_GAP_MAX), step: '1' });
+    range.addEventListener('input', () => { regionFill.gap = Number(range.value); syncFillOptions(box); });
+    range.addEventListener('keydown', event => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key))
+        event.stopPropagation();
+    });
+    const value = document.createElement('b');
+    level.append(text, range, value);
+    const row = document.createElement('div');
+    row.className = 'evr-brush-row';
+    row.append(toggle, level);
+    box.append(title, row);
+    return box;
+  }
+  function syncFillOptions(box) {
+    const toggle = box.querySelector('.evr-fill-toggle');
+    if (toggle.getAttribute('aria-pressed') !== String(regionFill.on)) toggle.setAttribute('aria-pressed', String(regionFill.on));
+    const range = box.querySelector('input');
+    if (Number(range.value) !== regionFill.gap) range.value = String(regionFill.gap);
+    const label = regionFill.gap ? `${regionFill.gap}px` : '끔';
+    const value = box.querySelector('.evr-brush-level b');
+    if (value.textContent !== label) value.textContent = label;
+    if (box.dataset.off !== String(!regionFill.on)) box.dataset.off = String(!regionFill.on);
+  }
+  // ---- 고른 도형 투명도(벡터) ----
+  // 엔트리 그림판에는 투명도 조절이 없다. 선택 도구로 고른 도형·이미지(레이어)의 불투명도(paper opacity, 저장 SVG의
+  // opacity)를 0~100%로 바꾼다. 막대를 놓을 때 되돌리기 기록을 하나 남긴다: 엔트리 벡터 채우기의 원래 누르기 처리는 고른
+  // 도형이 없으면 기록(It.saveSnapshot)만 남기므로 그 길을 쓴다(마우스를 올린 도형 미리보기는 먼저 지운다).
+  function saveEntryHistory(ep) {
+    const fill = ep?.paper?.tools?.find(tool => tool.MY_MODE?.toolMode === 'FILL' && tool.MY_MODE?.graphicsMode === 'VECTOR');
+    if (typeof fill?.__evrOriginalDown !== 'function') return false;
+    fill.__evrClearHover?.();
+    fill.__evrOriginalDown.call(fill, { point: new ep.paper.Point(-1e7, -1e7) });
+    return true;
+  }
+  function selectedPaintItems(ep) {
+    const layer = paintLayer(ep)?.layer;
+    if (!layer) return [];
+    // 고른 묶음 안의 도형까지 겹쳐 세지 않게, 위쪽이 이미 고른 것은 뺀다
+    return layer.getItems({ match: item => item.data?.selected && !item.data?.guideItem })
+      .filter(item => { for (let p = item.parent; p && p !== layer; p = p.parent) if (p.data?.selected) return false; return true; });
+  }
+  // 선택 도구 옵션 줄은 엔트리 칸만으로 거의 차서(폭 1600에서 넘침 109px) 끝에 붙이면 보이지 않는다. 엔트리 칸을 밀어내지
+  // 않게, 고른 것이 있을 때만 그림 칸 왼쪽 위에 작은 상자로 띄운다.
+  function ensureOpacityOptions(painter) {
+    const ep = painter?.entryPaint, active = ep?.paper?.tool;
+    const isSelect = active?.MY_MODE?.toolMode === 'SELECT' && active?.MY_MODE?.graphicsMode === 'VECTOR';
+    const items = isSelect ? selectedPaintItems(ep) : [];
+    const area = document.querySelector('#entryPainter .canvas_area');
+    let box = document.querySelector('#entryPainter .evr-opacity-opts');
+    if (!items.length || !area || session) { box?.remove(); return; }
+    if (!box) box = buildOpacityOptions(ep);
+    if (box.parentElement !== area) area.append(box);
+    // 끄는 중이 아니면 고른 도형의 지금 불투명도를 보여 준다(여럿이면 첫 도형)
+    if (!box.dataset.dragging) syncOpacityOptions(box, Math.round((items[0].opacity ?? 1) * 100));
+  }
+  function buildOpacityOptions(ep) {
+    const box = document.createElement('div');
+    box.className = 'evr-opacity-opts';
+    const title = document.createElement('span');
+    title.className = 'evr-opacity-title';
+    title.textContent = '투명도';
+    const level = document.createElement('label');
+    level.className = 'evr-brush-level';
+    level.title = '고른 도형·이미지의 불투명도(100% = 원래대로, 0% = 안 보임). 저장한 모양에도 그대로 남음';
+    const range = document.createElement('input');
+    Object.assign(range, { type: 'range', min: '0', max: '100', step: '1' });
+    range.style.width = '110px';
+    const value = document.createElement('b');
+    range.addEventListener('input', () => {
+      box.dataset.dragging = 'true';
+      const opacity = Number(range.value) / 100;
+      selectedPaintItems(ep).forEach(item => { item.opacity = opacity; });
+      syncOpacityOptions(box, Number(range.value));
+    });
+    range.addEventListener('change', () => {
+      delete box.dataset.dragging;
+      if (!saveEntryHistory(ep)) console.warn('[entry-vector-rig] 투명도: 되돌리기 기록을 남기지 못함');
+    });
+    // 방향키로 막대를 움직일 때 엔트리가 고른 도형을 옮기지 않게
+    range.addEventListener('keydown', event => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key))
+        event.stopPropagation();
+    });
+    // 상자 위 마우스 움직임이 엔트리 선택 도구의 "마우스 올린 도형" 표시로 가지 않게
+    for (const type of ['mousemove', 'pointermove', 'mousedown', 'pointerdown']) box.addEventListener(type, event => event.stopPropagation());
+    level.append(range, value);
+    box.append(title, level);
+    return box;
+  }
+  function syncOpacityOptions(box, percent) {
+    const range = box.querySelector('input');
+    if (Number(range.value) !== percent) range.value = String(percent);
+    const value = box.querySelector('.evr-brush-level b'), label = `${percent}%`;
+    if (value.textContent !== label) value.textContent = label;
+  }
   function refresh() {
     inkGeneration++;
     const c = context();
@@ -4950,6 +5554,11 @@
       ensureSaveHook(painter);
       ensureLoadHook(painter);
       try { ensurePainterNav(painter); } catch (error) { console.warn('[entry-vector-rig] 편집기 이동·확대', error); }
+      try { ensureSmoothBrush(painter); ensureBrushOptions(painter); }
+      catch (error) { console.warn('[entry-vector-rig] 부드러운 붓', error); }
+      try { ensureRegionFill(painter); ensureFillOptions(painter); }
+      catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
+      try { ensureOpacityOptions(painter); } catch (error) { console.warn('[entry-vector-rig] 투명도', error); }
     }
     ensurePixelDrawHook();
     const entity = window.Entry?.container?.selectedObject?.entity;
@@ -5042,7 +5651,14 @@
         drawPivotUI();
       }, { class: 'evr-tool evr-pin', 'aria-pressed': 'false',
         title: '지금 모양을 기준으로 고정해 다른 모양에서도 겹쳐 보기(그 모양에서 다시 누르면 해제)' });
-      list.append(pixel, split, arrange, align, center, onion, pin);
+      // 화면이 좁아 "비트맵 | 벡터" 옆 뼈대 버튼이 엔트리 오른쪽 버튼에 가려질 때(폭 약 1260px 미만, 1.0.0 제보) 이 목록에서도
+      // 뼈대 모드를 켜고 끌 수 있게 한다. 위쪽 버튼은 그대로 둔다(자리를 옮겼다 되돌리며 깜빡이지 않게).
+      const bone = button('뼈대', () => {
+        const header = document.querySelector('.evr-mode-wrap[data-evr-mode="bone"] .evr-bone-mode');
+        if (session) close();
+        else open(context(), header);
+      }, { class: 'evr-tool evr-bone-menu', 'aria-pressed': 'false', title: '뼈대 모드(벡터 모양)' });
+      list.append(bone, pixel, split, arrange, align, center, onion, pin);
       // 접힌 목록에서 하나를 고르면 목록을 닫는다(버튼 동작이 먼저 실행된 뒤).
       list.addEventListener('click', () => { tools.dataset.open = 'false'; });
       tools.append(more, list);
@@ -5052,6 +5668,12 @@
     if (tools.parentElement !== box) box.prepend(tools);
     const pixel = tools.querySelector('.evr-pixel'), on = objectPixel(c.object) > 0;
     if (pixel.getAttribute('aria-pressed') !== String(on)) pixel.setAttribute('aria-pressed', String(on));
+    const boneMenu = tools.querySelector('.evr-bone-menu'), boneHeader = document.querySelector('.evr-bone-mode');
+    if (boneMenu) {
+      const disabled = boneHeader ? boneHeader.disabled : true;
+      if (boneMenu.disabled !== disabled) boneMenu.disabled = disabled;
+      if (boneMenu.getAttribute('aria-pressed') !== String(!!session)) boneMenu.setAttribute('aria-pressed', String(!!session));
+    }
     const pin = tools.querySelector('.evr-pin'), pinnedId = pinnedPictures.get(c.object.id);
     const pinnedIndex = c.object.pictures.findIndex(picture => picture.id === pinnedId);
     const pinState = String(pinnedIndex >= 0);
@@ -5090,6 +5712,8 @@
       tools.dataset.open = 'false';
     }
     if (wrap && wrap.dataset.narrow !== String(narrow)) wrap.dataset.narrow = String(narrow);
+    // 글자를 숨겨야 할 만큼 좁으면 위쪽 뼈대 버튼이 엔트리 버튼에 가려질 수 있어 도구 목록에도 뼈대를 둔다
+    if (tools.dataset.boneInMenu !== String(narrow)) tools.dataset.boneInMenu = String(narrow);
   }
   setInterval(refresh, 500);
   // 엔트리의 "비트맵 | 벡터" 버튼을 누르면 뼈대 모드에서 나온다(묶음 안의 버튼이면 무엇이든).
