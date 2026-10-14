@@ -6490,12 +6490,13 @@
   // 엔트리 벡터 붓(entry-paint 260921)은 끄는 동안 찍힌 점 사이를 직선 막대+원으로 이어 붙여 합친다. 새 점은 앞 점에서
   // 3+굵기/5만큼 떨어져야 찍히는데 이 거리가 그림 좌표라 확대할수록 화면에서 듬성해지고(1600%면 16배), 끌기 처리가
   // throttle로 묶여 빠른 획은 점이 더 빠진다. 그래서 곡선이 꺾은선이 된다.
-  // 켜 두면 "획 모양 만들기"만 바꾼다: 브라우저가 주는 촘촘한 입력(PointerEvent.getCoalescedEvents)을 화면 좌표에서
-  // 1€ 필터(Casiez·Roussel·Vogel, CHI 2012, 저자 구현 1eurofilter)로 손떨림만 거르고, perfect-freehand getStroke로
-  // 굵기만큼 바깥선을 만든 뒤 paper.js simplify(곡선 맞춤)로 점 수를 줄인다. 누를 때 검사, 같은 색 붓 획 합치기,
-  // 되돌리기 기록은 엔트리 onMouseUp이 우리가 돌려준 모양으로 그대로 한다.
-  // 벡터 지우개도 같은 붓 조각($r)으로 지울 모양을 만든 뒤 그 모양을 그림에서 빼므로(onMouseUp: end → remove →
-  // erasePath), 같은 방식으로 지울 모양만 바꾼다. 비트맵 붓·지우개는 같은 입력 보정만 쓴다(BitmapSmooth).
+  // 켜 두면 "점 넣기"만 바꾼다(비트맵 붓과 같은 방식): 브라우저가 주는 촘촘한 입력(PointerEvent.getCoalescedEvents)을
+  // 화면 좌표에서 1€ 필터(Casiez·Roussel·Vogel, CHI 2012, 저자 구현 1eurofilter)로 손떨림만 거르고, 엔트리 자기 획 만들기
+  // (brushItemMaker $r — 시작 원 + 점마다 둥근 막대를 이어 합침, 굵기가 늘 정확)에 엔트리 간격과 화면 4px 중 작은 간격으로
+  // 넣는다. 획 모양·같은 색 붓 획 합치기·지우개로 빼기·되돌리기 기록은 모두 엔트리 코드 그대로다.
+  // 예전엔 엔트리 획 만들기를 버리고 perfect-freehand 바깥선 → union → 곡선 맞춤으로 모양을 새로 만들었는데, 굵기가 변하는 선용
+  // 라이브러리를 굵기가 일정한 붓에 써서 단계마다 따로 망가졌다(곧은 획 방추꼴, 점 하나면 굵기 3배 덩어리, 곡선 맞춤 오차 단위로
+  // 확대 시 깎임 — 2026-10-14 사용자 영상·실측). 그래서 모양은 엔트리에 맡긴다.
   // 설정은 붓·지우개가 같이 쓰고 이 탭에서만 기억한다(새로 고치면 처음 값).
   const smoothBrush = { on: true, level: 1 };
   // 손떨림 보정 단계(0=끔)별 1€ 최소 차단 주파수(Hz, 낮을수록 많이 거름)와 빠르게 그릴 때 지연을 줄이는 beta(화면 px 기준).
@@ -6504,11 +6505,15 @@
   // 단계가 클수록 떨림은 더 거르지만 빠른 획이 더 안쪽으로 밀린다(4단계 6px). 떨림 모형은 흰 잡음이라 실제 손과는 다를 수 있다.
   const BRUSH_MIN_CUTOFF = [0, 12, 8, 4, 2, 1];
   const BRUSH_BETA = 0.001;
-  const BRUSH_SIMPLIFY_PX = 0.5; // 곡선 맞춤 허용 오차(화면 px). 그림 좌표로는 배율로 나눈다.
   const BRUSH_MIN_STEP_PX = 0.5; // 이보다 가까운 입력 점은 버린다(화면 px)
-  // 점 간격 하한 = 붓 지름의 10%(래스터 붓의 "간격 = 지름의 %"와 같은 손잡이). 크게 확대해 굵은 붓이 화면을 덮을 때
-  // 점이 지름보다 훨씬 촘촘하면 작은 떨림에도 진행 방향이 크게 흔들려 바깥선이 톱니·고리가 된다(1600%·떨림 시험에서 확인).
+  // 거르기 전 입력 점 간격 하한 = 붓 지름의 10%(래스터 붓의 "간격 = 지름의 %"와 같은 손잡이) — 크게 확대해 굵은 붓이 화면을 덮을 때
+  // 작은 떨림까지 다 받지 않게
   const BRUSH_SPACING = 0.1;
+  // 엔트리 획 만들기에 넣는 간격(화면 px) 상한. 엔트리 간격(벡터 3+굵기/5, 비트맵 4 — 그림 좌표)이 이보다 크면(확대할수록) 이 간격으로
+  // 넣는다. 엔트리 막대 합치기는 촘촘할수록 무겁다(굵기 10·300px 직선, 실측: 1단위 간격 531ms·한 번에 97ms 멈춤, 4단위 48ms·5ms,
+  // 엔트리 5단위 42ms·7ms) — 화면 4px이면 꺾은선이 안 보이면서(반지름 16px 곡선에서 어긋남 0.1px) 엔트리 원래와 비슷한 무게.
+  const SMOOTH_SEGMENT_PX = 4;
+  const smoothSegment = (entrySpacing, zoom, floor = 0) => Math.min(entrySpacing, Math.max(floor, SMOOTH_SEGMENT_PX / (zoom || 1)));
   // paper는 마우스 이벤트로 받는 경우가 있어 포인터 번호가 안 보인다. 같은 누르기의 포인터 이벤트를 따로 기억해 둔다.
   let lastPointerDown = null;
   document.addEventListener('pointerdown', event => { lastPointerDown = event; }, true);
@@ -6518,7 +6523,7 @@
   }
   const SMOOTH_TOOLS = { BRUSH: '부드러운 붓', ERASER: '부드러운 지우개' };
   // 획 입력: 브라우저가 주는 촘촘한 입력(getCoalescedEvents)을 화면 좌표에서 1€ 필터로 거르고 점 간격 하한을 지켜
-  // 그림 좌표 점으로 넘긴다(accept). 벡터 붓·지우개(SmoothStroke)와 비트맵 붓·지우개(BitmapSmooth)가 같이 쓴다.
+  // 그림 좌표 점으로 넘긴다(accept). 벡터·비트맵 붓·지우개가 같이 쓴다(SmoothFeed).
   class StrokeInput {
     constructor(ep, event, width) {
       this.paper = ep.paper;
@@ -6599,93 +6604,57 @@
       document.removeEventListener('pointercancel', this.onUp, true);
     }
   }
-  class SmoothStroke extends StrokeInput {
-    constructor(ep, layer, event, color, width, erase = false) {
-      super(ep, event, width);
-      this.points = [];
-      this.path = new this.paper.Path({ fillColor: color, insert: false });
-      // 지우개: 엔트리는 끄는 동안 흰 모양만 보여 주고 놓을 때 지운다. 미리보기를 "뚫기"(destination-out)로 그려 끄는 동안
-      // 그 자리가 바로 지워져 보이게 한다. 실제 지우기(놓을 때 이 모양을 그림에서 빼기)와 되돌리기 기록은 엔트리가 그대로 한다.
-      if (erase) {
-        this.path.blendMode = 'destination-out';
-        // 그림 레이어만 따로 합성되게(불투명도 1 미만이면 paper가 레이어를 따로 그려 얹는다) 해서, 뚫기가 아래 바둑판 배경까지
-        // 뚫지 않게 한다. 놓으면 원래 값으로 돌린다.
-        this.layer = layer;
-        this.layerOpacity = layer.opacity;
-        layer.opacity = Math.min(layer.opacity, .99999);
-      }
+  // 끄는 동안 잠깐 있는 미리보기(레이어가 아님 — 레이어 목록·클리핑 기준에서 뺌). 항목 data가 아니라 여기에 둔다: 엔트리가 놓을 때
+  // 남기는 되돌리기 기록에 표시가 들어가면 안 된다.
+  const strokePreview = new WeakSet();
+  // 벡터 부드러운 지우개 미리보기: 엔트리는 끄는 동안 흰 막대 조각을 맨 위 작업 층에 보여 주고 놓을 때 지운다. 그 조각은 가리고
+  // (투명도 0 — 합쳐진 조각도 따라감, 놓으면 엔트리가 떼어 냄), 같은 중심선·굵기·둥근 끝과 꺾임(= 엔트리 조각을 합친 모양)의 선을
+  // 그림 층 맨 위에 "뚫기"(destination-out)로 그려 끄는 동안 그 자리가 바로 지워져 보이게 한다. 그림 층은 불투명도를 1보다 아주 조금
+  // 낮춰 따로 합성되게 해(paper가 층을 따로 그려 얹음) 뚫기가 아래 바둑판 배경까지 뚫지 않게 하고, 놓으면 되돌린다.
+  class EraserPreview {
+    constructor(ep, layer, entryLayer, known, start, width) {
+      this.layer = layer;
+      this.opacity = layer.opacity;
+      layer.opacity = Math.min(layer.opacity, .99999);
+      this.entryLayer = entryLayer;
+      this.known = known;
+      this.path = new ep.paper.Path({ segments: [start, start], strokeColor: '#000', strokeWidth: width, strokeCap: 'round',
+        strokeJoin: 'round', blendMode: 'destination-out', insert: false });
+      strokePreview.add(this.path);
       layer.addChild(this.path);
-      this.listen();
-      this.add(this.down, event.point);
-      this.schedule();
+      // 글자는 엔트리 지우개가 지우지 않는다(도형이 아니라 일부만 뺄 수 없음). 끄는 동안에도 지워져 보이지 않게 뚫기 선 위에 글자를
+      // 한 번 더 그린다(놓을 때 걷음) — 놓으면 되살아나는 것처럼 보이지 않게.
+      this.keep = [];
+      for (const text of layer.getItems({ class: ep.paper.PointText })) {
+        if (!text.visible || strokePreview.has(text)) continue;
+        let toLayer = text.matrix.clone();
+        for (let parent = text.parent; parent && parent !== layer; parent = parent.parent) toLayer = parent.matrix.clone().append(toLayer);
+        const copy = text.clone({ insert: false });
+        copy.matrix = toLayer;
+        strokePreview.add(copy);
+        layer.addChild(copy);
+        this.keep.push(copy);
+      }
+      this.hideEntry();
     }
-    take(point) { this.points.push([point.x, point.y, .5]); }
-    outline(last) {
-      return window.perfectFreehand.getStroke(this.points, { size: this.width, thinning: 0,
-        smoothing: .5, streamline: 0, simulatePressure: false, last });
-    }
-    schedule() {
-      if (this.frame) return;
-      this.frame = requestAnimationFrame(() => {
-        this.frame = 0;
-        if (!this.path.parent) return;
-        this.path.segments = this.outline(false);
-        this.path.closed = true;
-      });
-    }
-    stop() {
-      if (this.layer) { this.layer.opacity = this.layerOpacity; this.layer = null; }
-      super.stop();
+    add(point) { this.path.add(point); this.hideEntry(); }
+    hideEntry() {
+      for (const child of this.entryLayer?.children || []) if (!this.known.has(child)) { this.known.add(child); child.opacity = 0; }
     }
     end() {
-      this.stop();
-      cancelAnimationFrame(this.frame);
-      this.frame = 0;
-      const first = this.points[0];
-      if (!first) return this.path;
-      if (!(this.rawMove >= 2)) {
-        // 누르고 바로 떼면 엔트리 원래 붓처럼 지름 = 굵기인 동그란 점
-        const dot = new this.paper.Path.Circle({ center: [first[0], first[1]], radius: this.width / 2, insert: false });
-        this.path.segments = dot.segments;
-        this.path.closed = true;
-        return this.path;
-      }
-      // 끝점 보정: 손을 뗀 실제 위치까지 잇는다(손떨림 보정이나 점 간격 하한 때문에 끝이 덜 그려지지 않게)
-      const tail = this.points[this.points.length - 1];
-      const zoom = this.view.zoom; // 그리는 중에 휠로 확대할 수 있어 끝날 때 배율로 판단
-      if (this.lastRaw && Math.hypot(this.lastRaw.x - tail[0], this.lastRaw.y - tail[1]) * zoom >= BRUSH_MIN_STEP_PX)
-        this.points.push([this.lastRaw.x, this.lastRaw.y, tail[2]]);
-      return this.finish(this.outline(true), zoom);
-    }
-    // perfect-freehand 바깥선은 스스로 교차한다(README "Flattening"). 교차가 남은 모양은 엔트리가 같은 색 획을 합치거나
-    // 지우개로 뺄 때(paper 불리언) 겹친 쪽 조각이 통째로 사라졌다(굵기가 변하는 획, 실제 엔트리에서 최대 6800화소). README가 권하는
-    // 대로 polygon-clipping union으로 교차 없는 다각형(구멍 포함)으로 편 뒤 넘긴다. 곡선 맞춤(simplify)이 다시 교차를
-    // 만들면 그 고리는 맞추기 전 다각형을 쓴다.
-    finish(outline, zoom) {
-      const faces = window.polygonClipping ? window.polygonClipping.union([outline]) : [[outline]];
-      const rings = faces.flat().filter(ring => ring.length >= 3);
-      const paths = rings.map(ring => {
-        const raw = new this.paper.Path({ segments: ring, closed: true, insert: false });
-        if (raw.segments.length <= 4) return raw;
-        const fit = raw.clone({ insert: false });
-        fit.simplify(BRUSH_SIMPLIFY_PX / zoom);
-        return fit.getIntersections().length ? raw : fit;
-      });
-      if (paths.length <= 1) {
-        this.path.segments = paths[0]?.segments || [];
-        this.path.closed = true;
-        return this.path;
-      }
-      // 고리가 여럿(갈라진 조각·구멍)이면 한 덩어리 복합 경로로. 구멍은 바깥과 반대 방향이라 nonzero 채우기에서 빈다.
-      const item = new this.paper.CompoundPath({ children: paths, fillColor: this.path.fillColor, insert: false });
-      this.path.replaceWith(item);
-      this.path = item;
-      return item;
+      if (!this.path) return;
+      this.path.remove();
+      this.path = null;
+      for (const copy of this.keep) copy.remove();
+      this.keep = [];
+      this.layer.opacity = this.opacity;
     }
   }
-  // 비트맵 붓·지우개: 같은 입력으로 거른 점을 엔트리 그리기 함수(붓 drawRaster·지우개 eraseRaster)에 앞 점 → 새 점으로 차례로
-  // 넘긴다. 번짐 없는 화소 만들기·사각 펜·투명 잠금·무한 배경·굽기·되돌리기는 엔트리와 확장의 원래 길을 그대로 탄다
-  // (엔트리 drawRaster는 lodash throttle을 기다림 없이 써서 한 동작 안에서 여러 번 불러도 모두 그린다 — 시험으로 확인).
+  // 거른 점을 엔트리 그리기에 앞 점 → 새 점으로 차례로 넘긴다: 벡터 붓·지우개는 엔트리 획 만들기(brushItemMaker.move), 비트맵 붓·지우개는
+  // 엔트리 그리기 함수(붓 drawRaster·지우개 eraseRaster). 번짐 없는 화소 만들기·사각 펜·투명 잠금·무한 배경·굽기·되돌리기는 엔트리와 확장의
+  // 원래 길을 그대로 탄다(엔트리 drawRaster는 lodash throttle을 기다림 없이 써서 한 동작 안에서 여러 번 불러도 모두 그린다 — 시험으로 확인).
+  // 잇는 간격 = 엔트리 간격과 화면 SMOOTH_SEGMENT_PX 중 작은 쪽(비트맵은 1화소 아래로는 안 내림) — 엔트리 간격은 그림 좌표라 크게 확대하면
+  // 화면에서 듬성해져(1400%에서 비트맵 4화소 = 화면 56px) 보정을 켜도 꺾은선이었다.
   // 엔트리 drawRaster는 부를 때마다 두 점 사이 선을 72dpi로 구워 알파 경계로 끊은 그림 조각을 하나 만들고(한 번 약 2ms, 선분 길이와 거의
   // 무관 — 실측) 놓을 때까지 쌓는다. 예전엔 거른 점(간격 하한 = 지름 10%, 굵기 10이면 1px)과 합쳐 온 표본마다 불러, 같은 거리에 엔트리
   // 붓(도구 minDistance 4마다)보다 몇 배 많이 굽고 조각이 쌓여 획이 끊기고 길수록 느려졌다(사용자 제보 "랙·뚝뚝" — 몰아 보낸 입력 시험에서
@@ -6695,7 +6664,7 @@
   // 엔트리 붓(한 번 약 2ms)은 프레임마다 20ms 넘게 끊겼다(사용자 제보 — 사각 펜(한 번 0.1ms)은 괜찮음). 엔트리 원래 붓은 마우스 이동
   // 이벤트(대략 프레임당 한 번)마다 한 번 그린다. 넘치면 그 프레임의 점을 고르게 골라 잇는다(마지막 점은 늘 포함).
   const SMOOTH_FRAME_BUDGET_MS = 4, smoothDrawCost = new Map(); // 도구·사각 펜 여부 → 한 번 그리는 데 걸린 시간(이동 평균, ms)
-  class BitmapSmooth extends StrokeInput {
+  class SmoothFeed extends StrokeInput {
     constructor(ep, event, width, draw, segment, costKey) {
       super(ep, event, width);
       this.draw = draw;
@@ -6766,8 +6735,9 @@
         const started = () => mode === 'ERASER' ? !!tool.targetRaster : !!(tool.drawing && tool.tempGroup);
         const width = mode === 'ERASER' ? tool.eraserSize : paintStore()?.getState().tool.userBrushWidth;
         const draw = mode === 'ERASER' ? (a, b) => { if (started()) tool.eraseRaster(a, b); } : (a, b) => { if (started()) tool.drawRaster(a, b, true); };
-        // 잇는 간격 = 엔트리가 그 도구를 누를 때 거는 끌기 간격(붓 minDistance 4)
-        if (width > 0 && started()) tool.__evrStroke = new BitmapSmooth(ep, event, width, draw, tool.minDistance, `${mode}:${pixelPen.square ? 'square' : 'entry'}`);
+        // 잇는 간격 = 엔트리가 그 도구를 누를 때 거는 끌기 간격(붓 minDistance 4, 지우개 2)과 화면 4px 중 작은 쪽, 1화소 아래로는 안 내림
+        const segment = smoothSegment(tool.minDistance || 4, ep.project.view.zoom, 1);
+        if (width > 0 && started()) tool.__evrStroke = new SmoothFeed(ep, event, width, draw, segment, `${mode}:${pixelPen.square ? 'square' : 'entry'}`);
       } catch (error) {
         console.warn('[entry-vector-rig] 부드러운 붓(비트맵)', error);
         tool.__evrStroke = null;
@@ -6790,53 +6760,140 @@
       return up.call(this, event);
     };
   }
-  // 붓·지우개 도구의 누르기만 감싼다. 엔트리가 시작 원을 만든 직후 그걸 끝내 꺼내 지우고(엔트리 쪽 붓 조각 상태 비움),
-  // 같은 레이어에 우리 획을 시작한다. 끄기·놓기(붓은 합치기, 지우개는 빼기)·되돌리기 기록은 엔트리 코드가 우리
-  // 획(brushItemMaker)으로 그대로 한다.
   function ensureSmoothBrush(painter) {
     const ep = painter?.entryPaint;
     for (const mode of Object.keys(SMOOTH_TOOLS)) {
       const tool = vectorTool(ep, mode);
-      if (tool && !tool.__evrSmooth && typeof tool.onMouseDown === 'function') wrapSmoothTool(ep, tool, mode);
+      if (tool && !tool.__evrSmooth && typeof tool.onMouseDown === 'function' && typeof tool.onMouseDrag === 'function' &&
+        typeof tool.onMouseUp === 'function') wrapSmoothTool(ep, tool, mode);
+      if (mode === 'ERASER' && tool && !tool.__evrErase && typeof tool.erasePath === 'function') wrapVectorErase(ep, tool);
       const raster = bitmapTool(ep, mode);
       if (raster && !raster.__evrSmooth && typeof raster.onMouseDown === 'function' && typeof raster.onMouseDrag === 'function' &&
         typeof raster.onMouseUp === 'function') wrapBitmapSmooth(ep, raster, mode);
     }
   }
-  function wrapSmoothTool(ep, tool, mode) {
-    const original = tool.onMouseDown;
-    tool.__evrSmooth = true;
-    tool.onMouseDown = function (event) {
-      // 앞 획이 놓기 없이 남아 있으면(포인터 취소, 끄는 중 다른 버튼 누름 등) 붓은 그 자리에서 마감해 붓 획으로 남기고,
-      // 지우개는 미리보기만 지운다(엔트리 원래 도구도 이때 놓기 처리를 못 한다).
-      const stale = tool.brushItemMaker;
-      if (stale instanceof SmoothStroke) {
-        try {
-          const path = stale.end();
-          if (mode === 'ERASER') path?.remove();
-          else if (path?.parent) path.data.isBrushItem = true;
-        } catch (error) { console.warn('[entry-vector-rig] 부드러운 붓', error); }
-        tool.brushItemMaker = null;
+  // 엔트리 벡터 지우개(erasePath, entry-paint 260921)는 닫힌 도형에서 지우개 모양을 뺀 묶음 경로를 만든 뒤 조각을 하나씩 꺼내 위에
+  // 얹고, 비운 묶음 경로는 그대로 남긴다(보이지 않는 빈 항목 — 다음 지우기에선 빈 경로가 됨). 열린 선은 자른 조각이 따로 선이 된다.
+  // 확장은 그림 층 맨 위 항목 하나를 레이어 하나로 세므로 지울 때마다 레이어가 불어났다(사용자 제보 "지 맘대로 늘어남", 확장 없는
+  // 엔트리에서 사각형 하나를 두 번 지우면 7개). 지운 직후(엔트리 되돌리기 기록 전) 조각을 원래 항목 하나로 되돌리고 빈 항목을 지운다:
+  // 닫힌 도형은 비운 묶음 경로에 조각을 다시 넣고(모양·구멍 그대로), 열린 선은 엔트리 묶기(Wn)처럼 묶음 하나로 모은다.
+  function wrapVectorErase(ep, tool) {
+    tool.__evrErase = true;
+    const original = tool.erasePath;
+    tool.erasePath = function (shape) {
+      const P = ep.paper, PI = P.PathItem.prototype, IP = P.Item.prototype, PP = P.Path.prototype;
+      const subtract = PI.subtract, insertAbove = IP.insertAbove, splitAt = PP.splitAt;
+      const results = new Map(); // subtract 결과 → 엔트리가 그 위에 꺼내 얹은 조각
+      const splitRoot = new Map(); // 자른 조각 → 원래 열린 선
+      PI.subtract = function (...args) { const result = subtract.apply(this, args); if (result && !results.has(result)) results.set(result, []); return result; };
+      IP.insertAbove = function (item, ...rest) { results.get(item)?.push(this); return insertAbove.call(this, item, ...rest); };
+      PP.splitAt = function (...args) { const piece = splitAt.apply(this, args); if (piece) splitRoot.set(piece, splitRoot.get(this) || this); return piece; };
+      try { return original.call(this, shape); }
+      finally {
+        PI.subtract = subtract; IP.insertAbove = insertAbove; PP.splitAt = splitAt;
+        try { tidyErased(P, results, splitRoot); } catch (error) { console.warn('[entry-vector-rig] 지우개 조각 정리', error); }
+        try { eraseRasters(P, paintLayer(ep)?.layer, shape); } catch (error) { console.warn('[entry-vector-rig] 지우개 이미지 지우기', error); }
       }
-      const result = original.call(this, event);
-      const old = tool.brushItemMaker;
-      if (!smoothBrush.on || !old || old instanceof SmoothStroke ||
-          !window.perfectFreehand?.getStroke || !window.oneEuroFilter?.OneEuroFilter) return result;
+    };
+  }
+  // 엔트리 벡터 지우개는 도형(경로)만 빼고 그림(이미지) 항목은 그대로 둔다. 끄는 동안 미리보기는 그림 층 전체를 뚫어 보여, 이미지도
+  // 지워지는 것처럼 보이다가 놓으면 되살아났다(사용자 제보, 엔트리 원래 지우개도 흰 미리보기로 덮었다가 놓으면 다시 나타남). 지운 모양을
+  // 그 이미지 화소에서도 뺀다: 지우개 모양(그림 층 좌표)을 그 그림의 화소 좌표로 옮겨(paper Raster는 가운데가 원점, 1단위 = 1화소)
+  // destination-out으로 칠한다. 엔트리가 바로 뒤에 남기는 되돌리기 기록에 바뀐 화소가 들어간다.
+  function eraseRasters(P, layer, shape) {
+    if (!layer || !shape) return;
+    const area = shape.bounds;
+    for (const raster of layer.getItems({ class: P.Raster })) {
+      if (isLayerHelper(raster) || !raster.width || !raster.height) continue;
+      let toLayer = raster.matrix.clone();
+      for (let parent = raster.parent; parent && parent !== layer; parent = parent.parent) toLayer = parent.matrix.clone().append(toLayer);
+      const w = raster.width / 2, h = raster.height / 2;
+      const corners = [[-w, -h], [w, -h], [w, h], [-w, h]].map(([x, y]) => toLayer.transform(new P.Point(x, y)));
+      const xs = corners.map(p => p.x), ys = corners.map(p => p.y);
+      if (!area.intersects(new P.Rectangle(new P.Point(Math.min(...xs), Math.min(...ys)), new P.Point(Math.max(...xs), Math.max(...ys))))) continue;
+      const m = new P.Matrix().translate(raster.width / 2, raster.height / 2).append(toLayer.inverted()).append(shape.matrix);
+      const ctx = raster.getContext(true);
+      ctx.save();
+      ctx.setTransform(m.a, m.b, m.c, m.d, m.tx, m.ty);
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = '#000';
+      ctx.fill(new Path2D(shape.pathData));
+      ctx.restore();
+    }
+  }
+  function tidyErased(P, results, splitRoot) {
+    for (const [result, list] of results) {
+      if (!result.isInserted()) continue;
+      const pieces = list.filter(piece => piece.isInserted() && piece.parent === result.parent);
+      if (result instanceof P.CompoundPath && !result.children.length && pieces.length > 1) {
+        // 조각 경로는 묶음 경로 안으로 옮기고, 구멍이 있던 조각(묶음 경로)은 속만 옮긴 뒤 빈 껍데기를 지운다
+        for (const piece of pieces) result.addChildren(piece instanceof P.CompoundPath ? piece.removeChildren() : [piece]);
+        for (const piece of pieces) if (piece instanceof P.CompoundPath) piece.remove();
+      } else if (result.isEmpty()) result.remove();
+    }
+    const groups = new Map();
+    for (const [piece, root] of splitRoot) { if (!groups.has(root)) groups.set(root, [root]); groups.get(root).push(piece); }
+    for (const all of groups.values()) {
+      const alive = all.filter(path => path.isInserted() && !path.isEmpty());
+      const parent = alive[0]?.parent;
+      if (alive.length < 2 || alive.some(path => path.parent !== parent)) continue;
+      alive.sort((a, b) => a.index - b.index);
+      const group = new P.Group({ insert: false });
+      group.applyMatrix = false;
+      for (const key of ['evrName', 'evrClip']) if (alive[0].data?.[key] !== undefined) { group.data[key] = alive[0].data[key]; for (const path of alive) delete path.data[key]; }
+      parent.insertChild(alive[0].index, group);
+      group.addChildren(alive);
+      group.pivot = group.bounds.center;
+    }
+  }
+  // 벡터 붓·지우개: 누르기는 엔트리 그대로(시작 원 + 획 만들기 brushItemMaker), 끌기는 엔트리 끌기(그림 좌표 간격·throttle) 대신 거른 점을
+  // 같은 획 만들기에 넣고, 놓기 전에 남은 점까지 넣는다. 놓기(엔트리 onMouseUp: 놓은 자리까지 막대 → 합치기 → 같은 색 붓 획 합치기·
+  // 지우개로 빼기 → 되돌리기 기록)는 엔트리 그대로다.
+  function wrapSmoothTool(ep, tool, mode) {
+    tool.__evrSmooth = true;
+    const down = tool.onMouseDown, drag = tool.onMouseDrag, up = tool.onMouseUp;
+    const endStroke = () => {
+      const stroke = tool.__evrStroke;
+      tool.__evrStroke = null;
+      try { stroke?.stop(); } finally { stroke?.preview?.end(); }
+    };
+    tool.onMouseDown = function (event) {
+      endStroke(); // 앞 획이 놓기 없이 남았으면(포인터 취소 등) 넣던 점과 미리보기만 정리 — 엔트리 원래 도구와 같은 처리
+      const entryLayer = ep.project.activeLayer, known = new Set(entryLayer?.children || []);
+      const result = down.call(this, event);
+      const maker = tool.brushItemMaker;
+      if (!smoothBrush.on || !maker || !window.oneEuroFilter?.OneEuroFilter) return result;
       try {
-        // 시작 원은 엔트리가 지금 색·굵기(지우개는 지우개 크기)로 만든 것이라(반지름 = 굵기/2) 여기서 그대로 읽는다.
-        const seed = old.end(), layer = seed?.parent;
-        const color = seed?.fillColor?.clone(), size = seed?.bounds;
-        // 원 하나면 가로 = 세로 = 굵기. 엔트리 쪽에 끝나지 않은 붓 조각이 남아 있었으면 합쳐진 모양이라 짧은 변을 쓴다.
-        const width = size && (Math.abs(size.width - size.height) < .01 ? size.width : Math.min(size.width, size.height));
-        if (size && Math.abs(size.width - size.height) >= .01) console.warn('[entry-vector-rig] 붓 시작 모양이 원이 아님', size);
-        seed?.remove();
-        tool.brushItemMaker = layer && color && width > 0 ? new SmoothStroke(ep, layer, event, color, width, mode === 'ERASER') : null;
-        tool.minDistance = 1;
+        const state = paintStore()?.getState().tool;
+        const width = mode === 'ERASER' ? state?.userEraserSize : state?.userBrushWidth;
+        if (!(width > 0)) return result;
+        const layer = paintLayer(ep)?.layer;
+        const preview = mode === 'ERASER' && layer ? new EraserPreview(ep, layer, entryLayer, known, event.point, width) : null;
+        const draw = (a, b) => {
+          if (tool.brushItemMaker !== maker) return;
+          maker.move({ point: b });
+          preview?.add(b);
+        };
+        // 엔트리 간격 = 엔트리가 누를 때 거는 끌기 간격(3+굵기/5, 그림 좌표)
+        const stroke = new SmoothFeed(ep, event, width, draw, smoothSegment(3 + Math.floor(width / 5), ep.project.view.zoom), `VECTOR_${mode}`);
+        stroke.preview = preview;
+        tool.__evrStroke = stroke;
       } catch (error) {
         console.warn('[entry-vector-rig] 부드러운 붓', error);
-        tool.brushItemMaker = null;
+        endStroke();
       }
       return result;
+    };
+    tool.onMouseDrag = function (event) {
+      const stroke = tool.__evrStroke;
+      if (!stroke || !tool.brushItemMaker) return drag.call(this, event);
+      stroke.move(event);
+      return undefined;
+    };
+    tool.onMouseUp = function (event) {
+      // 지우개는 놓을 때 그림 층 항목에서 지울 모양을 빼므로 미리보기가 먼저 빠져야 한다
+      try { endStroke(); } catch (error) { console.warn('[entry-vector-rig] 부드러운 붓', error); }
+      return up.call(this, event);
     };
   }
   // 붓·지우개 옵션 줄(엔트리 아래쪽 "펜 | 윤곽선 굵기 | 채우기 색상" 등) 끝에 부드럽게·보정을 붙인다(벡터·비트맵 같은 설정).
@@ -7436,8 +7493,8 @@
   // 켜짐). 옛 묶음은 열 때 푼다(normalizeVectorLayers). 저장 SVG에는 자르기가 안 남아 확장 없는 편집기로 열면 잘리지 않은 채 보이지만,
   // 실행 화면 PNG는 그림판 그리기 그대로라 잘려 있다. 다시 열면 data를 보고 되살린다.
   const CLIP_STACK = 'evrClipStack', CLIP_ISOLATE = .99999;
-  const isLayerHelper = item => item?.data?.entryVectorCanvasBox === '1' || !!item?.data?.evrLayerDisplay;
-  const helperFast = item => !!(item._data && (item._data.entryVectorCanvasBox === '1' || item._data.evrLayerDisplay));
+  const isLayerHelper = item => item?.data?.entryVectorCanvasBox === '1' || !!item?.data?.evrLayerDisplay || (!!item && strokePreview.has(item));
+  const helperFast = item => strokePreview.has(item) || !!(item._data && (item._data.entryVectorCanvasBox === '1' || item._data.evrLayerDisplay));
   // 잘라 그릴 그림 층들(벡터 모드 그림 층 — 맨 위 항목만). 레이어 작은 그림처럼 자르지 않은 내용을 구울 때는 clipDrawOff를 올린다.
   const clipLayers = new WeakSet();
   let clipDrawOff = 0;

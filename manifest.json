@@ -8,7 +8,7 @@
     "matches": ["https://playentry.org/ws/*"],
     "run_at": "document_idle",
     "world": "MAIN",
-    "js": ["vendor/IK-browser.js", "vendor/warp.js", "vendor/delaunator.min.js", "vendor/gl-matrix-min.js", "vendor/perfect-freehand.js", "vendor/one-euro-filter.js", "vendor/polygon-clipping.umd.min.js", "vendor/d3-array.min.js", "vendor/d3-contour.min.js", "vendor/ag-psd.js", "vendor/bresenham-zingl.js", "rig.js"],
+    "js": ["vendor/IK-browser.js", "vendor/warp.js", "vendor/delaunator.min.js", "vendor/gl-matrix-min.js", "vendor/one-euro-filter.js", "vendor/d3-array.min.js", "vendor/d3-contour.min.js", "vendor/ag-psd.js", "vendor/bresenham-zingl.js", "rig.js"],
     "css": ["rig.css"]
   }]
 }

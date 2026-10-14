@@ -24,7 +24,6 @@ SOFTWARE.
 
 Third-party libraries in vendor/ keep their own licenses:
 gl-matrix (MIT), delaunator (ISC), warp.js (MIT), IK.ts (MIT, bundles three.js parts under MIT),
-perfect-freehand (MIT), 1eurofilter (BSD-3-Clause, Inria),
-polygon-clipping (MIT; its UMD build bundles splaytree (MIT) and robust-predicates (Unlicense)),
-d3-array (ISC, bundles internmap (ISC)), d3-contour (ISC).
+1eurofilter (BSD-3-Clause, Inria), d3-array (ISC, bundles internmap (ISC)), d3-contour (ISC),
+ag-psd (MIT, its bundle includes base64-js (MIT)), bresenham-zingl (MIT).
 See the LICENSE files in vendor/.
