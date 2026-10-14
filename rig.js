@@ -1157,6 +1157,15 @@
     }
     if (cover.parentElement !== area) area.append(cover);
   }
+  // 엔트리가 작품을 불러오는 중인가. 엔트리 사이트는 .ent를 넣은 뒤 다른 정리를 기다렸다가 Entry.Loader.isLoaded()를 보고, 아직이면
+  // loadComplete를 기다려 진행 창("업로드 중이에요.")을 닫는다. 그런데 엔트리는 loadComplete를 작품마다 한 번만 보내서, 그 사이 확장이
+  // 모양 그림을 다시 불러(setImage) 대기열에 넣으면 창이 영영 안 닫혔다(2026-10-15 재현, 애니메이터만 켜고 약 3번에 1번). 그래서 진행 창이
+  // 떠 있거나 불러오는 중에는 작품을 연 뒤 모양을 바꾸는 자동 정리(주소 다시 걸기·자기 파일·.ent 레이어)를 다음 번으로 미룬다.
+  function entryLoading() {
+    const loader = window.Entry?.Loader;
+    if (typeof loader?.isLoaded === 'function' && !loader.isLoaded()) return true;
+    return [...document.querySelectorAll('[class*="modal_progress"]')].some(element => element.getClientRects().length);
+  }
   // .ent를 다시 열면 엔트리 서버가 fileurl을 빼고 돌려준다. SVG로 저장한 픽셀 모양은 새 파일
   // 이름으로도 서버에 SVG가 남아 있으므로(시험으로 확인) 주소만 다시 건다. 업로드는 하지 않고,
   // 확인 요청도 한 번에 2개까지만 보낸다.
@@ -1164,6 +1173,7 @@
   let svgChecking = 0;
   // 아틀라스 칸을 쓰는 모양(imageType png)도 같은 방법으로 칸 주소를 다시 건다(아틀라스 파일로 확인).
   function restorePixelFileurls() {
+    if (entryLoading()) return;
     for (const object of window.Entry?.container?.getAllObjects?.() || []) {
       for (const picture of object.pictures || []) {
         const atlas = pixelOf(picture) ? atlasOf(picture) : null;
@@ -1460,7 +1470,7 @@
   const ownJobs = new Set(), ownFailed = new Map(), OWN_SLOTS = 2; // ownFailed: 모양 id → 다시 시도할 때
   function ownPixelPictures() {
     // 다른 일괄 작업(픽셀 켜기·끄기, 맞추기, 공통 크기)이 도는 동안은 미룬다 — 그 작업이 같은 모양을 바꾸는 중일 수 있다
-    if (pixelBusy || alignBusy || unifyRunning) return;
+    if (pixelBusy || alignBusy || unifyRunning || entryLoading()) return;
     const painter = window.Entry?.playground?.painter;
     for (const object of window.Entry?.container?.getAllObjects?.() || []) {
       for (const picture of object.pictures || []) {
@@ -8140,6 +8150,7 @@
   // .ent로 불러온 레이어 모양: 합친 PNG(새 파일)와 담겨 온 레이어 원본으로 레이어 SVG를 다시 올리고 모양을 그 파일로 바꾼다
   const entLayerJobs = new Set(), entLayerFailed = new Map(); // 모양 id → 실패한 때(30초 뒤 다시)
   function restoreEntLayers() {
+    if (entryLoading()) return;
     for (const object of window.Entry?.container?.getAllObjects?.() || []) {
       for (const picture of object.pictures || []) {
         const meta = picture.dimension?.[LAYER_ENT];
