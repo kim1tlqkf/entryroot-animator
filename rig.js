@@ -8035,9 +8035,14 @@
     }
     if (fixed) console.warn(`[entry-vector-rig] 그림 주소가 빠진 모양 ${fixed}개를 원래 주소로 이어 불러옵니다`);
   }
+  // 다른 확장도 loadProject를 감쌀 수 있다. 맨 위가 우리 것인지만 보고 0.5초마다 다시 감싸면, 상대도 같은 식일 때 서로 끝없이 쌓여
+  // 작품을 열 때마다 쌓인 수만큼 돈다(다른 확장과 함께 켠 크롬에서 '응답 없음' 기록). 엔트리마다 한 번만 감싸고(위에 누가 감싸도 우리 것은
+  // 그 아래에서 그대로 불림), 엔트리가 아직 없을 때만 refresh에서 다시 시도한다.
+  const loadRepairHooked = new WeakSet();
   function hookLoadRepair() {
     const E = window.Entry;
-    if (typeof E?.loadProject !== 'function' || E.loadProject.__evrRepair) return;
+    if (typeof E?.loadProject !== 'function' || loadRepairHooked.has(E) || E.loadProject.__evrRepair) return;
+    loadRepairHooked.add(E);
     const original = E.loadProject;
     const wrapped = function (project, ...rest) {
       try { repairPictures(project); } catch (error) { console.warn('[entry-vector-rig] 모양 주소 잇기', error); }
