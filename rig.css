@@ -293,6 +293,31 @@
 /* 모양 맞추기 창: 아래 모양 띠(지금 모양 파란 테두리, 고른 모양 옅은 파랑, 기준 주황 표시, 옮긴 모양 번호 주황) */
 /* 중심 맞추기 창: 나누기 창보다 작게 */
 .evr-slicer.evr-center { width: min(760px, calc(100vw - 32px)); height: min(520px, calc(100vh - 32px)); }
+/* 캔버스 창: 설정만 있는 작은 창 */
+.evr-slicer.evr-canvas { width: min(440px, calc(100vw - 32px)); height: auto; max-height: calc(100vh - 32px); }
+.evr-slicer .evr-canvas-side { flex: 1; width: auto; border-left: 0; padding: 4px 16px 12px; }
+.evr-slicer .evr-canvas-side .evr-slicer-row { margin-top: 6px; }
+.evr-slicer .evr-canvas-side .evr-slicer-row button { height: 28px; padding: 0 10px; font-size: 12px; }
+.evr-canvas .evr-slicer-status[data-warn="true"] { color: #c0392b; }
+/* 모양 이름 붙이기 창: 왼쪽 모양 목록(고른 줄 옅은 파랑), 오른쪽 새 이름 */
+.evr-slicer.evr-rename { width: min(760px, calc(100vw - 32px)); height: min(560px, calc(100vh - 32px)); }
+.evr-rename-list {
+  flex: 1; min-height: 0; overflow-y: auto; padding: 6px; user-select: none;
+  scrollbar-width: thin; scrollbar-color: #c3cdd9 transparent;
+}
+.evr-rename-row {
+  display: grid; grid-template-columns: 32px 40px minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 8px;
+  height: 46px; padding: 0 8px; border: 1px solid transparent; border-radius: 6px; cursor: pointer;
+}
+.evr-rename-row:hover { background: #f3f6fb; }
+.evr-rename-row[aria-selected="true"] { border-color: #b8ccff; background: #eef3ff; }
+.evr-rename-index { color: #8796a8; font-size: 12px; text-align: right; }
+.evr-rename-thumb {
+  width: 40px; height: 40px; object-fit: contain; border-radius: 4px; background: #eef1f5;
+  image-rendering: pixelated;
+}
+.evr-rename-old, .evr-rename-new { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.evr-rename-new { color: #3d6ef0; font-weight: 600; }
 .evr-aligner-strip {
   display: flex; flex: none; gap: 4px; overflow-x: auto; padding: 6px 10px; border-top: 1px solid #e3e8ef;
   background: #f7f9fc; scrollbar-width: thin; scrollbar-color: #c3cdd9 transparent;
@@ -328,6 +353,7 @@
 #entryPainter .evr-brush-level { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
 #entryPainter .evr-brush-level b { min-width: 1.6em; color: #4f80ff; text-align: left; }
 #entryPainter .evr-brush-opts[data-off="true"] .evr-brush-level { opacity: .4; pointer-events: none; }
+#entryPainter .evr-brush-opts [hidden] { display: none; }
 #entryPainter .evr-brush-level input[type="range"] {
   -webkit-appearance: none; appearance: none; width: 64px; height: 18px; margin: 0; padding: 0;
   background: transparent; cursor: pointer;
@@ -348,3 +374,40 @@
 }
 #entryPainter .evr-opacity-title { font-size: 13px; font-weight: 700; color: #2c313d; }
 #entryPainter .evr-opacity-opts .evr-brush-level b { min-width: 2.6em; }
+#entryPainter .evr-opacity-opts [hidden] { display: none; }
+/* 비트맵 레이어 창: 그림 칸 오른쪽 위, 접어 둠 */
+#entryPainter .evr-layers {
+  position: absolute; right: 12px; top: 12px; z-index: 30; width: 212px; box-sizing: border-box;
+  border: 1px solid #e2e2e2; border-radius: 8px; background: #fff; box-shadow: 0 2px 8px rgba(0, 0, 0, .12);
+  font-family: NanumGothicOTF, NanumGothic, sans-serif; font-size: 12px; color: #555;
+}
+#entryPainter .evr-layers[data-open="false"] { width: auto; }
+#entryPainter .evr-layers-toggle {
+  display: block; width: 100%; height: 30px; margin: 0; padding: 0 12px; border: 0; background: none;
+  font: inherit; font-size: 13px; font-weight: 700; color: #2c313d; text-align: left; cursor: pointer;
+}
+#entryPainter .evr-layers[data-open="false"] .evr-layers-body { display: none; }
+#entryPainter .evr-layers-list { max-height: 210px; margin: 0; padding: 0 6px; overflow-y: auto; list-style: none; border-top: 1px solid #eee; }
+#entryPainter .evr-layer {
+  display: flex; align-items: center; gap: 6px; height: 32px; margin: 3px 0; padding: 0 6px; border-radius: 6px; cursor: pointer;
+}
+#entryPainter .evr-layer[aria-selected="true"] { background: #eaf0ff; box-shadow: inset 0 0 0 1px #4f80ff; }
+#entryPainter .evr-layer-eye {
+  width: 22px; height: 22px; margin: 0; padding: 0; border: 0; border-radius: 4px; background: none; color: #4f80ff; font-size: 13px; cursor: pointer;
+}
+#entryPainter .evr-layer-eye[aria-pressed="false"] { color: #bbb; }
+#entryPainter .evr-layer-thumb {
+  flex: none; width: 40px; height: 24px; border: 1px solid #e2e2e2; border-radius: 3px;
+  background: repeating-conic-gradient(#eee 0% 25%, #fff 0% 50%) 0 0 / 8px 8px;
+}
+#entryPainter .evr-layer-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #2c313d; }
+#entryPainter .evr-layer-badges { flex: none; color: #4f80ff; font-size: 11px; }
+#entryPainter .evr-layers-props { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px 4px; border-top: 1px solid #eee; }
+#entryPainter .evr-layers-props .evr-brush-level input[type="range"] { width: 80px; }
+#entryPainter .evr-layers-props .evr-brush-level b { min-width: 2.6em; }
+#entryPainter .evr-layers-actions { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 10px 10px; }
+#entryPainter .evr-layers-act {
+  height: 24px; margin: 0; padding: 0 8px; border: 1px solid #e2e2e2; border-radius: 12px; background: #fff;
+  font: inherit; font-weight: 700; color: #555; cursor: pointer;
+}
+#entryPainter .evr-layers-act:disabled, #entryPainter .evr-layers .evr-brush-toggle:disabled { opacity: .4; cursor: default; }
