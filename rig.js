@@ -107,6 +107,10 @@
       item.className === 'Shape')?.bounds;
     return { layer: layers[0], stage };
   }
+  function pictureSwitching() {
+    const E = window.Entry, p = E?.playground?.painter, object = E?.container?.selectedObject;
+    return !!(p && object?.selectedPicture && (p.__evrLoading || (p.file?.id && p.file.id !== object.selectedPicture.id)));
+  }
   function context() {
     const E = window.Entry, p = E?.playground?.painter, ep = p?.entryPaint;
     const object = E?.container?.selectedObject;
@@ -114,6 +118,10 @@
     if (!root || !root.getClientRects().length || !object?.selectedPicture ||
         E.playground.object !== object || !ep?.project ||
         !['VECTOR', 'BITMAP'].includes(ep.mode)) return null;
+    // 모양을 바꾸는 동안은 선택 모양이 먼저 바뀌고 편집기 그림은 아직 앞 모양 것이다(비동기 불러오기, 저장 확인창이 떠 있는 동안 —
+    // 확인창 동안 file.id는 앞 모양). 그 사이 0.5초 갱신이 새 모양 정보에 앞 모양 그림 기준 값(기준점·상자 표시)을 쓰지 않게
+    // 비워 둔다(검토로 찾음 2026-10-16 — 무한 배경 접기에서 같은 틈이 실제로 재현됨).
+    if (pictureSwitching()) return null;
     const found = paintLayer(ep);
     if (!found) return null;
     const canvas = root.querySelector('.canvas_area #paint_canvas');
@@ -761,11 +769,13 @@
     const canvas = document.createElement('canvas');
     canvas.width = size.width; canvas.height = size.height;
     const context = canvas.getContext('2d');
-    context.drawImage(image, Math.floor((size.width - image.naturalWidth) / 2),
-      Math.floor((size.height - image.naturalHeight) / 2));
+    const left = Math.floor((size.width - image.naturalWidth) / 2), top = Math.floor((size.height - image.naturalHeight) / 2);
+    context.drawImage(image, left, top);
     context.fillStyle = 'rgba(0, 0, 0, 0.01)';
     for (const [x, y] of cornersOf(size)) context.fillRect(x, y, 2, 2);
-    return { ext: 'png', image: canvas.toDataURL('image/png'), size };
+    // shift: 그림이 십자(그림 가운데) 기준으로 옮겨진 거리 — 홀수 차이면 반 칸(레이어 원본 자리를 같이 옮길 때 씀)
+    return { ext: 'png', image: canvas.toDataURL('image/png'), size,
+      shift: { x: left + image.naturalWidth / 2 - size.width / 2, y: top + image.naturalHeight / 2 - size.height / 2 } };
   }
   // 픽셀 모양은 원래 해상도에서 여백을 맞춘 뒤 SVG 방식으로 다시 만든다(size는 k배 크기).
   async function resizedPixel(picture, size, k) {
@@ -773,11 +783,11 @@
     const target = { width: Math.round(size.width / k), height: Math.round(size.height / k) };
     const canvas = canvasOfSize(target.width, target.height), context = canvas.getContext('2d');
     context.imageSmoothingEnabled = false;
-    context.drawImage(art, Math.floor((target.width - art.width) / 2),
-      Math.floor((target.height - art.height) / 2));
+    const left = Math.floor((target.width - art.width) / 2), top = Math.floor((target.height - art.height) / 2);
+    context.drawImage(art, left, top);
     context.fillStyle = 'rgba(0, 0, 0, 0.01)';
     for (const [x, y] of cornersOf(target)) context.fillRect(x, y, 2, 2);
-    return pixelPayload(canvas, k);
+    return { ...pixelPayload(canvas, k), shift: { x: left + art.width / 2 - target.width / 2, y: top + art.height / 2 - target.height / 2 } };
   }
   // 이전 버전은 상자가 무대보다 크면 잘린 PNG를 올렸다. 실행 화면은 PNG를 쓰므로 크기가 다르면 고친다.
   async function runtimePngMatches(picture) {
@@ -909,7 +919,7 @@
     if (!('entryVectorAtlas' in patch)) delete dimension.entryVectorAtlas;
     for (const key of Object.keys(dimension)) if (dimension[key] === undefined) delete dimension[key];
     Object.assign(saved, { id: current.id, name: current.name, objectId: object.id,
-      imageType: payload.ext, dimension });
+      imageType: payload.imageType || payload.ext, dimension });
     delete saved.thumbUrl;
     // 픽셀 모양은 실행 화면이 SVG(pixelated)를 쓰도록 fileurl을 건다. 빠져도 k배 PNG가 남는다.
     if (payload.pixelSvg) saved.fileurl = svgFile(saved.filename);
@@ -982,13 +992,29 @@
         const pixel = pixelOf(picture);
         if (!differs(picture, size) && !needsSvg(picture) &&
             (pixel || await runtimePngMatches(picture))) return;
+        const layered = !!picture.dimension?.[LAYER_MARK];
         if (pixel && !pixelVector(picture)) {
-          const payload = await resizedPixel(picture, size, pixel);
-          if (isCurrent()) await uploadPicture(object, picture, payload, isCurrent);
+          let payload = await resizedPixel(picture, size, pixel), gone = false;
+          if (layered) {
+            try { payload = await withLayerOriginal(picture, payload, payload.shift); }
+            catch (error) { if (!error.missing) throw error; gone = true; }
+          }
+          // 레이어 원본이 이미 없는 모양은 레이어 표시를 지우고 보통 그림으로 맞춘다(계속 건너뛰며 저장마다 경고하지 않게)
+          if (isCurrent()) await uploadPicture(object, picture, payload, isCurrent,
+            layered ? { [LAYER_ENT]: undefined, ...(gone ? { [LAYER_MARK]: undefined } : {}) } : undefined);
           return;
         }
-        const payload = picture.imageType === 'svg' ?
+        let payload = picture.imageType === 'svg' ?
           await resizedSvg(picture, size) : await resizedPng(picture, size);
+        // 비트맵 레이어 모양은 합친 PNG만 올리면 새 파일에 레이어 원본(SVG)이 없어 레이어가 사라졌다(검토로 찾음 2026-10-16) — 같이 올린다
+        if (layered && picture.imageType === 'png') {
+          let gone = false;
+          try { payload = await withLayerOriginal(picture, payload, payload.shift); }
+          catch (error) { if (!error.missing) throw error; gone = true; }
+          if (!isCurrent()) return;
+          await uploadPicture(object, picture, payload, isCurrent, { [LAYER_ENT]: undefined, ...(gone ? { [LAYER_MARK]: undefined } : {}) });
+          return;
+        }
         if (!isCurrent()) return;
         if (pixelVector(picture)) {
           await uploadPicture(object, picture, payload, isCurrent, { entryVectorPixel: 1, [PIXEL_VECTOR]: 'svg' });
@@ -1069,7 +1095,7 @@
           const layer = this.entryPaint && paintLayer(this.entryPaint)?.layer;
           if (layer) delete layer.data[LAYERS];
           layerUi.importing = { token, meta: ready?.__evrLayers || null };
-          layerUi.signature = '';
+          layerUi.signature = null;
         } catch (error) { console.warn('[entry-vector-rig] 레이어 목록 비우기', error); }
         try {
           original.call(this, ready, isImport, ...rest);
@@ -2151,9 +2177,31 @@
     let sent = 0;
     const saved = (i, file) => { uploaded.set(i, file); toast(`${verb}… 올리기 ${++sent}/${list.length}`); };
     const vectorList = list.filter(i => vectors[i]);
-    await uploadArts({ indexes: list.filter(i => !vectors[i]),
+    // 그림이 십자 기준으로 옮겨진 거리(잘라 낸 그림의 기준점이 틀 가운데에 옴). 레이어 원본·비트맵 뼈대 관절도 십자 기준이라 같이 옮긴다 —
+    // 예전엔 PNG만 묶어 올려 비트맵 레이어 모양의 레이어가 사라지고, 관절은 옛 자리에 남았다(검토로 찾음 2026-10-16).
+    const shiftOf = i => ({ x: arts[i].width / 2 - items[i].rect.x - anchors[i][0], y: arts[i].height / 2 - items[i].rect.y - anchors[i][1] });
+    const layeredList = k ? [] : list.filter(i => !vectors[i] && pictures[i].dimension?.[LAYER_MARK]);
+    const layeredSet = new Set(layeredList), lostLayers = new Set(), flattened = new Set();
+    await uploadArts({ indexes: list.filter(i => !vectors[i] && !layeredSet.has(i)),
       artAt: i => scale > 1 ? scaledCanvas(frameOf(i), size.width, size.height) : frameOf(i),
       state: {}, onSaved: saved });
+    // 비트맵 레이어 모양: 레이어 원본을 옮겨 PNG와 같은 요청으로 한 장씩(묶음 업로드는 PNG만 받음). 원본을 못 받으면 그 모양은 건너뜀
+    await runLimited(layeredList.map(i => async () => {
+      try {
+        const plain = { ext: 'png', image: frameOf(i).toDataURL('image/png'), size };
+        let payload;
+        try { payload = await withLayerOriginal(pictures[i], plain, shiftOf(i)); }
+        catch (error) {
+          if (!error.missing) throw error;
+          payload = plain; // 레이어 원본이 이미 없는 모양: 보통 그림으로 맞추고 표시를 지운다
+          flattened.add(i);
+        }
+        saved(i, await uploadPayload(payload));
+      } catch (error) {
+        lostLayers.add(i);
+        console.warn('[entry-vector-rig] 레이어 원본을 읽지 못해 이 모양은 그대로 둡니다', pictures[i].name, error);
+      }
+    }), UPLOAD_SLOTS);
     // 벡터 모양: 기준점(SVG 좌표)이 틀 가운데에 오게 보이는 범위를 옮긴 SVG(+PNG)를 한 장씩 올린다(SVG는 묶음 업로드가 느림)
     await runLimited(vectorList.map(i => async () => {
       const { view } = vectors[i], { x, y } = items[i].rect;
@@ -2171,6 +2219,7 @@
     const next = [];
     for (const i of list) {
       const picture = pictures[i], current = object.pictures.find(item => item.id === picture.id);
+      if (lostLayers.has(i) || !uploaded.has(i)) continue;
       if (!current || pictureFile(current) !== pictureFile(picture) || current.fileurl !== picture.fileurl) continue;
       const dimension = { ...current.dimension, width: size.width, height: size.height,
         entryVectorNativeCanvas: true, entryVectorArt: { x: clean(Math.max(anchors[i][0], items[i].w - anchors[i][0])),
@@ -2178,13 +2227,25 @@
       delete dimension.entryVectorPivot;
       delete dimension.entryVectorAtlas;
       if (marks) dimension.entryVectorAtlas = marks[i];
+      if (!vectors[i]) {
+        const shift = shiftOf(i);
+        if (dimension[BITMAP_RIG]) {
+          try {
+            const rig = JSON.parse(dimension[BITMAP_RIG]);
+            rig.joints = rig.joints.map(j => ({ ...j, x: clean(j.x + shift.x), y: clean(j.y + shift.y) }));
+            dimension[BITMAP_RIG] = JSON.stringify(rig);
+          } catch (error) { console.warn('[entry-vector-rig] 비트맵 뼈대 관절 옮기기', picture.name, error); }
+        }
+        if (layeredSet.has(i)) delete dimension[LAYER_ENT]; // 새 파일 SVG에 옮긴 레이어 원본이 있다(.ent용 담은 값은 옛 자리)
+        if (flattened.has(i)) delete dimension[LAYER_MARK];
+      }
       const result = { ...current, filename: uploaded.get(i).filename, imageType: vectors[i] ? 'svg' : 'png', dimension };
       delete result.thumbUrl;
       if (marks) result.fileurl = atlasUrl(marks[i]); else delete result.fileurl;
       next.push(result);
     }
     setPicturesBatch(object.id, next);
-    return { done: next.length, skipped: list.length - next.length };
+    return { done: next.length, skipped: list.length - next.length - lostLayers.size, keptLayers: lostLayers.size };
   }
   // 맞출 기준점 규칙(스프라이트 나누기와 같음): 모양마다 그림 부분 상자의 비율 점(pivot)을 같은 자리에 맞추고, 맞춘 전체의
   // 가운데를 회전 중심으로 한다. 돌려주는 anchors[i]는 commitPictureFrames가 틀 가운데에 둘 점(잘라 낸 그림 안 정수 px).
@@ -2319,6 +2380,7 @@
         frames.anchors = pivotAnchors(items, pivot);
         const result = await commitPictureFrames(object, frames, pictures.map((picture, i) => i), '중심 맞추는 중');
         toast(`모양 ${result.done}개의 중심을 맞췄습니다${result.skipped ? ` (그 사이 바뀐 모양 ${result.skipped}개는 그대로)` : ''}` +
+          (result.keptLayers ? ` · 레이어 원본을 읽지 못한 모양 ${result.keptLayers}개는 그대로` : '') +
           ' · 되돌리기 가능 · 작품을 저장하세요', 6000);
         close(true);
       } catch (error) {
@@ -3567,6 +3629,7 @@
             `모양이 커져 같은 크기 틀을 맞추느라 모양 ${list.length}개를 다시 올립니다(바꾼 것 ${changed.length}개). 계속할까요?`));
         if (!result) { status.textContent = '적용하지 않았습니다.'; return; }
         toast(`모양 ${result.done}개에 적용했습니다${result.skipped ? ` (그 사이 바뀐 모양 ${result.skipped}개는 그대로)` : ''}` +
+          (result.keptLayers ? ` · 레이어 원본을 읽지 못한 모양 ${result.keptLayers}개는 그대로` : '') +
           ' · 되돌리기 가능 · 작품을 저장하세요', 6000);
         close(true);
       } catch (error) {
@@ -5577,7 +5640,7 @@
       mode.addEventListener('click', () => {
         try {
           if (session) close();
-          else open(context(), mode);
+          else { const c = context(); if (c) open(c, mode); } // 모양을 바꾸는 틈에는 열지 않음
         } catch (error) { window.alert(error.message || String(error)); }
       });
       wrap.append(mode);
@@ -5830,6 +5893,9 @@
     // 이벤트(mousedown·mousemove·mouseup)도 생기지 않는다.
     area.addEventListener('pointerdown', event => {
       if (!(event.button === 0 || event.button === 1 || event.button === 2)) return;
+      // 그림판 칸 안에 띄운 확장 창(레이어 창·투명도 상자)은 화면 이동으로 가로채지 않는다 — 손 도구·스페이스일 때 창의 단추·밀대가
+      // 눌리지 않았다(검토로 찾음 2026-10-16)
+      if (event.target?.closest?.('.evr-layers, .evr-opacity-opts')) return;
       const now = current();
       if (!now || (event.button === 0 && !painterSpace && !entryHandTool(now))) return;
       event.preventDefault();
@@ -5935,6 +6001,75 @@
       }
       return original.call(this, rect, ...rest);
     };
+  }
+  // run을 부르는 동안 Math.max/min 첫 몇 번의 경계만 바꾼다. edges는 엔트리가 부르는 차례대로 [함수, 경계가 든 인자 자리, 엔트리 경계,
+  // 바꿀 경계, 다른 인자(끄는 점 좌표)]. 다른 인자까지 같아야 바꾼다 — 그 사이 paper 내부가 우연히 같은 경계로 Math를 불러도 건드리지
+  // 않게. 차례·값이 어긋나면(엔트리가 바뀜) 그 자리에서 원래 Math로 돌려 엔트리 그대로 둔다. 엔트리가 모듈 안 상수로 끄는 점을 묶는
+  // 곳(아래 두 곳)에 쓴다 — 상수를 밖에서 바꿀 길이 없다(entry-paint 261015 소스로 확인).
+  function callWithEdges(edges, run) {
+    const { max, min } = Math;
+    let step = 0;
+    const restore = () => { Math.max = max; Math.min = min; };
+    const pick = which => function (...args) {
+      const [want, at, limit, wide, other] = edges[step] || [];
+      if (want !== which || args.length !== 2 || args[at] !== limit || args[1 - at] !== other) { restore(); return which.apply(Math, args); }
+      if (++step === edges.length) restore();
+      args[at] = wide;
+      return which(...args);
+    };
+    Math.max = pick(max); Math.min = pick(min);
+    try { return run(); } finally { restore(); }
+  }
+  // 엔트리 선택 이동(entry-paint 261015 Mt.onMouseDrag)은 끄는 점을 xt.getValidMousePoint로 옛 무대(모듈 안 상수 ue.minX..maxY
+  // = 720..1680, 405..945)에 묶어, 캔버스를 키우면 옛 무대 밖으로 옮길 수 없었다(사용자 제보 2026-10-16, 벡터·비트맵 모두 재현 — 1900까지
+  // 끌면 1680에서 멈춤). 그 함수가 view.on('mousedrag')로 붙을 때 감싸, 첫 묶기 네 번(Math.max(x, minX), Math.min(·, maxX), y도 같은
+  // 차례)의 경계만 지금 배경 범위로 바꿔 부른다.
+  const moveDrags = new WeakMap();
+  function hookMoveClamp(ep) {
+    const view = ep.project?.view;
+    if (!view || own(view, '__evrMoveClamp') || typeof view.on !== 'function' || typeof view.off !== 'function') return;
+    Object.defineProperty(view, '__evrMoveClamp', { value: true });
+    const on = view.on, off = view.off;
+    view.on = function (type, fn, ...rest) {
+      if (type !== 'mousedrag' || typeof fn !== 'function' || !String(fn).includes('getValidMousePoint')) return on.call(this, type, fn, ...rest);
+      let wrapped = moveDrags.get(fn);
+      if (!wrapped) {
+        wrapped = function (event, ...args) {
+          // 범위 = 옛 무대와 지금 배경을 합친 것(작은 캔버스에서 예전보다 좁아지지 않게). 끌 때마다 그림판을 훑지 않게 붙잡아 둔 배경 층을 쓴다
+          const bg = areaState.ep === ep && areaState.bg?.bounds, old = areaRect(ep, AREA_DEFAULT.w, AREA_DEFAULT.h), p = event?.point;
+          if (!bg || !p || old.contains(bg)) return fn.call(this, event, ...args);
+          const left = Math.min(old.left, bg.left), right = Math.max(old.right, bg.right), top = Math.min(old.top, bg.top), bottom = Math.max(old.bottom, bg.bottom);
+          const { max, min } = Math;
+          return callWithEdges([[max, 1, old.left, left, p.x], [min, 1, old.right, right, Math.max(p.x, left)],
+            [max, 1, old.top, top, p.y], [min, 1, old.bottom, bottom, Math.max(p.y, top)]], () => fn.call(this, event, ...args));
+        };
+        moveDrags.set(fn, wrapped);
+      }
+      return on.call(this, type, wrapped, ...rest);
+    };
+    view.off = function (type, fn, ...rest) {
+      return off.call(this, type, (type === 'mousedrag' && moveDrags.get(fn)) || fn, ...rest);
+    };
+  }
+  // 엔트리 사각형·원 도구(entry-paint 261015 Wr.doing)는 끄는 점을 Math.max(0, x)·Math.max(0, y)로 캔버스 원점에 묶어, 캔버스를 2400보다
+  // 넓히거나(가로 3배 등) 비트맵 무한 배경을 켜서 배경이 0보다 왼쪽·위로 넓어지면 그쪽으로는 도형을 키울 수 없었다(검토로 찾음 2026-10-16).
+  // 두 도구의 끌기를 감싸 배경이 0 밖으로 나갈 때만 그 두 경계를 배경 끝으로 바꾼다.
+  const shapeDragTools = new WeakSet(); // 도구마다 한 번만 감싼다(다른 확장이 위에 또 감싸도 0.5초마다 쌓이지 않게)
+  function hookShapeDrag(ep) {
+    for (const tool of ep.paper?.tools || []) {
+      const mode = tool.MY_MODE?.toolMode;
+      if ((mode !== 'RECT' && mode !== 'ELLIPSE') || typeof tool.onMouseDrag !== 'function' || shapeDragTools.has(tool)) continue;
+      shapeDragTools.add(tool);
+      const original = tool.onMouseDrag;
+      const wrapped = function (event, ...args) {
+        const bounds = areaState.ep === ep && areaState.bg?.bounds;
+        if (!bounds || (bounds.left >= 0 && bounds.top >= 0)) return original.call(this, event, ...args);
+        const { max } = Math, p = event?.point;
+        if (!p) return original.call(this, event, ...args);
+        return callWithEdges([[max, 0, 0, Math.min(0, bounds.left), p.x], [max, 0, 0, Math.min(0, bounds.top), p.y]], () => original.call(this, event, ...args));
+      };
+      tool.onMouseDrag = wrapped;
+    }
   }
   // 비트맵 무한 배경은 둘레(칸 3배)까지 — 엔트리가 둘레에 그린 것을 자르지 않고, 그림 층에 들어올 때 칸으로 접는다(hookPaintLayer).
   function applyStageRect() {
@@ -6151,6 +6286,11 @@
     layer.addChild = function (item, ...rest) {
       if (isRasterLayer(item)) {
         try {
+          // 모양을 바꾸면 엔트리는 file.id를 먼저 바꾸고 그림을 넣는다. 작업 영역은 0.5초 갱신·SNAPSHOT_SAVED에서야 새 모양 것으로 바뀌어,
+          // 무한 배경 모양에서 큰 모양으로 바꾸면 들어오는 그림이 앞 모양 칸으로 접혀 들어갔다(재현 2026-10-16: 1920 그림이 960 칸에
+          // 겹쳐 열림, 3번 중 3번). 넣기 전에 지금 모양 작업 영역으로 맞춘다.
+          const painter = window.Entry?.playground?.painter;
+          if (areaState.ep === ep && painter?.entryPaint === ep && (painter.file?.id ?? null) !== areaState.fileId) syncAreaFile(painter, ep);
           const tile = ep.mode === 'BITMAP' && wrapOn(ep) && areaTile(ep);
           if (tile && item.width && item.height && plainRaster(item) && !tile.contains(item.bounds)) {
             const b = item.bounds;
@@ -6250,6 +6390,7 @@
       Object.assign(areaState, { ep, bg: parts.bg, stageRect: null, size: null, wrap: 'none', fileId: undefined,
         copies: null, frame: null, backdrop: null, twins: null, signature: '', home: { x: c0.x, y: c0.y }, mode: ep.mode });
       hookStageRect(ep.paper);
+      hookMoveClamp(ep);
       try { ep.getDataURL(); } catch { /* 무대 사각형 붙잡기용. 실패해도 다음 자르기 때 붙잡는다 */ }
       hookPaintLayer(ep, parts);
       // 그림을 넣을 때(모양 열기·모양 가져오기로 지금 모양에 넣기 모두 addSVG·addBitmap) 들어온 그림 크기에 맞춘다.
@@ -6279,6 +6420,7 @@
       });
     }
     hookWrapEraser(ep);
+    hookShapeDrag(ep);
     syncAreaFile(painter, ep);
     // 비트맵·벡터를 바꾸면 무대 사각형·배경·잘라 보이는 틀 범위가 달라진다(비트맵 무한 배경만 둘레까지)
     if (areaState.mode !== ep.mode && (areaState.size || wrapOn(ep)))
@@ -6907,6 +7049,18 @@
     };
   }
   // 붓·지우개 옵션 줄(엔트리 아래쪽 "펜 | 윤곽선 굵기 | 채우기 색상" 등) 끝에 부드럽게·보정을 붙인다(벡터·비트맵 같은 설정).
+  // 엔트리 옵션 줄은 넘치면 옆으로 넘기는(화살표) 한 줄이고 끝 표식(#rightObserver)으로 끝을 안다 — 확장 옵션 상자는 그 앞에 둔다.
+  // 확장 상자끼리는 차례를 다투지 않는다: 예전엔 비트맵 붓에서 붓 옵션과 사각 펜 옵션이 서로 끝 표식 바로 앞이어야 한다며 0.5초마다
+  // 자리를 바꿔(요소를 옮기면 끌던 밀대가 놓이고 초점이 빠짐) 보정 밀대를 끄는 중에 끊겼다(검토로 찾음 2026-10-16).
+  function placeOptionBox(bar, box) {
+    const end = bar.querySelector(':scope > #rightObserver');
+    if (box.parentElement === bar) {
+      let next = box.nextElementSibling;
+      while (next && next !== end && /(^|\s)evr-[\w-]+-opts(\s|$)/.test(next.className)) next = next.nextElementSibling;
+      if (next === (end || null)) return;
+    }
+    bar.insertBefore(box, end || null);
+  }
   function ensureBrushOptions(painter) {
     const ep = painter?.entryPaint, active = ep?.paper?.tool;
     const mode = Object.keys(SMOOTH_TOOLS).find(key => active && (active === vectorTool(ep, key) || active === bitmapTool(ep, key)));
@@ -6916,9 +7070,7 @@
     if (!box) box = buildBrushOptions();
     const title = box.querySelector('.evr-brush-title');
     if (title.textContent !== SMOOTH_TOOLS[mode]) title.textContent = SMOOTH_TOOLS[mode];
-    // 엔트리 옵션 줄은 넘치면 옆으로 넘기는(화살표) 한 줄이고 끝 표식(#rightObserver)으로 끝을 안다 — 그 앞에 둔다.
-    const end = bar.querySelector(':scope > #rightObserver');
-    if (box.parentElement !== bar || (end && box.nextElementSibling !== end)) bar.insertBefore(box, end || null);
+    placeOptionBox(bar, box);
     syncBrushOptions(box);
   }
   function buildBrushOptions() {
@@ -6974,7 +7126,9 @@
   // 곳에만 그려지게 한다. 묶음에만 걸면 엔트리가 조각을 꺼내 굽는 순간 사라진다(실제 엔트리 실험: 밖 4,052화소 → 조각마다면 0).
   // 엔트리 붓 색·굵기는 그림판 상태 저장소(redux, 모듈 안)에 있어 그림판 화면 요소의 React fiber로 읽는다. 쓰는 곳은 벡터 레이어 창의
   // 고르기(SELECT_ITEMS·CHANGE_TOOL_MODE, 엔트리가 쓰는 것과 같은 동작)와 모드 바꾸기 감지(hookModeSwitch — dispatch를 감싸 보기만 함)뿐.
-  const pixelPen = { square: false, alphaLock: false };
+  // alphaLock: 지금 쓰는 값(레이어가 있으면 지금 레이어 값), tabLock: 레이어 없는 모양에서 고른 이 탭 동안의 값. 예전엔 하나뿐이라 레이어 모양에서
+  // 켠 잠금이 레이어 없는 다음 모양에 그대로 남아 붓이 칠해진 곳에만 그려졌다(검토로 찾음 2026-10-16).
+  const pixelPen = { square: false, alphaLock: false, tabLock: false };
   const PEN_TOOLS = { BRUSH: '비트맵 붓', ERASER: '비트맵 지우개', LINE: '비트맵 선' };
   let paintStoreCache = null;
   function paintStore() {
@@ -7078,8 +7232,7 @@
     box.dataset.mode = mode;
     const title = box.querySelector('.evr-brush-title');
     if (title.textContent !== PEN_TOOLS[mode]) title.textContent = PEN_TOOLS[mode];
-    const end = bar.querySelector(':scope > #rightObserver');
-    if (box.parentElement !== bar || (end && box.nextElementSibling !== end)) bar.insertBefore(box, end || null);
+    placeOptionBox(bar, box);
     syncPixelPenOptions(box);
   }
   function buildPixelPenOptions() {
@@ -7118,7 +7271,7 @@
       layer.lock = !layer.lock;
       pixelPen.alphaLock = layer.lock;
       commitLayers(ep);
-    } else pixelPen.alphaLock = !pixelPen.alphaLock;
+    } else pixelPen.alphaLock = pixelPen.tabLock = !pixelPen.alphaLock;
   }
   // ---- 비트맵 레이어(편집은 확장 전용, 보이는 것은 합친 그림) ----
   // 엔트리 비트맵은 그림 한 장이다(도구는 그림 층 첫 그림을 고치고, 붓·선은 획마다 그림 층 전체를 한 장으로 굽는다). 그래서
@@ -7139,7 +7292,10 @@
   const layerCache = new Map();
   let layerSeq = 0;
   const layerUid = prefix => `${prefix}${Date.now().toString(36)}${(layerSeq++).toString(36)}`;
-  const layerUi = { ep: null, signature: '', displays: [], under: null, panel: null, open: false, importing: null,
+  // signature: 지금 화면 표시의 요약('' = 레이어 목록 없음), null = 다시 맞추기. 예전엔 다시 맞추기도 ''라 레이어 모양에서 레이어 없는
+  // 모양으로 바꾸면(또는 레이어 추가를 되돌리면) 둘이 같다고 보고 표시를 안 지워, 앞 모양의 다른 레이어·클리핑 합성이 다음 모양에
+  // 남았다(사용자 제보 2026-10-16 "클리핑이 모양마다 따로 안 됨" — 재현: 앞 모양 바탕 원이 다음 모양 뒤에 남음).
+  const layerUi = { ep: null, signature: null, displays: [], under: null, panel: null, open: false, importing: null,
     convert: null, vectorPick: null, vectorEpoch: 0, thumbs: new WeakMap(), panelRows: null };
   // 그림 층 data의 목록(모드는 보지 않음 — 모드를 바꾸는 순간에는 엔트리 상태가 이미 새 모드다)
   function storedLayerMeta(layer) {
@@ -7347,8 +7503,13 @@
       }
     };
     layer.importJSON = function (...args) {
+      // paper importJSON은 기록에 있는 칸만 덮는다. 레이어를 처음 만들기 전 기록에는 레이어 목록 칸이 없어(빈 data는 기록에서 빠짐)
+      // 첫 레이어 조작을 되돌려도 목록이 남았다(재현 2026-10-16: 추가 → 되돌리기 뒤에도 2장). 기록에 없으면 목록도 지운다.
+      const json = args[0];
+      const carried = typeof json === 'string' ? json.includes(`"${LAYERS}"`) : json?.[1]?.data?.[LAYERS] !== undefined;
       const result = importJSON.apply(this, args);
-      layerUi.signature = '';
+      if (!carried && this.data && LAYERS in this.data) delete this.data[LAYERS];
+      layerUi.signature = null;
       try { refreshLayers(ep); } catch (error) { console.warn('[entry-vector-rig] 레이어 되돌리기', error); }
       return result;
     };
@@ -7363,7 +7524,7 @@
         layerUi.importing = null;
         if (pending.meta) this.data[LAYERS] = pending.meta;
         else delete this.data[LAYERS];
-        layerUi.signature = '';
+        layerUi.signature = null;
       }
       return addChild.call(this, item, ...rest);
     };
@@ -7371,7 +7532,7 @@
   // 레이어를 바꾼 뒤: 엔트리 되돌리기 기록을 남기고(그림 층 data·지금 그림이 같이 기록됨) 화면·목록을 다시 맞춘다
   function commitLayers(ep) {
     if (!saveEntryHistory(ep)) console.warn('[entry-vector-rig] 레이어: 되돌리기 기록을 남기지 못함');
-    layerUi.signature = '';
+    layerUi.signature = null;
     refreshLayers(ep);
   }
   function refreshLayers(ep) {
@@ -7393,7 +7554,7 @@
       }
     }
     const meta = layerMeta(ep);
-    if (meta) pixelPen.alphaLock = !!activeLayer(meta).lock;
+    pixelPen.alphaLock = meta ? !!activeLayer(meta).lock : pixelPen.tabLock;
     const stage = paintLayer(ep).stage;
     // 뼈대 모드(비트맵은 지금 레이어 한 장만 휨) 동안에도 다른 레이어는 보인다 — 예전엔 뼈대 모드면 표시를 지워 지금 레이어만 보였다(사용자 제보)
     const signature = meta ? JSON.stringify([meta, Math.round(stage.x), Math.round(stage.y), Math.round(stage.width), Math.round(stage.height)]) : '';
@@ -7490,7 +7651,7 @@
     layer[key] = value;
     if (key === 'lock' && id === meta.active) pixelPen.alphaLock = !!value;
     if (commit) commitLayers(ep);
-    else { layerUi.signature = ''; refreshLayers(ep); }
+    else { layerUi.signature = null; refreshLayers(ep); }
   }
   // ---- 벡터 레이어: 엔트리 벡터 그림 층의 맨 위 항목 하나가 레이어 하나(뼈대 목록의 "레이어"와 같음) ----
   // 엔트리 벡터 편집(아무 도형이나 고르기, 앞으로·뒤로, 그룹·그룹 해제, 저장 SVG)은 그대로 두고, 레이어 창이 그 항목들을 비트맵 레이어와
@@ -7914,7 +8075,7 @@
     });
     meta.active = (meta.layers[convert.active] || meta.layers[meta.layers.length - 1]).id;
     layer.data[LAYERS] = meta;
-    layerUi.signature = '';
+    layerUi.signature = null;
     pixelPen.alphaLock = !!activeLayer(meta).lock;
     return layerRaster(ep, activeLayer(meta));
   }
@@ -7931,7 +8092,7 @@
     delete layer.data[LAYERS];
     clearLayerDisplays(ep);
     restackVector(layer, ep.paper, convert.items);
-    layerUi.signature = '';
+    layerUi.signature = null;
     layerUi.convert = { dropAdd: true, layer };
     setTimeout(() => { if (layerUi.convert?.layer === layer) layerUi.convert = null; }, 0);
   }
@@ -7986,6 +8147,28 @@
   };
   const base64ToBytes = text => typeof Uint8Array.fromBase64 === 'function' ? Uint8Array.fromBase64(text)
     : Uint8Array.from(atob(text.replace(/\s+/g, '')), ch => ch.charCodeAt(0));
+  // 보이는 PNG(+픽셀 아트 SVG)를 새로 올릴 때 그 모양의 레이어 원본을 같이 담는다. 레이어 자리는 십자 기준이라 그림이 십자 기준으로
+  // (dx, dy) 옮겨졌으면 같이 옮긴다. 원본을 못 받으면 던진다(합친 그림만 올려 레이어를 잃지 않게 — 부른 쪽은 그 모양을 건너뜀).
+  async function withLayerOriginal(picture, payload, shift = { x: 0, y: 0 }) {
+    const carried = picture.dimension?.[LAYER_ENT];
+    const response = picture.filename ? await fetch(svgFile(picture.filename), { credentials: 'same-origin' }) : null;
+    // 404: 서버에 레이어 원본이 없다(1.2.0 공통 크기 맞추기가 합친 PNG만 올려 표시만 남은 모양) — 부른 쪽이 보통 그림으로 다룬다(missing)
+    if (!response?.ok && !carried) throw Object.assign(Error(`레이어 원본을 받을 수 없습니다 (${response?.status ?? '파일 없음'})`),
+      { missing: !response || response.status === 404 });
+    const text = response?.ok ? await response.text() : entLayerSvgText(carried);
+    const node = new DOMParser().parseFromString(text, 'image/svg+xml');
+    const meta = node.getElementById(LAYER_SVG) || node.querySelector(`metadata#${LAYER_SVG}`);
+    const list = meta && JSON.parse(meta.textContent);
+    if (!list || list.v !== 2 || list.format !== 'psd' || typeof list.psd !== 'string') throw Error('레이어 원본 형식이 다릅니다');
+    list.x = clean(Number(list.x || 0) + shift.x);
+    list.y = clean(Number(list.y || 0) + shift.y);
+    const extra = `<metadata id="${LAYER_SVG}">${JSON.stringify(list)}</metadata>`;
+    if (payload.svg) return { ...payload, ext: 'svg', svg: payload.svg.replace(/<svg\b[^>]*>/, open => open + extra) };
+    const { width, height } = payload.size;
+    return { ...payload, ext: 'svg', imageType: 'png',
+      svg: `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" ` +
+        `viewBox="0 0 ${width} ${height}">${extra}<image width="${width}" height="${height}" xlink:href="${payload.image}"/></svg>` };
+  }
   function layerSvg(swap, png, baseSvg) {
     const size = pngSize(png), lib = window.__evrAgPsd;
     if (!size) return null;
@@ -8126,13 +8309,17 @@
       const open = proto.open, send = proto.send;
       proto.open = function (method, url, ...rest) {
         this.__evrEnt = isEntDownload(method, url);
+        this.__evrSaveOp = saveOp(url);
+        this.__evrSaveUrl = this.__evrSaveOp ? String(url) : null;
         return open.call(this, method, url, ...rest);
       };
       proto.send = function (body) {
+        if (saveWatch && this.__evrSaveOp) watchSaveXhr(this, body);
         if (!this.__evrEnt || typeof body !== 'string') return send.call(this, body);
         withEntLayers(body).then(next => send.call(this, next), () => send.call(this, body));
         return undefined;
       };
+      proto.send.__evrSaveHook = true;
     }
     // axios가 fetch로 보내는 경우까지
     const fetch0 = window.fetch;
@@ -8141,11 +8328,326 @@
         const url = typeof input === 'string' ? input : input?.url;
         if (init && typeof init.body === 'string' && isEntDownload(init.method || 'GET', url))
           return withEntLayers(init.body).catch(() => init.body).then(body => fetch0.call(this, input, { ...init, body }, ...rest));
-        return fetch0.call(this, input, init, ...rest);
+        const pending = fetch0.call(this, input, init, ...rest);
+        const op = saveWatch && saveOp(input);
+        if (op) watchSaveFetch(op, input, init, pending);
+        return pending;
       };
       wrapped.__evrEntHook = true;
       window.fetch = wrapped;
     }
+  }
+  // ---- 작품 저장 확인(1.2.1) ----
+  // 사용자 제보(2026-10-16, 카톡방): 확장을 쓰던 사람 2명의 작품이 서버에서 사라짐. 확장 코드에는 작품 저장·삭제 요청이 없다(전체 검색).
+  // 다만 엔트리 사이트 저장(_next 묶음의 #eu)은 저장 도중 예외를 콘솔에만 남기고 진행 창을 닫는다 — 저장이 안 됐는데 사용자는 모르고 나갈
+  // 수 있고, 새 작품이면 서버에 아예 없다. 사용자 요청: "서버에 안정적으로 저장되는 게 해결". 그래서 저장마다 ① 저장 전 열리지 않을 모양
+  // (그림 정보 없음)을 막고 ② 저장 요청·응답을 지켜보고(바꾸지 않음) ③ 성공이면 서버에서 다시 읽어 보낸 내용과 대조해, 성공은 작게 알리고
+  // 실패는 크게 알린다(다시 저장·.ent로 받기, 나갈 때 경고). 다시 읽기는 사이트와 같은 서버·같은 머리글(로그인 토큰)로만 보낸다.
+  // 확장 쪽 확인이 실패하면 저장을 막지 않는다(확인 없이 엔트리 원래대로 저장). 여러 번 저장하면 작은 알림은 마지막 저장만 띄우고,
+  // 앞 저장의 실패 경고는 더 새 저장이 서버에 받아들여졌을 때만 거둔다.
+  // saveChecking: 저장 전 확인창을 띄운 때(0이면 없음) — 답이 영영 안 와도 5분 뒤엔 다시 저장할 수 있게
+  let saveWatch = null, saveSeq = 0, lastOkSeq = 0, saveChecking = 0, siteFound = null, siteLookAt = 0;
+  const projectSaveHooked = new WeakSet();
+  // 저장 요청: 엔트리 서버(https playentry.org·*.playentry.org)로 가고 주소 경로 끝이 정확히 /graphql/CREATE_PROJECT·UPDATE_PROJECT인 것만
+  // (그 요청의 로그인 머리글로 다시 읽으므로 다른 곳은 잡지 않는다. 모든 XHR·fetch마다 불리므로 던지지 않는다)
+  const saveOp = input => {
+    try {
+      const url = new URL(String(input?.url ?? input ?? ''), location.href);
+      if (url.protocol !== 'https:' || !(url.hostname === 'playentry.org' || url.hostname.endsWith('.playentry.org'))) return null;
+      return url.pathname.endsWith('/graphql/CREATE_PROJECT') ? 'create' : url.pathname.endsWith('/graphql/UPDATE_PROJECT') ? 'update' : null;
+    } catch { return null; }
+  };
+  // 저장 요청을 지켜보는 감싸기가 아직 그 자리에 있는지(다른 코드가 fetch·XHR을 바꿔 끼우면 요청을 못 볼 수 있다)
+  const saveHooksIntact = () => window.fetch?.__evrEntHook === true && window.XMLHttpRequest?.prototype?.send?.__evrSaveHook === true;
+  // 엔트리 사이트 작업 공간 도우미(저장·알림)와 사이트 저장소(로그인 토큰). React 화면 나무에서 찾아 둔다(못 찾으면 5초 뒤 다시).
+  function siteWorkspace() {
+    const alive = siteFound?.helper && document.contains(siteFound.root);
+    if (alive && siteFound.store) return siteFound;
+    // 저장소를 아직 못 찾았으면 도우미는 그대로 쓰고 5초마다 다시 찾는다
+    if (Date.now() - siteLookAt < 5000) return alive ? siteFound : null;
+    siteLookAt = Date.now();
+    const root = document.getElementById('__next') || document.body.firstElementChild;
+    const key = root && Object.keys(root).find(k => k.startsWith('__reactContainer$') || k.startsWith('__reactFiber$'));
+    const start = key && root[key];
+    if (!start) return null;
+    const found = { root, helper: null, store: null };
+    const stack = [start.stateNode?.current || start];
+    for (let n = 0; stack.length && n < 200000; n++) {
+      const fiber = stack.pop();
+      if (!fiber) continue;
+      const props = fiber.memoizedProps, value = props?.value;
+      if (!found.helper && value && typeof value === 'object' && typeof value.saveProject === 'function' && 'modalProgress' in value) found.helper = value;
+      if (!found.store && typeof props?.store?.getState === 'function' && props.store.getState()?.common) found.store = props.store;
+      if (found.helper && found.store) break;
+      if (fiber.child) stack.push(fiber.child);
+      if (fiber.sibling) stack.push(fiber.sibling);
+    }
+    if (found.helper) siteFound = found;
+    else if (!alive) siteFound = null;
+    return siteFound;
+  }
+  function hookProjectSave() {
+    const helper = siteWorkspace()?.helper;
+    if (!helper || projectSaveHooked.has(helper)) return;
+    projectSaveHooked.add(helper);
+    for (const [name, event] of [['saveProject', 'saveWorkspace'], ['saveAsProject', 'saveAsWorkspace']]) {
+      const original = helper[name];
+      if (typeof original !== 'function') continue;
+      const wrapped = async function (...args) {
+        // 저장 전 확인창이 이미 떠 있으면 그 답을 기다린다(겹쳐 묻거나 확인 없이 저장하지 않음)
+        if (saveChecking && Date.now() - saveChecking < 300000) return undefined;
+        // 이미 저장 중이면 엔트리가 그냥 무시한다 — 지켜보지 않는다
+        if (helper.isSaving) return original.apply(this, args);
+        let go = true;
+        saveChecking = Date.now();
+        try { go = await checkPicturesBeforeSave(helper, name); }
+        catch (error) { console.warn('[entry-vector-rig] 저장 전 확인', error); }
+        finally { saveChecking = 0; }
+        if (!go) return undefined;
+        // 확인하는 동안 다른 길로 저장이 시작됐으면 엔트리에 넘긴다(엔트리가 겹친 저장을 무시함)
+        if (helper.isSaving) return original.apply(this, args);
+        const watch = { kind: name, seq: ++saveSeq, request: null, response: null, informed: false };
+        saveWatch = watch;
+        try { return await original.apply(this, args); }
+        finally {
+          if (saveWatch === watch) saveWatch = null;
+          verifySave(helper, watch).catch(error => console.warn('[entry-vector-rig] 저장 확인', error));
+        }
+      };
+      helper[name] = wrapped;
+      // 엔트리 머리 메뉴 [저장하기]·Ctrl+S는 처음 붙여 둔 원래 함수를 부른다 — 그 자리도 바꿔 끼운다(사이트가 다시 붙일 때는 바뀐 속성을 씀)
+      const list = window.Entry?.events_?.[event];
+      if (Array.isArray(list)) list.forEach((fn, i) => { if (fn === original) list[i] = wrapped; });
+    }
+    // 엔트리가 저장 중에 알림·확인창을 띄웠으면(로그인 필요·이름이 김·저장 실패 등) 사용자는 이미 안다 — 겹쳐 알리지 않는다.
+    // 저장 성공 뒤 "작품으로 이동할까요?" 같은 확인창은 셈하지 않는다(그때는 다시 읽어 대조함).
+    // 요청 전 확인창에서 "진행"(true)을 고르면 엔트리가 저장을 이어 간다 — 그 뒤 조용히 실패하면 알려야 하므로 알림으로 셈하지 않는다.
+    const informed = () => { if (saveWatch && !saveWatch.response?.ok) saveWatch.informed = true; };
+    for (const target of [helper, window.EntryModal].filter(Boolean)) {
+      for (const name of ['alert', 'confirm']) {
+        const original = target[name];
+        if (typeof original !== 'function' || original.__evrSaveSeen) continue;
+        const wrapped = function (...args) {
+          informed();
+          const result = original.apply(this, args);
+          const watch = saveWatch;
+          if (name === 'confirm' && watch) Promise.resolve(result).then(answer => { if (answer === true && !watch.request) watch.informed = false; }, () => {});
+          return result;
+        };
+        wrapped.__evrSaveSeen = true;
+        target[name] = wrapped;
+      }
+    }
+  }
+  // 작품 요약 — 보낸 것과 서버에서 다시 읽은 것을 견준다. 개수·파일 이름(크게 다르면 그 수를 알려 줌)과 objects 전체 글(블록·모양 등).
+  // 서버는 objects를 그대로 저장한다: 공개 작품을 편집기로 열어 내보낸 objects와 서버 objects가 글자까지 같았다(10-16, 작품 하나).
+  function projectDigest(objects) {
+    let list = objects;
+    if (typeof list === 'string') { try { list = JSON.parse(list); } catch { return null; } }
+    if (!Array.isArray(list)) return null;
+    const pictures = list.flatMap(object => Array.isArray(object?.sprite?.pictures) ? object.sprite.pictures : []);
+    return { objects: list.length, pictures: pictures.length, files: pictures.map(p => p?.filename).filter(Boolean).sort().join('|'), text: JSON.stringify(list) };
+  }
+  // 사이트가 저장 요청에 붙인 머리글 중 다시 읽기에 쓸 것(CSRF·로그인 토큰·클라이언트 종류)
+  function saveHeaders(raw) {
+    try {
+      const all = new Headers(raw || {});
+      return Object.fromEntries(['csrf-token', 'x-token', 'x-client-type'].map(name => [name, all.get(name)]).filter(([, value]) => value));
+    } catch { return {}; }
+  }
+  function noteSaveRequest(watch, op, body, url, headers) {
+    let variables = null;
+    try { variables = JSON.parse(typeof body === 'string' ? body : '')?.variables || null; } catch { variables = null; }
+    watch.request = { op, url, headers, id: variables?.id || null, digest: projectDigest(variables?.objects), sentAt: Date.now() };
+    // 요청 전에 뜬 알림(이메일 인증 확인 등)은 저장 결과와 상관없다
+    watch.informed = false;
+  }
+  // 응답 상태: ok(서버가 받음) · failed(거절·연결 실패) · unknown(응답을 읽지 못함 — 크게 알리지 않는다)
+  // json이 undefined면 읽지 못한 것. 업데이트는 엔트리가 보낸 작품 번호로 다시 읽는다(성공 판단은 엔트리처럼 오류 없음 — 실제 확인은 다시 읽기).
+  // serverDate: 응답 Date 머리글(서버 시계) — 업데이트가 이번 저장으로 바뀌었는지 볼 때 이 컴퓨터 시계 대신 쓴다.
+  function noteSaveResponse(watch, status, json, serverDate) {
+    const op = watch.request?.op;
+    const id = op === 'update' ? watch.request.id : json?.data?.createProject?.result?.id;
+    let state = 'ok';
+    if (status === 0 || status < 200 || status >= 300) state = status === -1 ? 'unknown' : 'failed';
+    else if (json === undefined) state = 'unknown';
+    else if (json?.errors?.length) state = 'failed';
+    else if (!id) state = op === 'update' ? 'unknown' : 'failed';
+    watch.response = { state, ok: state === 'ok', status, id: id || null, serverDate: Date.parse(serverDate || '') };
+    if (state === 'ok') lastOkSeq = Math.max(lastOkSeq, watch.seq);
+  }
+  function watchSaveFetch(op, input, init, pending) {
+    const watch = saveWatch;
+    try {
+      noteSaveRequest(watch, op, init?.body, String(input?.url ?? input), saveHeaders(init?.headers ?? input?.headers));
+      pending.then(response => {
+        const date = response.headers?.get?.('date');
+        return response.clone().json().then(json => noteSaveResponse(watch, response.status, json, date),
+          () => noteSaveResponse(watch, response.status, undefined, date));
+      }, () => noteSaveResponse(watch, 0, undefined))
+        .catch(() => noteSaveResponse(watch, -1, undefined));
+    } catch (error) { console.warn('[entry-vector-rig] 저장 지켜보기', error); }
+  }
+  function watchSaveXhr(xhr, body) {
+    const watch = saveWatch;
+    try {
+      noteSaveRequest(watch, xhr.__evrSaveOp, body, xhr.__evrSaveUrl, null);
+      xhr.addEventListener('loadend', () => {
+        let json, date = null;
+        try {
+          const type = xhr.responseType;
+          json = type === 'json' ? (xhr.response ?? undefined) : (!type || type === 'text') ? JSON.parse(xhr.responseText || 'null') : undefined;
+        } catch { json = undefined; }
+        try { date = xhr.getResponseHeader('date'); } catch { date = null; }
+        noteSaveResponse(watch, xhr.status, json, date);
+      });
+    } catch (error) { console.warn('[entry-vector-rig] 저장 지켜보기', error); }
+  }
+  // 서버에서 그 작품을 다시 읽는다 — 방금 저장 요청을 보낸 그 서버의 SELECT_PROJECT로, 사이트가 그 요청에 붙인 머리글 그대로
+  // (비공개 작품도 읽히도록 로그인 토큰 포함). 머리글을 모르면(XHR) 페이지 CSRF·사이트 저장소 토큰을 쓴다.
+  // 읽기 오류는 던지고(확인 못 함), 오류 없이 작품이 없다고 하면 missing.
+  async function readProjectBack(request) {
+    const headers = { 'Content-Type': 'application/json', ...(request.headers || {}) };
+    if (!headers['csrf-token']) headers['csrf-token'] = document.querySelector('meta[name="csrf-token"]')?.content || '';
+    if (!headers['x-client-type']) headers['x-client-type'] = 'Client';
+    if (!headers['x-token']) {
+      const token = siteWorkspace()?.store?.getState?.()?.common?.user?.xToken;
+      if (token) headers['x-token'] = token;
+    }
+    const target = new URL(request.url || '/graphql/SELECT_PROJECT', location.href);
+    target.pathname = target.pathname.replace(/(CREATE|UPDATE)_PROJECT$/, 'SELECT_PROJECT');
+    target.search = '';
+    const response = await fetch(target.href, { method: 'POST', credentials: 'include', headers,
+      body: JSON.stringify({ query: 'query SELECT_PROJECT($id: ID!){ project(id: $id){ id updated objects } }', variables: { id: request.id } }) });
+    if (!response.ok) throw Error(`다시 읽기 실패 (${response.status})`);
+    const json = await response.json();
+    if (json?.errors?.length) throw Error(`다시 읽기 오류: ${String(json.errors[0]?.message || '').slice(0, 60)}`);
+    const project = json?.data?.project;
+    // 로그인 토큰 없이 읽었으면 비공개 작품이 안 보인 것일 수 있다(authed로 가림)
+    return project ? { project } : { missing: true, authed: !!headers['x-token'] };
+  }
+  async function verifySave(helper, watch) {
+    // 더 새 저장이 시작됐으면 작은 알림은 그쪽에 맡긴다. 실패 경고는 더 새 저장이 서버에 받아들여졌을 때만 거둔다.
+    const stale = () => watch.seq !== saveSeq;
+    const notice = (text, ms) => { if (!stale()) toast(text, ms); };
+    const problem = text => { if (lastOkSeq <= watch.seq) saveProblem(helper, text); };
+    // 응답이 늦게 오면 조금 기다린다(사이트는 응답을 받은 뒤 끝나므로 보통 이미 와 있음)
+    for (let i = 0; i < 20 && watch.request && !watch.response; i++) await sleep(250);
+    if (!watch.request) {
+      // 요청이 나가지 않았다: 엔트리가 알림을 띄웠으면(로그인·이름·이메일 인증 확인 등) 그대로, 아니면 저장 도중 오류로 조용히 끝난 것
+      if (watch.informed) return;
+      // 지켜보는 감싸기가 다른 코드로 바뀌었으면 요청을 못 본 것일 수 있다 — 크게 알리지 않는다
+      if (!saveHooksIntact()) { notice('저장 요청을 지켜보지 못해 서버 저장을 확인하지 못했습니다.', 6000); return; }
+      problem('저장이 되지 않았습니다. 엔트리가 저장하다 오류로 멈췄습니다(서버로 저장 요청이 가지 않음).');
+      return;
+    }
+    const response = watch.response;
+    if (!response || response.state === 'unknown') {
+      notice('저장 응답을 읽지 못해 서버 저장을 확인하지 못했습니다.', 6000);
+      return;
+    }
+    if (response.state === 'failed') {
+      if (!watch.informed) problem(`서버가 저장을 받지 못했습니다(응답 ${response.status || '없음'}).`);
+      return;
+    }
+    await sleep(1500);
+    let read = null;
+    try { read = await readProjectBack({ ...watch.request, id: response.id }); }
+    catch (error) { notice(`저장 요청은 성공했지만 서버에서 다시 읽어 확인하지 못했습니다(${error.message}).`, 6000); return; }
+    if (read.missing) {
+      if (read.authed) problem('저장했다는 작품을 서버에서 찾을 수 없습니다.');
+      else notice('저장 요청은 성공했지만 로그인 정보 없이 다시 읽어 작품이 보이지 않았습니다(확인하지 못함).', 6000);
+      return;
+    }
+    const sent = watch.request.digest, saved = projectDigest(read.project.objects);
+    if (!sent || !saved) { notice('저장 요청은 성공했지만 내용을 견주지 못해 서버 저장을 확인하지 못했습니다.', 6000); return; }
+    if (sent.objects !== saved.objects || sent.pictures !== saved.pictures || sent.files !== saved.files) {
+      problem(`서버에 저장된 내용이 화면과 다릅니다(오브젝트 ${saved.objects}/${sent.objects}개, 모양 ${saved.pictures}/${sent.pictures}개).`);
+      return;
+    }
+    if (sent.text !== saved.text) {
+      problem('서버에 저장된 내용(블록·모양 정보 등)이 방금 저장한 것과 다릅니다.');
+      return;
+    }
+    // 업데이트: 서버 저장 시각이 이번 저장 뒤여야 "확인됨". 서버 시계(저장 응답 Date)로 보고, 없으면 이 컴퓨터 시계로 10분 안.
+    // 못 읽거나 앞서 있으면 작게만 알린다(내용은 같으므로 화면 내용이 서버에 있긴 함)
+    if (watch.request.op === 'update') {
+      const updated = typeof read.project.updated === 'number' ? read.project.updated : Date.parse(read.project.updated);
+      const fresh = Number.isFinite(response.serverDate) ? updated >= response.serverDate - 60000 : updated >= watch.request.sentAt - 10 * 60000;
+      if (!Number.isFinite(updated) || !fresh) {
+        notice('서버 내용은 화면과 같지만, 서버 저장 시각이 이번 저장보다 앞서 있어 이번 저장이 반영됐는지는 확인하지 못했습니다.', 6000);
+        return;
+      }
+    }
+    notice(`서버 저장 확인됨 — 오브젝트 ${saved.objects}개, 모양 ${saved.pictures}개`, 3500);
+  }
+  // 저장이 확인되지 않음: 크게 알리고, 나갈 때 경고를 다시 켠다(사이트는 저장을 시작하며 나가기 경고를 끈다)
+  function saveProblem(helper, message) {
+    try { helper.setBindUnload?.(true); } catch (error) { console.warn('[entry-vector-rig] 나가기 경고', error); }
+    document.querySelector('.evr-save-alert')?.remove();
+    const box = document.createElement('div');
+    box.className = 'evr-save-alert';
+    box.setAttribute('role', 'alertdialog');
+    const title = document.createElement('b');
+    title.textContent = '작품이 서버에 저장되지 않았을 수 있습니다';
+    const text = document.createElement('p');
+    text.textContent = `${message} 이 창을 닫거나 나가기 전에 다시 저장하거나 .ent 파일로 받아 두세요.`;
+    const row = document.createElement('div');
+    row.append(
+      button('다시 저장', () => { box.remove(); helper.saveProject?.(); }, { class: 'evr-save-again' }),
+      button('.ent로 받기', () => { helper.exportProjectData?.(); }, { class: 'evr-save-ent' }),
+      button('닫기', () => box.remove(), { class: 'evr-save-close' }));
+    box.append(title, text, row);
+    document.body.append(box);
+  }
+  // 저장 전: 그림 정보(파일 이름·주소)가 둘 다 없는 모양이 있으면 그 작품은 다시 열 때 엔트리가 통째로 못 연다(오브젝트 0개).
+  // 아틀라스 칸 표시가 있으면 원래 주소로 고치고, 못 고치면 저장을 멈출지 묻는다(멈추면 서버의 지난 저장본이 그대로 남음).
+  // [그래도 저장]만 저장을 이어 간다. [저장 멈춤]·닫기(X)·모르는 답은 멈추고 알린다(엔트리 나가기 경고는 저장을 시작하지 않았으니 그대로 켜져 있음).
+  // 엔트리 확인창이 실패하면 브라우저 확인창으로 묻는다 — 묻지 못한 채 저장을 막지 않는다.
+  // 확인창이 답 없이 사라지면(다른 창이 덮는 등) 멈춤으로 본다 — 답을 영영 기다리며 저장이 굳지 않게.
+  function modalGone(text) {
+    let timer = 0;
+    const done = new Promise(resolve => {
+      let seen = false, missing = 0, tries = 0;
+      timer = setInterval(() => {
+        const visible = [...document.querySelectorAll('.entry-modal-modal')].some(m => m.getBoundingClientRect().width && m.innerText.includes(text));
+        if (visible) { seen = true; missing = 0; }
+        else if (seen && ++missing >= 3) { clearInterval(timer); resolve('gone'); }
+        // 10초 안에 창을 못 찾으면(창 모양이 바뀜) 지켜보기를 그만두고 답만 기다린다
+        else if (!seen && ++tries > 20) clearInterval(timer);
+      }, 500);
+    });
+    return { done, stop: () => clearInterval(timer) };
+  }
+  async function checkPicturesBeforeSave(helper, kind) {
+    const broken = [];
+    for (const object of window.Entry?.container?.getAllObjects?.() || []) {
+      for (const picture of object.pictures || []) {
+        if (!picture || picture.filename || picture.fileurl) continue;
+        const atlas = atlasOf(picture);
+        if (atlas) { picture.fileurl = atlas.base || atlasUrl(atlas); continue; }
+        broken.push(`${object.name}/${picture.name}`);
+      }
+    }
+    if (!broken.length) return true;
+    const target = kind === 'saveAsProject' ? '복사본을 저장하면 그 복사본은' : '저장하면';
+    const message = `그림 정보가 없는 모양 ${broken.length}개가 있습니다(${broken.slice(0, 5).join(', ')}${broken.length > 5 ? ' 등' : ''}). ` +
+      `이대로 ${target} 다시 열 때 작품 전체가 열리지 않을 수 있습니다. 그 모양을 지우거나 다시 그린 뒤 저장하세요.`;
+    let go;
+    try {
+      if (typeof helper.confirm !== 'function') throw Error('확인창 없음');
+      // 글자 결과: 저장 멈춤 "ok" · 그래도 저장 "cancel" · 닫기 "close". 글자 결과를 안 주는 판이면 false(그래도 저장·닫기 못 가림)를 진행으로 본다
+      const gone = modalGone('그림 정보가 없는 모양');
+      let answer;
+      try { answer = await Promise.race([helper.confirm(message, '저장 전 확인', { positiveButtonText: '저장 멈춤', negativeButtonText: '그래도 저장', resultType: 'string' }), gone.done]); }
+      finally { gone.stop(); }
+      go = answer === 'cancel' || answer === false;
+    } catch (error) {
+      console.warn('[entry-vector-rig] 저장 전 확인창', error);
+      go = window.confirm(`${message} 그래도 저장할까요?`);
+    }
+    if (!go) toast('저장을 멈췄습니다. 그림 정보가 없는 모양을 지우거나 다시 그린 뒤 저장하세요.', 6000);
+    return go;
   }
   // .ent로 불러온 레이어 모양: 합친 PNG(새 파일)와 담겨 온 레이어 원본으로 레이어 SVG를 다시 올리고 모양을 그 파일로 바꾼다
   const entLayerJobs = new Set(), entLayerFailed = new Map(); // 모양 id → 실패한 때(30초 뒤 다시)
@@ -8543,17 +9045,30 @@
     } else layer.insertChild(0, item);
     return true;
   }
+  const FILL_SKIP = Symbol('채우지 않음');
   // 비트맵: 그림(래스터) 화소에서 바로 영역을 찾아, 이미 있는 화소 아래로(destination-over) 칠한다
   function bitmapRegionFill(ep, tool, event) {
-    const raster = paintLayer(ep)?.layer.children[0];
+    const parts = paintLayer(ep);
+    let raster = parts?.layer.children[0];
     if (!(raster instanceof ep.paper.Raster) || !raster.width || !raster.height) return null;
+    // 캔버스를 키우면 그림(엔트리가 만든 무대 크기·불러온 그림 크기)보다 칸이 넓다. 그림 밖 칸을 누르면 그림을 칸만큼 넓힌 뒤 채운다 —
+    // 예전엔 엔트리 채우기로 넘겨 아무것도 칠해지지 않았다(재현 2026-10-16: 1920×1080 칸, 그림 왼쪽 빈 곳).
+    if (!raster.bounds.contains(event.point)) {
+      // 픽셀 아트 모양은 넓히지 않는다(스프라이트 밖을 잘못 눌러 그림이 칸 전체가 되고 저장 때 k배로 아주 커짐 — 검토로 찾음). 칸 밖도.
+      // 이때는 엔트리 채우기로도 넘기지 않는다(엔트리는 그림 밖 점을 범위 검사 없이 써서 엉뚱한 곳을 칠함 — 재현 2026-10-16).
+      if (pixelOf(window.Entry?.playground?.object?.selectedPicture) || !parts.stage?.contains(event.point) || !plainRaster(raster)) return FILL_SKIP;
+      raster = fillRasterToStage({ layer: parts.layer, stage: parts.stage, ep }) || raster;
+      delete raster.__evrSigBefore; // 넓히기 전 요약은 뼈대 열기용 — 곧 화소를 칠하므로 버린다(남으면 다음 자세 그리기가 칠한 것을 버림)
+    }
     const w = raster.width, h = raster.height;
     const local = raster.globalToLocal(event.point).add(new ep.paper.Point(w / 2, h / 2));
     const sx = Math.floor(local.x), sy = Math.floor(local.y);
     if (sx < 0 || sy < 0 || sx >= w || sy >= h) return null;
     const perUnit = w / raster.bounds.width; // 그림 좌표 1당 화소
     const image = raster.getImageData(new ep.paper.Rectangle(0, 0, w, h)), d = image.data;
-    const region = fillRegion(d, w, h, sx, sy, regionFill.gap * perUnit, FILL_EXPAND * perUnit);
+    // 선 밑으로 1.5 넓히기는 투명 잠금이면 하지 않는다: 잠금은 칠해진 화소 색만 바꾸므로 넓힌 띠에 든 선 안쪽 가장자리까지 색이
+    // 바뀌었다(검토로 찾음 2026-10-16 — 잠금 없을 때는 불투명한 선 화소를 건너뛰어 괜찮음)
+    const region = fillRegion(d, w, h, sx, sy, regionFill.gap * perUnit, pixelPen.alphaLock ? 0 : FILL_EXPAND * perUnit);
     if (!region) return null;
     const [R, G, B, A] = fillColorOf(ep.paper, tool.fillColor), fa0 = A / 255;
     for (let i = 0, p = 0; i < region.length; i++, p += 4) {
@@ -8601,6 +9116,7 @@
           if (!regionFill.on) return down.call(this, event);
           let seedColor = null;
           try { seedColor = bitmapRegionFill(ep, tool, event); } catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
+          if (seedColor === FILL_SKIP) return;
           if (!seedColor) return down.call(this, event);
           // 엔트리 비트맵 채우기는 누른 곳이 이미 그 색이면 아무것도 안 하고 되돌리기 기록만 남긴다 — 그 길로 기록만 남긴다
           const color = tool.fillColor;
@@ -8619,8 +9135,7 @@
     if (!isFill || !bar) { box?.remove(); return; }
     if (!box) box = buildFillOptions(ep);
     box.dataset.graphics = active.MY_MODE.graphicsMode;
-    const end = bar.querySelector(':scope > #rightObserver');
-    if (box.parentElement !== bar || (end && box.nextElementSibling !== end)) bar.insertBefore(box, end || null);
+    placeOptionBox(bar, box);
     syncFillOptions(box);
   }
   function buildFillOptions(ep) {
@@ -8941,12 +9456,17 @@
     restorePixelFileurls();
     try { ownPixelPictures(); } catch (error) { console.warn('[entry-vector-rig] 모양 자기 파일', error); }
     try { hookLoadRepair(); } catch (error) { console.warn('[entry-vector-rig] 모양 주소 잇기', error); }
-    if (c) tidyPixelPainter(c);
-    refreshPivotUI(c);
-    ensureRigModeButton(c);
-    if (session) draw(session);
-    const top = document.getElementById('entryPainter')?.querySelector('.top_area');
-    ensureToolButtons(c, top);
+    try { hookProjectSave(); } catch (error) { console.warn('[entry-vector-rig] 작품 저장 확인', error); }
+    // 모양을 바꾸는 틈(context()가 비어 있음)에는 십자·뼈대 버튼·도구 막대를 지우지 않고 그대로 둔다 — 지웠다 다시 만들면 켜 둔
+    // "그림 전체 이동" 같은 모드가 풀렸다(검토로 찾음 2026-10-16)
+    if (!pictureSwitching()) {
+      if (c) tidyPixelPainter(c);
+      refreshPivotUI(c);
+      ensureRigModeButton(c);
+      if (session) draw(session);
+      const top = document.getElementById('entryPainter')?.querySelector('.top_area');
+      ensureToolButtons(c, top);
+    }
     // 오브젝트 추가하기 창 탭은 덧붙인 기능이라 맨 끝에 두고, 오류가 나도 위의 저장·모양 처리를 막지 않게 한다.
     try { ensureAddObjectTab(); } catch (error) { console.warn('[entry-vector-rig] 오브젝트 추가 탭', error); }
   }
@@ -9026,7 +9546,7 @@
       const bone = button('뼈대', () => {
         const header = document.querySelector('.evr-mode-wrap[data-evr-mode="bone"] .evr-bone-mode');
         if (session) close();
-        else open(context(), header);
+        else { const c = context(); if (c) open(c, header); }
       }, { class: 'evr-tool evr-bone-menu', 'aria-pressed': 'false', title: '뼈대 모드(벡터 모양)' });
       list.append(bone, pixel, split, rename, canvasSize, arrange, align, center, onion, pin);
       // 접힌 목록에서 하나를 고르면 목록을 닫는다(버튼 동작이 먼저 실행된 뒤).
