@@ -1039,13 +1039,14 @@
     return canvas;
   };
   // 픽셀 모양의 원래 해상도 그림. 대체용 k배 PNG(파일 이름)가 있으면 그것을 1/k로 줄인다.
-  async function pixelArtOf(picture) {
+  async function pixelArtOf(picture, attempt = 0) {
     const k = pixelOf(picture) || 1;
+    const load = async src => attempt ? loadImage(await freshImageUrl(src)) : loadImage(src); // 다시 받기는 캐시 없이
     let image;
     try {
       if (!picture.filename) throw Error('파일 이름 없음');
-      image = await loadImage(runtimePng(picture.filename));
-    } catch { image = await loadImage(window.Entry.playground.painter.getImageSrc(picture)); }
+      image = await load(runtimePng(picture.filename));
+    } catch { image = await load(window.Entry.playground.painter.getImageSrc(picture)); }
     return scaledCanvas(image, Math.round(image.naturalWidth / k), Math.round(image.naturalHeight / k));
   }
   // 픽셀 모양 업로드 데이터. 엔트리 실행 화면은 보간을 끌 수 없지만, fileurl로 건 SVG 안의 PNG에
@@ -1083,11 +1084,24 @@
       // 모양 바꾸기(afterModified)만 두 번째 인자가 참이다. 다른 호출은 엔트리 그대로 둔다.
       if (!isImport) return original.call(this, picture, isImport, ...rest);
       const token = {};
+      const attempt = this.__evrRetryNext?.picture === picture ? this.__evrRetryNext.attempt : 0;
+      this.__evrRetryNext = null;
       this.__evrLoadToken = token;
       this.__evrUnbaked = null;
-      startLoading(this, token);
+      // 다시 받기 = 같은 모양을 처음부터 다시(새 표식 — 늦게 온 앞 결과는 버림, 캐시 없이 새로 받음). 그 사이 다른 모양을 골랐으면
+      // 아무것도 안 한다 — 모양을 바꾼 직후 남은 앞 모양 단추를 누르면 새로 고른 모양이 버려지고 앞 모양 그림이 그 편집기에 들어갔다(검토 M, 시험 재현)
+      const retry = () => {
+        if (this.__evrLoadToken !== token || this.file?.id !== picture.id) return;
+        this.__evrRetryNext = { picture, attempt: attempt + 1 };
+        this.addPicture(picture, true);
+      };
+      startLoading(this, token, retry);
       const hand = ready => {
         if (this.__evrLoadToken !== token) return; // 그 사이 다른 모양을 골랐다: 이 그림은 버린다
+        // 넘긴 뒤에는 엔트리가 넣고 5초 안에 덮개를 걷으므로(waitImported) [다시 받기]를 띄우지 않는다 — 넣는 중에 누르면 두 번 넣다가 앞 넣기의
+        // 끝 알림에 덮개가 일찍 걷히고 그 사이 그린 것이 지워질 수 있었다(검토 M)
+        clearTimeout(this.__evrLoadingSlowTimer);
+        if (document.querySelector('.evr-load-cover[data-slow]')) showLoadingCover(this, true);
         if (ready !== picture && pixelOf(picture)) this.__evrUnbaked = picture.id;
         // 비트맵 레이어 목록: 엔트리는 다른 모양을 열어도 그림 층 data를 지우지 않으므로 여기서 비우고, 레이어 모양이면 엔트리가 첫
         // 그림을 넣는 순간(hookLayerPaint) 넣는다 — 그래야 엔트리 첫 되돌리기 기록에 같이 남는다
@@ -1103,8 +1117,18 @@
           waitImported(this, token); // 엔트리 쪽에서 예외가 나도 5초 안에는 저장 막힘을 푼다
         }
       };
-      readyPicture(this, picture).then(hand, error => {
+      readyPicture(this, picture, attempt).then(hand, error => {
         console.warn('[entry-vector-rig] 모양 그림 미리 받기 실패', picture.name, error);
+        // 다시 받기가 실패하면(연결 끊김 등) 엔트리에 넘기지 않고 바로 알림·[다시 받기]를 다시 띄운다 — 넘기면 엔트리가 멈춘 첫 요청에 붙거나
+        // 실패하고(엔트리는 실패 때 그림을 지우지 않음) 5초 뒤 덮개가 걷혀 앞 모양 그림이 새 모양 편집기에 남았다(검토 N, 시험 재현). 저장 막힘도 그대로.
+        // 처음 받기(attempt 0)는 예전처럼 엔트리가 직접 받게 넘긴다(미리 받기만 안 되는 그림 — 벡터 픽셀 원래 SVG 등)
+        if (attempt > 0) {
+          if (this.__evrLoadToken === token) {
+            clearTimeout(this.__evrLoadingTimer); clearTimeout(this.__evrLoadingSlowTimer); // 0.15초 안에 실패하면 보통 덮개 타이머가 알림을 덮어썼음(시험)
+            showLoadingCover(this, true, retry, error?.status ? `모양 그림을 서버에서 받지 못했습니다(${error.status}) — 잠시 뒤 다시 받거나, 다른 모양을 골랐다 돌아오거나, 새로고침해 보세요.` : null);
+          }
+          return;
+        }
         // 벡터 픽셀 모양의 모양 주소는 실행 화면용 아틀라스 칸(시트 전체 SVG)이라 그대로 넘기면 시트가 벡터 그림으로 열린다 —
         // 원래 SVG 주소를 넘겨 엔트리가 직접 받게 한다
         hand(pixelVector(picture) ? { ...picture, imageType: 'svg', fileurl: vectorSource(picture) } : picture);
@@ -1112,20 +1136,176 @@
     };
   }
   // SVG는 글로 받아 넘긴다. paper importSVG는 첫 줄에 '<'가 있는 글을 바로 읽는다(주소면 다시 받는다).
-  async function svgText(src) {
-    const response = await fetch(src, { credentials: 'same-origin' });
-    if (!response.ok) throw Error(`SVG를 받을 수 없습니다 (${response.status})`);
+  async function svgText(src, attempt = 0) {
+    const response = await fetch(src, fetchOptions(attempt));
+    if (!response.ok) throw Object.assign(Error(`SVG를 받을 수 없습니다 (${response.status})`), { status: response.status });
     const text = (await response.text()).replace(/^\s+/, '');
     if (!/^[^\n]*</.test(text)) throw Error('SVG 글이 아닙니다.');
     return text;
   }
+  // ---- 벡터 SVG 정의 이름 겹침(1.3) ----
+  // 엔트리 저장(entry-paint exportSVG)은 그림 층 도형마다 따로 만든 SVG를 이어 붙여서, 그라데이션·클리핑 틀 같은 정의 이름이 도형마다
+  // 처음부터 다시 매겨진다(color-1, clip-1…). 다시 열면(importSVG) 겹친 이름이 모두 마지막 정의를 가리켜 그라데이션이 바뀌고 두 번째
+  // 클리핑 마스크부터 사라진다 — 엔트리 결함(확장 없이도 같음, 10-18 실험 vector-roundtrip). 이름이 겹칠 때만 도형 SVG(맨 위 svg의
+  // 자식 svg)마다 그 안 정의 이름과 그 안 참조(url(#…)·href="#…")를 고유하게 바꾼다. 저장할 때 고쳐 서버 파일이 바르게 남고, 열 때도
+  // 고쳐 예전에 저장된 파일도 바르게 열린다. 고치다 실패하면 원래 글을 그대로 쓴다.
+  function uniqueSvgIds(text) {
+    if (typeof text !== 'string' || !text.includes(' id="')) return text;
+    const ids = [...text.matchAll(/\sid="([^"]+)"/g)].map(match => match[1]);
+    if (new Set(ids).size === ids.length) return text;
+    const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+    const root = doc.documentElement;
+    if (!root || root.nodeName !== 'svg' || doc.querySelector('parsererror')) return text;
+    const blocks = [...root.children].filter(element => element.nodeName === 'svg');
+    if (blocks.length < 2) return text;
+    blocks.forEach((block, k) => {
+      const rename = new Map();
+      for (const element of block.querySelectorAll('[id]')) {
+        const id = element.getAttribute('id'), next = `${id}-evr${k}`;
+        rename.set(id, next);
+        element.setAttribute('id', next);
+      }
+      if (!rename.size) return;
+      for (const element of [block, ...block.querySelectorAll('*')]) {
+        for (const attr of [...element.attributes]) {
+          let value = attr.value, changed = false;
+          if (value.includes('url(#')) value = value.replace(/url\(#([^)\s]+)\)/g, (all, id) => rename.has(id) ? (changed = true, `url(#${rename.get(id)})`) : all);
+          if (/^(xlink:)?href$/.test(attr.name) && value.startsWith('#') && rename.has(value.slice(1))) { value = `#${rename.get(value.slice(1))}`; changed = true; }
+          if (changed) element.setAttributeNS(attr.namespaceURI, attr.name, value);
+        }
+      }
+    });
+    const out = new XMLSerializer().serializeToString(doc);
+    return text.startsWith('<?xml') && !out.startsWith('<?xml') ? `<?xml version="1.0" encoding="utf-8"?>\n${out}` : out;
+  }
+  const svgIdFixed = new WeakSet();
+  // 엔트리는 모양 탭을 처음 열 때 그림판을 만들고(painter.initialize → EntryPaint.default.create) 곧바로 첫 그림을 연다 — 0.5초 점검에서
+  // 그림판이 생긴 뒤 감싸면 첫 그림은 안 고친 채 열렸다(독립 검토 지적). 그림판 클래스(window.EntryPaint.default)의 공용 틀을 미리 감싼다.
+  function ensureSvgIdFix(painter) {
+    const ep = painter?.entryPaint;
+    hookSvgIdProto(window.EntryPaint?.default?.prototype);
+    if (ep) hookSvgIdProto(Object.getPrototypeOf(ep));
+    // paper 틀은 그림판이 생기기 전에도 건다(첫 그림을 열며 옮길 때부터 따라가게) — 그림판 클래스의 paper는 모듈을 그대로 돌려주는 읽기 전용 값
+    let P = ep?.paper;
+    if (!P) try { P = window.EntryPaint?.default?.prototype?.paper; } catch { P = null; }
+    if (P?.Item) { hookGradientSvgSpace(P); hookMaskStyleTransform(P); }
+  }
+  function hookSvgIdProto(proto) {
+    if (!proto || svgIdFixed.has(proto) || typeof proto.exportSVG !== 'function' || typeof proto.addSVG !== 'function') return;
+    svgIdFixed.add(proto);
+    const exportSVG = proto.exportSVG, addSVG = proto.addSVG;
+    const fixed = (text, when) => {
+      try { return uniqueSvgIds(text); } catch (error) { console.warn(`[entry-vector-rig] SVG 이름 겹침 고치기(${when})`, error); return text; }
+    };
+    proto.exportSVG = function (...args) { return fixed(exportSVG.apply(this, args), '저장'); };
+    proto.addSVG = function (source, ...rest) {
+      if (typeof source === 'string' && /^\s*</.test(source)) return addSVG.call(this, fixed(source, '열기'), ...rest);
+      // 주소로 넣는 길(모양 가져오기 등): 글로 받아 고친 뒤 넣는다(엔트리도 주소면 비동기로 받는다). 못 받으면 엔트리 그대로.
+      if (typeof source === 'string' && /\.svg(\?|#|$)/i.test(source)) {
+        // 받는 사이 다른 모양을 열었으면 넣지 않는다(늦게 온 그림이 다른 모양 그림 층에 섞이지 않게 — 검토 지적)
+        const painter = window.Entry?.playground?.painter, token = painter?.__evrLoadToken, fileId = painter?.file?.id;
+        const still = () => !painter || (painter.__evrLoadToken === token && painter.file?.id === fileId);
+        fetch(source, { credentials: 'same-origin' })
+          .then(response => response.ok ? response.text() : Promise.reject(Error(`SVG를 받을 수 없습니다 (${response.status})`)))
+          .then(text => { if (still()) addSVG.call(this, fixed(text.replace(/^\s+/, ''), '열기'), ...rest); },
+            () => { if (still()) addSVG.call(this, source, ...rest); });
+        return undefined;
+      }
+      return addSVG.call(this, source, ...rest);
+    };
+    proto.exportSVG.__evrSvgIds = proto.addSVG.__evrSvgIds = true; // 시험이 미리 감쌌는지 본다(vector-roundtrip)
+  }
+  // 그라데이션 점 자리: paper 편집기는 항목의 부모 좌표로 그리지만(Color#toCanvasStyle이 항목 행렬을 거꾸로 건다 — 검토 L, 엔트리 번들 paper
+  // 확인), 저장 SVG(gradientUnits=userSpaceOnUse)는 그 요소의 좌표계로 읽는다. paper SVG 내보내기는 도형(Shape)·글상자·그림은 회전·늘리기만
+  // transform에 쓰고 이동은 x·y로(getTransform(matrix, true)), 경로는 행렬 전체를 transform에 쓰므로, 항목을 SVG로 쓰는 순간에만 점을 그
+  // 좌표계로 바꿔 쓰고 되돌린다(엔트리 저장은 맨 위 항목 사본을 옮긴 뒤 항목마다 exportSVG — 옮길 때 paper가 점도 같이 옮기므로 이 순간이어야
+  // 맞음). 열 때는 paper가 fill을 먼저 넣고 transform을 걸며 점도 같이 옮겨(번들 확인) 따로 할 일이 없다. 예전엔 돌린 도형의 그라데이션이 저장
+  // SVG·다시 연 편집기에서 다른 자리였다(시험: 브라우저가 그린 저장 SVG가 한 색).
+  function hookGradientSvgSpace(P) {
+    const proto = P?.Item?.prototype;
+    if (!proto || own(proto, '__evrGradientSpace') || typeof proto.exportSVG !== 'function') return;
+    Object.defineProperty(proto, '__evrGradientSpace', { value: true });
+    const exportSVG = proto.exportSVG;
+    proto.exportSVG = function (...args) {
+      const kept = [];
+      try {
+        for (const item of [this, ...(typeof this.getItems === 'function' ? this.getItems({}) : [])]) {
+          const m = item.matrix;
+          // 겹친 경로(CompoundPath)는 자식이 있어도 자기 칠을 <path transform=행렬 전체> 한 요소로 쓴다(검토 M)
+          if ((item.children && item.className !== 'CompoundPath') || !m || m.isIdentity()) continue;
+          const own = /^(Shape|PointText|Raster)$/.test(item.className) ? new P.Matrix(m.a, m.b, m.c, m.d, 0, 0) : m;
+          const back = own.inverted();
+          if (!back) continue;
+          for (const key of ['fillColor', 'strokeColor']) {
+            const color = item[key];
+            if (!color?.gradient) continue;
+            kept.push([item, key, color]);
+            // 색 복사(new Color(색))는 점을 복제하고 투명도를 지키며 그라데이션 주인 목록에 끼지 않는다(번들 확인) — 예전처럼 새로 만들면 색의
+            // 투명도를 버리고 저장할 때마다 같이 쓰는 그라데이션의 주인 목록이 쌓였다(검토 M)
+            const moved = new P.Color(color);
+            moved.transform(back);
+            item[key] = moved;
+          }
+        }
+      } catch (error) { console.warn('[entry-vector-rig] 그라데이션 점 바꿔 쓰기', error); }
+      try { return exportSVG.apply(this, args); } finally { for (const [item, key, color] of kept) item[key] = color; }
+    };
+  }
+  // 마스크 틀에 적어 둔 그라데이션 점(data.evrMaskStyle)도 항목과 같이 옮긴다. paper Item#transform은 살아 있는 칠의 그라데이션 점만 같은
+  // 행렬로 옮기고(번들 확인) data에 적은 점은 그대로 둬서, 마스크를 만든 뒤 묶음을 옮기거나 돌리고 [마스크 풀기]를 하면 그라데이션이 옮기기 전
+  // 자리에 칠해졌다(검토 M, 시험 재현). paper가 칠을 옮기는 때(행렬이 있을 때)·같은 항목(도형·겹친 경로 — 묶음에 적힌 색은 자식 좌표라 자식이
+  // 따로 옮김)에만 같은 행렬로 옮긴 새 기록으로 바꾼다(복제본과 기록을 같이 쓰므로 제자리에서 고치지 않음). 열 때는 data가 transform 뒤에
+  // 들어가 두 번 옮기지 않는다(검토 M 번들 확인).
+  function hookMaskStyleTransform(P) {
+    const proto = P?.Item?.prototype;
+    if (!proto || own(proto, '__evrMaskStyleMove') || typeof proto.transform !== 'function') return;
+    Object.defineProperty(proto, '__evrMaskStyleMove', { value: true });
+    const transform = proto.transform;
+    proto.transform = function (matrix, ...rest) {
+      const result = transform.call(this, matrix, ...rest);
+      const style = this._data?.evrMaskStyle;
+      if (style && matrix && !matrix.isIdentity() && (!this._children || this.className === 'CompoundPath')) {
+        try {
+          const at = point => {
+            if (!Array.isArray(point)) return point;
+            const moved = matrix.transform(new P.Point(point[0], point[1]));
+            return [moved.x, moved.y];
+          };
+          const move = value => !value || typeof value === 'string' || !value.gradient ? value
+            : { ...value, origin: at(value.origin), destination: at(value.destination), highlight: at(value.highlight) };
+          this._data.evrMaskStyle = { ...style, fill: move(style.fill), stroke: move(style.stroke) };
+        } catch (error) { console.warn('[entry-vector-rig] 마스크 틀 그라데이션 점 옮기기', error); }
+      }
+      return result;
+    };
+  }
+  // [다시 받기](attempt 1부터)는 같은 주소를 캐시 없이 새로 받는다(fetch cache:'no-store') — 크롬은 받는 중인 같은 주소 그림(new Image)을 새로
+  // 받지 않고 그 요청을 같이 기다리게 해, 멈춘 주소를 다시 받으면 요청이 하나도 안 나가고 같이 멈췄다(검토 M, 시험 재현). 받은 그림은 data 주소로
+  // 넘긴다(픽셀 모양처럼). 처음엔 주소에 꼬리표(?evr-retry=n)를 붙였는데, 서버가 모르는 꼬리표를 받아 주는지는 엔트리 /lib만 확인했고 사용자
+  // 그림 서버는 확인하지 못해 그만뒀다(검토 O — 거절하면 다시 받기가 매번 실패).
+  function fetchOptions(attempt) {
+    return { credentials: 'same-origin', ...(attempt ? { cache: 'no-store' } : {}) };
+  }
+  async function freshImageUrl(src) {
+    const response = await fetch(src, fetchOptions(1));
+    if (!response.ok) throw Object.assign(Error(`그림을 받을 수 없습니다 (${response.status})`), { status: response.status });
+    const blob = await response.blob();
+    const url = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || Error('그림을 읽을 수 없습니다.'));
+      reader.readAsDataURL(blob);
+    });
+    await loadImage(url); // 그림인지 확인
+    return url;
+  }
   // 엔트리에 넘길 모양: 그림을 미리 받아 두고, 받은 그림을 바로 쓰도록 주소를 바꾼 사본(원래 모양은 그대로).
-  async function readyPicture(painter, picture) {
+  async function readyPicture(painter, picture, attempt = 0) {
     const k = pixelOf(picture);
     // 비트맵 레이어 모양: 저장 SVG에서 레이어를 꺼내 지금 레이어 그림을 비트맵으로 넘긴다(실패하면 아래 원래 길 — 합친 그림)
     if (picture.dimension?.[LAYER_MARK] && picture.filename && !(k > 1)) {
       try {
-        const response = await fetch(svgFile(picture.filename), { credentials: 'same-origin' });
+        const response = await fetch(svgFile(picture.filename), fetchOptions(attempt));
         const carried = picture.dimension[LAYER_ENT];
         if (!response.ok && !carried) throw Error(`레이어 SVG를 받을 수 없습니다 (${response.status})`);
         const text = response.ok ? await response.text() : entLayerSvgText(carried);
@@ -1136,30 +1316,41 @@
     // 벡터 픽셀 모양은 원래 SVG(벡터)로 연다 — 실행 화면용 아틀라스 칸(fileurl)이 아니라
     if (pixelVector(picture)) {
       const source = picture.filename ? svgFile(picture.filename) : atlasOf(picture)?.base;
-      if (source) return { ...picture, imageType: 'svg', fileurl: await svgText(source) };
+      if (source) return { ...picture, imageType: 'svg', fileurl: await svgText(source, attempt) };
     }
     // 픽셀 모양(SVG·아틀라스 주소)도 비트맵으로, 원래 해상도 그림을 넣어 연다.
     if (k > 1) {
-      const art = await pixelArtOf(picture);
+      const art = await pixelArtOf(picture, attempt);
       return { ...picture, imageType: 'png', fileurl: art.toDataURL('image/png') };
     }
     if (k === 1 && picture.filename) {
       const src = runtimePng(picture.filename); // 1배 픽셀 모양은 파일 PNG가 원래 그림이다
+      if (attempt) return { ...picture, imageType: 'png', fileurl: await freshImageUrl(src) };
       await loadImage(src, true);
       return { ...picture, imageType: 'png', fileurl: src };
     }
     const src = painter.getImageSrc(picture);
-    if (picture.imageType === 'svg') return { ...picture, fileurl: await svgText(src) };
+    if (picture.imageType === 'svg') return { ...picture, fileurl: await svgText(src, attempt) };
+    if (attempt) return { ...picture, fileurl: await freshImageUrl(src) }; // 다시 받기: 받은 그림을 data 주소로
     await loadImage(src, true); // 엔트리가 같은 주소를 다시 받을 때 캐시에서 온다
     return picture;
   }
-  // 불러오는 동안은 저장을 막고, 0.15초 넘게 걸리면 편집기를 덮어 그리기도 막는다.
-  function startLoading(painter, token) {
+  // 불러오는 동안은 저장을 막고, 0.15초 넘게 걸리면 편집기를 덮어 그리기도 막는다. 10초 넘게 걸리면(그림 받기가 멈춤 — 네트워크) 덮개에
+  // 알림과 [다시 받기]를 둔다: 예전엔 받기가 끝날 때까지 덮개만 남아 그림판을 못 썼다(시험 환경에서 60초 넘게 재현). 덮개를 그냥 걷지는
+  // 않는다 — 그림이 오기 전에 그리면 늦게 온 그림이 덮어쓰거나, 레이어 모양이 합친 그림으로 열려 저장 때 레이어가 사라질 수 있다.
+  const LOAD_SLOW_MS = 10000;
+  function startLoading(painter, token, retry) {
     painter.__evrLoading = token;
     clearTimeout(painter.__evrLoadingTimer);
+    clearTimeout(painter.__evrLoadingSlowTimer);
+    // 앞 모양의 알림·[다시 받기]가 떠 있으면 바로 보통 덮개로(150ms 뒤가 아니라 — 그 사이 누를 수 있었음, 검토 M)
+    if (document.querySelector('.evr-load-cover[data-slow]')) showLoadingCover(painter, true);
     painter.__evrLoadingTimer = setTimeout(() => {
       if (painter.__evrLoading === token) showLoadingCover(painter, true);
     }, 150);
+    painter.__evrLoadingSlowTimer = setTimeout(() => {
+      if (painter.__evrLoading === token) showLoadingCover(painter, true, retry);
+    }, LOAD_SLOW_MS);
   }
   // 엔트리는 그림을 다 넣은 뒤 saveSnapshot → SNAPSHOT_SAVED를 낸다. 오지 않으면(그림 오류 등) 5초 뒤 푼다.
   function waitImported(painter, token) {
@@ -1167,18 +1358,29 @@
       if (painter.__evrLoading !== token) return;
       painter.__evrLoading = null;
       clearTimeout(painter.__evrLoadingTimer);
+      clearTimeout(painter.__evrLoadingSlowTimer);
       showLoadingCover(painter, false);
     };
     painter.entryPaint?.once?.('SNAPSHOT_SAVED', finish);
     setTimeout(finish, 5000);
   }
-  function showLoadingCover(painter, on) {
+  function showLoadingCover(painter, on, retry, message) {
     const area = painter.entryPaint?.project?.view?.element?.closest?.('.canvas_area');
     let cover = document.querySelector('.evr-load-cover');
     if (!on || !area) { cover?.remove(); return; }
     if (!cover) {
       cover = document.createElement('div');
       cover.className = 'evr-load-cover';
+    }
+    cover.replaceChildren();
+    if (retry) {
+      cover.dataset.slow = 'true';
+      const text = document.createElement('span');
+      text.textContent = message || '모양 그림을 받는 데 오래 걸립니다 — 인터넷 연결을 확인한 뒤 다시 받아 보세요.';
+      cover.append(text, button('다시 받기', () => { try { retry(); } catch (error) { console.warn('[entry-vector-rig] 모양 다시 받기', error); } },
+        { class: 'evr-layers-act evr-load-retry', title: '이 모양 그림을 처음부터 다시 받습니다' }));
+    } else {
+      delete cover.dataset.slow;
       cover.textContent = '모양 그림을 불러오는 중…';
     }
     if (cover.parentElement !== area) area.append(cover);
@@ -3977,9 +4179,10 @@
     // 비트맵 탭: 그림(Raster) 한 장이 레이어 하나(open에서 그림 칸만큼 넓혀 둠)
     // 벡터 탭: 경로가 든 맨 위 항목과 그림(Raster) 항목이 레이어 — 비트맵에서 바꿔 온 그림 레이어도 비트맵 뼈대 방식으로 휜다(사용자 요구,
     // 예전엔 경로만 골라 "벡터 도형이 없습니다"). 그림은 돌리거나 늘리지 않은(1화소 = 그림 1) 칠해진 것만.
+    // 엔트리 [그룹화]로 묶은 그림도 레이어 하나(groupParts — 예전엔 그림만 든 묶음은 빠져 "벡터 도형이나 그림이 없습니다", 사용자 제보)
     const layers = bitmapMode(c) ? c.layer.children.filter(isRasterLayer).slice(0, 1) :
       c.layer.children.filter(item => item.data?.entryVectorCanvasBox !== '1' && !isLayerHelper(item) &&
-        (isRasterLayer(item) ? plainRaster(item) && !!rasterInk(item) : pathItems(item).length > 0));
+        (isRasterLayer(item) ? plainRaster(item) && !!rasterInk(item) : pathItems(item).length > 0 || groupParts(item).length > 0));
     const s = { ...c, art, layers, opener,
       rigs: new Map(), base: new Map(), current: null, selectedJoint: -1, hover: null,
       stage: 'setup', ik: false, previews: new Map(), restBounds: new Map(),
@@ -3998,13 +4201,40 @@
           rig = joints ? bitmapRigBase(s, item, joints) : null;
           if (rig) rig.sig = rasterSig(item);
         }
-        if (!validRig(rig)) continue;
+        if (!validRig(rig)) {
+          // 뼈대가 없는 그림은 지금 그림이 휘기 전 그림이다 — 묶음에서 풀었거나 관절을 모두 지운 뒤 남은 옛 휘기 전 그림(같은 탭 기억·그림 데이터)을
+          // 쓰면 뼈를 넣는 순간 옛 모양·옛 자리로 돌아갔다(검토 L). 비트맵 탭은 모양 정보 관절(위)을 쓰므로 그대로.
+          if (!bitmapMode(s)) { restCanvases.set(item, restHere(item)); delete item.data[BITMAP_REST]; }
+          continue;
+        }
         rig.pose = Object.fromEntries(Object.entries(rig.pose).map(([id, angle]) => [id, Number(angle)]));
         rig = reconcileBitmapRig(s, rig, item, hadRest);
         s.rigs.set(item, rig);
         persist(s, item, true);
         touch(s, item);
         continue;
+      }
+      const parts = groupParts(item);
+      if (parts.length) {
+        // 묶음 안 그림: 휘기 전 그림을 모두 들고 있었는지(휜 채 남긴 것은 open이 읽어 둠) 본 뒤, 없는 것은 지금 그림으로
+        const hadRest = parts.every(raster => !!restCanvasOf(raster));
+        if (!validRig(rig)) {
+          parts.forEach(raster => { restCanvases.set(raster, partRestHere(raster)); delete raster.data[BITMAP_REST]; }); // 위 그림 레이어와 같은 까닭
+          continue;
+        }
+        parts.forEach(raster => { if (!restCanvasOf(raster)) restCanvases.set(raster, partRestHere(raster)); });
+        rig.pose = Object.fromEntries(Object.entries(rig.pose).map(([id, angle]) => [id, Number(angle)]));
+        rig = reconcileGroupRig(s, rig, item, parts, hadRest);
+        (rig.parts || []).forEach((part, i) => { const rest = restCanvases.get(parts[i]); if (rest) rest.at = { x: part.bitmap.x, y: part.bitmap.y }; });
+        s.rigs.set(item, rig);
+        persist(s, item, true);
+        touch(s, item);
+        continue;
+      }
+      if (rig?.parts) {
+        // 묶음 안 그림을 하나도 못 쓰게 됐으면(엔트리로 묶음을 돌리거나 늘림 등) 그림 기준을 버린다 — 남으면 휘기가 매번 멈췄다(검토 L)
+        delete rig.parts;
+        for (const raster of item.getItems({ match: node => isRasterLayer(node) })) delete raster.data[BITMAP_REST];
       }
       if (!validRig(rig)) continue;
       rig.pose = Object.fromEntries(Object.entries(rig.pose).map(([id, angle]) => [id, Number(angle)]));
@@ -4039,12 +4269,16 @@
   function persist(s, item, quiet) {
     const rig = s.rigs.get(item);
     if (rig && isRasterLayer(item)) rig.sig = rasterSig(item);
+    if (rig?.parts && !isRasterLayer(item)) {
+      const parts = groupParts(item);
+      if (parts.length === rig.parts.length) parts.forEach((raster, i) => { rig.parts[i].sig = partSig(raster); });
+    }
     if (rig) item.data[BONES] = JSON.stringify(rig);
     else delete item.data[BONES];
-    // 비트맵: 휘어 있는 동안만 휘기 전 그림을 같이 둔다(엔트리 되돌리기 기록에도 그림 데이터째 남는다)
-    if (isRasterLayer(item)) {
-      if (rig && posed(rig)) item.data[BITMAP_REST] = restUrlOf(item);
-      else delete item.data[BITMAP_REST];
+    // 비트맵: 휘어 있는 동안만 휘기 전 그림을 같이 둔다(엔트리 되돌리기 기록에도 그림 데이터째 남는다). 묶음 안 그림은 그림마다.
+    for (const raster of isRasterLayer(item) ? [item] : !rig || rig.parts ? groupParts(item) : []) {
+      if (rig && posed(rig)) raster.data[BITMAP_REST] = restUrlOf(raster);
+      else delete raster.data[BITMAP_REST];
     }
     if (!quiet) s.p.file.modified = true;
   }
@@ -4079,6 +4313,7 @@
       else s.rigs.delete(item);
       s.cache.delete(item);
       if (isRasterLayer(item)) deformLayer(s, item); // 비트맵은 기록에 그림 대신 자세만 두고 다시 그린다
+      else if (groupParts(item).length) renderParts(s, item, s.rigs.get(item) || null); // 묶음 안 그림도(경로는 위에서 되돌림)
       persist(s, item);
     }
     s.historyIndex = index;
@@ -4401,9 +4636,12 @@
     if (!rig) return;
     if (leaves.length !== rig.source.length)
       throw Error('레이어의 경로 구조가 달라져 휘기를 멈췄습니다.');
-    const data = madePaths(s, item, rig, leaves);
-    leaves.forEach((leaf, i) => setWorldPathData(s.ep.paper, leaf, data[i]));
-    rig.sig = shapeSig(item);
+    if (leaves.length) {
+      const data = madePaths(s, item, rig, leaves);
+      leaves.forEach((leaf, i) => setWorldPathData(s.ep.paper, leaf, data[i]));
+      rig.sig = shapeSig(item);
+    }
+    if (rig.parts) renderParts(s, item, rig); // 묶음 안 그림도 같은 뼈로
     s.ep.paper.view.update();
   }
 
@@ -4509,8 +4747,95 @@
     return wide;
   }
   // 엔트리 비트맵 그림은 1화소 = 그림 1(돌리거나 늘리지 않음)이라야 이 방식으로 다룬다.
-  const plainRaster = raster => Math.abs(raster.bounds.width - raster.width) < .5 &&
-    Math.abs(raster.bounds.height - raster.height) < .5;
+  // 뒤집거나 돌린 그림도 뺀다(크기만 보면 좌우로 뒤집거나 180° 돌린 그림·90° 돌린 정사각 그림이 통과해 뼈대가 뒤집기 전 그림으로 휘었음 — 검토 L)
+  const plainRaster = raster => {
+    const m = raster.matrix;
+    return m.a > 0 && m.d > 0 && Math.abs(m.b) < 1e-9 && Math.abs(m.c) < 1e-9 &&
+      Math.abs(raster.bounds.width - raster.width) < .5 && Math.abs(raster.bounds.height - raster.height) < .5;
+  };
+  // ---- 묶음 레이어 안의 그림 ----
+  // 사용자 결정(10-18, 제보 "비트맵 레이어를 그룹화 하면 뼈대에서 레이어 인식이 안돼"): 엔트리 [그룹화]로 묶은 묶음은 벡터 레이어처럼
+  // 레이어 하나이고, 뼈대 하나로 안의 그림(Raster)이 모두 같이 휜다(합치지 않음). 그림마다 자기 윤곽선 삼각망·가중치로 같은 뼈를 따른다
+  // (Spine의 뼈대 하나·그림 조각 여럿과 같음). 묶음 안 경로는 지금처럼 묶음 전체가 한 삼각망. 그림마다의 기준(윤곽선·휘기 전 자리·요약)은
+  // 묶음 뼈대의 parts에 그림 차례대로 두고, 휘기 전 그림 데이터(BITMAP_REST)는 그림마다 둔다. 돌리거나 늘린 그림·묶음은 빼고, 빈 그림도 뺀다.
+  function groupParts(item) {
+    if (!item?.children || isRasterLayer(item)) return [];
+    return item.getItems({ match: node => isRasterLayer(node) }).filter(raster => {
+      for (let node = raster.parent; node && node.className !== 'Layer'; node = node.parent) {
+        const m = node.matrix;
+        if (Math.abs(m.a - 1) > 1e-9 || Math.abs(m.d - 1) > 1e-9 || Math.abs(m.b) > 1e-9 || Math.abs(m.c) > 1e-9) return false;
+      }
+      return plainRaster(raster) && !!rasterInk(raster);
+    });
+  }
+  // 묶음 안 그림의 자리는 그림 좌표로 다룬다: 엔트리 묶음은 applyMatrix=false라 묶음을 옮기면 안의 그림이 아니라 묶음 행렬에 남는다
+  // (실제 엔트리로 확인 — 옮긴 뒤 예전엔 뼈대 목록에서 다시 빠졌음). 옮기기만 한 묶음 안이면 그 이동을 더한다.
+  function partShift(raster) {
+    let x = 0, y = 0;
+    for (let node = raster.parent; node && node.className !== 'Layer'; node = node.parent) { x += node.matrix.tx; y += node.matrix.ty; }
+    return { x, y };
+  }
+  function partRestHere(raster) {
+    const shift = partShift(raster);
+    return { canvas: rasterCopy(raster), url: null, at: { x: Math.round(raster.bounds.left + shift.x), y: Math.round(raster.bounds.top + shift.y) } };
+  }
+  function partSig(raster) {
+    const sig = rasterSig(raster), shift = partShift(raster);
+    return { ...sig, x: clean(sig.x + shift.x), y: clean(sig.y + shift.y) };
+  }
+  const partRig = (rig, part) => ({ joints: rig.joints, pose: rig.pose, radius: rig.radius, source: part.source, bitmap: part.bitmap });
+  // 그림 하나의 기준: 휘기 전 그림(세션이 들고 있는 것)과 그 자리로 윤곽선·자리·요약
+  function partBase(s, raster) {
+    if (!restCanvasOf(raster)) restCanvases.set(raster, partRestHere(raster));
+    const rest = restCanvasOf(raster), b = restCanvases.get(raster).at || partRestHere(raster).at;
+    return { source: rasterOutline(s.ep.paper, rest, b.x, b.y), bitmap: { x: clean(b.x), y: clean(b.y), w: rest.width, h: rest.height }, sig: partSig(raster) };
+  }
+  function renderParts(s, item, rig) {
+    if (rig && !rig.parts) return; // 예전 뼈대(경로만, reconcileGroupRig)
+    const parts = groupParts(item);
+    if (rig && (rig.parts || []).length !== parts.length) throw Error('묶음 안 그림이 달라져 휘기를 멈췄습니다.');
+    parts.forEach((raster, i) => renderBitmapPose(s, raster, rig ? partRig(rig, rig.parts[i]) : null, partShift(raster)));
+  }
+  // 뼈대 모드 밖에서 묶음이 바뀌었으면 맞춘다. 통째로 옮기기만 했으면(경로 모양·그림 화소 그대로, 모두 같은 거리) 뼈대와 기준을 같이
+  // 옮긴다. 그 밖(그림을 더하거나 빼거나 고침, 경로를 고침, 휜 상태인데 휘기 전 그림을 모름, 예전 뼈대라 그림 기준이 없음)이면 지금 보이는
+  // 모양을 새 기준으로(관절은 지금 자세 자리, 각도 0) — 비트맵 레이어(reconcileBitmapRig)와 같은 뜻.
+  function reconcileGroupRig(s, rig, item, parts, hadRest) {
+    // 그림 기준이 없는 예전 뼈대(1.3 전 도형+그림 묶음)가 휘어 있으면 지금처럼 경로만 휘는 뼈대로 둔다 — 새 기준으로 바꾸면 곧게 펴기로 원래
+    // 모양에 못 돌아간다(검토 L). 자세가 0이 되어 다시 열면 그때 그림 기준을 붙인다.
+    if (!rig.parts && posed(rig)) { reconcileRig(s, rig, item); return rig; }
+    const sigs = parts.map(raster => partSig(raster)), shape = shapeSig(item), old = rig.parts || [];
+    const sameParts = old.length === parts.length && old.every((part, i) => part.sig?.abs === sigs[i].abs && part.bitmap && part.source);
+    const samePaths = shape ? !!rig.sig && shape.rel === rig.sig.rel && rig.source.length === pathItems(item).length : !rig.source.length;
+    if (sameParts && samePaths) {
+      const moves = sigs.map((sig, i) => [sig.x - old[i].sig.x, sig.y - old[i].sig.y]);
+      if (shape) moves.push([shape.x0 - rig.sig.x0, shape.y0 - rig.sig.y0]);
+      const [dx, dy] = moves[0];
+      if (moves.every(([x, y]) => Math.abs(x - dx) < .01 && Math.abs(y - dy) < .01)) {
+        if (Math.abs(dx) > .01 || Math.abs(dy) > .01) {
+          rig.joints = rig.joints.map(j => ({ ...j, x: clean(j.x + dx), y: clean(j.y + dy) }));
+          if (rig.source.length) rig.source = shiftPaths(rig.source, dx, dy);
+          rig.parts = old.map((part, i) => ({ source: part.source.length ? shiftPaths(part.source, dx, dy) : part.source,
+            bitmap: { ...part.bitmap, x: clean(part.bitmap.x + dx), y: clean(part.bitmap.y + dy) }, sig: sigs[i] }));
+          if (shape) rig.sig = shape;
+        }
+        if (hadRest || !posed(rig)) return rig;
+      }
+    }
+    const points = jointPoints(rig);
+    parts.forEach(raster => restCanvases.set(raster, partRestHere(raster)));
+    return { joints: rig.joints.map(j => ({ ...j, x: clean(points[j.id].x), y: clean(points[j.id].y) })), pose: {},
+      source: pathItems(item).map(leaf => worldPathData(s.ep.paper, leaf)), radius: rig.radius, sig: shape,
+      parts: parts.map(raster => partBase(s, raster)) };
+  }
+  // 묶음 안 그림의 휘기 전 자리(남긴 묶음 뼈대에서) — 휜 채 남긴 그림을 열 때 쓴다
+  function partRestAt(c, raster) {
+    let top = raster;
+    while (top.parent && top.parent !== c.layer) top = top.parent;
+    try {
+      const rig = JSON.parse(top.data?.[BONES] || 'null'), at = rig?.parts?.[groupParts(top).indexOf(raster)]?.bitmap;
+      return at && Number.isFinite(at.x) && Number.isFinite(at.y) ? { x: at.x, y: at.y } : null;
+    } catch { return null; }
+  }
   // 꼭짓점마다 DQS로 옮긴 자리(그림 좌표)
   function skinVertices(paper, skin, rig) {
     const { anchorTransform, place } = dqsBlend(paper, skin, rig), { pts, n } = skin.mesh, out = new Float32Array(n * 2);
@@ -4611,10 +4936,18 @@
   // 벡터 탭 그림 레이어는 칸 크기 그림이 아니라 칠해진 곳 크기라, 그림 크기를 휜 결과(휘기 전이면 휘기 전 그림)에 맞춰 바꾼다.
   // 칸만큼 미리 넓혀 두면 엔트리 선택 상자·저장 SVG 그림이 커져 다른 기능까지 칸 크기로 본다.
   function fitRasterTo(P, item, canvas, left, top) {
-    item.setImage(canvas);
+    replaceRasterImage(item, canvas);
     item.position = new P.Point(left + canvas.width / 2, top + canvas.height / 2);
   }
-  function renderBitmapPose(s, item, rig) {
+  // paper가 SVG에서 불러온 그림(Raster)은 '다 불러오면 크기·자리 맞추기' 처리(paper 0.12.15 importSVG의 image: on('load', 가운데로 옮김))를
+  // 계속 달고 있어, 나중에 setImage를 부르면 paper가 load를 다시 알려 그림이 SVG 좌표만큼 한 번 더 밀렸다(저장했다 다시 연 그림을 뼈대로 휘면
+  // 엉뚱한 곳으로 감 — 시험으로 재현). 이미 불러온 그림이면 그 처리를 떼고 바꾼다.
+  function replaceRasterImage(raster, canvas) {
+    if (raster.loaded && raster.responds('load')) raster.off('load');
+    raster.setImage(canvas);
+  }
+  // shift: 묶음 안 그림이면 묶음들의 옮기기(그림 좌표 = 그림의 부모 좌표 + shift, partShift)
+  function renderBitmapPose(s, item, rig, shift = { x: 0, y: 0 }) {
     const rest = restCanvasOf(item);
     if (!rest) throw Error('휘기 전 그림을 찾지 못해 휘기를 멈췄습니다.');
     const fit = !bitmapMode(s);
@@ -4622,7 +4955,7 @@
     // 벡터 탭 그림은 휘면 자리가 바뀌므로 뼈대가 없을 때는 휘기 전 그림을 남긴 자리(비트맵 탭은 칸 크기 그림이라 그대로)
     const at0 = rig?.bitmap || (fit && restCanvases.get(item)?.at) || { x: origin.x, y: origin.y };
     if (!rig || !posed(rig) || rig.joints.length < 2) {
-      if (fit) { fitRasterTo(s.ep.paper, item, copyCanvas(rest), Math.round(at0.x), Math.round(at0.y)); return; }
+      if (fit) { fitRasterTo(s.ep.paper, item, copyCanvas(rest), Math.round(at0.x) - shift.x, Math.round(at0.y) - shift.y); return; }
       const ctx = item.getContext(true);
       ctx.clearRect(0, 0, item.width, item.height);
       ctx.drawImage(rest, Math.round(at0.x - origin.x), Math.round(at0.y - origin.y));
@@ -4641,7 +4974,7 @@
       const x0 = Math.floor(left) - 1, y0 = Math.floor(top) - 1;
       const out = canvasOfSize(Math.max(1, Math.ceil(right) + 1 - x0), Math.max(1, Math.ceil(bottom) + 1 - y0));
       drawMesh(out, x0, y0, rest, at0.x, at0.y, skin.mesh, moved, objectPixel(s.object) > 0);
-      fitRasterTo(s.ep.paper, item, out, x0, y0);
+      fitRasterTo(s.ep.paper, item, out, x0 - shift.x, y0 - shift.y);
       return;
     }
     const ctx = item.getContext(true);
@@ -4934,6 +5267,7 @@
         }
         const move = new p.ep.paper.Point(step.x, step.y);
         movableItems(p).forEach(item => item.translate(move));
+        if (bitmapMode(p)) shiftLayerDisplays(p, move);
         const box = canvasBox(p);
         const bounds = box && movableBounds(p);
         if (bounds) {
@@ -4956,12 +5290,39 @@
         });
       });
       const stopDrag = event => {
-        if (pivotUI?.dragging?.id === event.pointerId) pivotUI.dragging = null;
+        if (pivotUI?.dragging?.id !== event.pointerId) return;
+        const shift = pivotUI.dragging.layerShift;
+        pivotUI.dragging = null;
+        if (shift) try { commitLayerShift(pivotUI.ep, shift); } catch (error) { console.warn('[entry-vector-rig] 레이어 같이 옮기기', error); }
       };
       overlay.addEventListener('pointerup', stopDrag);
       overlay.addEventListener('pointercancel', stopDrag);
+      overlay.addEventListener('lostpointercapture', stopDrag); // 놓기 없이 붙잡기만 풀려도 다른 레이어 옮김을 확정(검토 지적)
     }
     drawPivotUI();
+  }
+  // 그림 전체 이동(비트맵): 지금 레이어만 옮기면 레이어가 여럿일 때 그림이 갈라졌다(사용자 결정 10-18 — 모든 레이어를 같이). 끄는 동안은
+  // 다른 레이어 표시 그림도 같이 옮기고(아래 묶음의 무대 틀은 그대로), 놓을 때 다른 레이어 그림 자리를 옮긴 만큼 확정한다.
+  function shiftLayerDisplays(p, move) {
+    const meta = layerMeta(p.ep);
+    if (!meta || meta.layers.length < 2) return;
+    for (const item of layerUi.displays) item.translate(move);
+    layerUi.under?.children.slice(1).forEach(item => item.translate(move));
+    const shift = p.dragging.layerShift ||= { x: 0, y: 0 };
+    shift.x += move.x; shift.y += move.y;
+  }
+  function commitLayerShift(ep, shift) {
+    const meta = layerMeta(ep);
+    if (!meta || (!shift.x && !shift.y)) return;
+    for (const layer of meta.layers) {
+      const content = layer.id !== meta.active && layer.ref && layerCache.get(layer.ref);
+      if (!content) continue;
+      const ref = layerUid('r'); // 참조는 한 번 만들면 바꾸지 않는다(되돌리기 기록이 옛 참조를 씀)
+      layerCache.set(ref, { canvas: content.canvas, x: content.x + shift.x, y: content.y + shift.y });
+      layer.ref = ref;
+    }
+    layerUi.signature = null;
+    refreshLayers(ep);
   }
   // ---- 뼈대 모드 화면 ----
   // "비트맵 | 벡터" 옆 "뼈대" 버튼으로 켠다. 레이어를 고르고(그림 클릭 또는 오른쪽 목록) Spine처럼 두 단계로 다룬다.
@@ -5012,7 +5373,10 @@
       rig = isRasterLayer(item) ? Object.assign(bitmapRigBase(s, item, root), { sig: rasterSig(item) }) :
         { joints: root, pose: {}, source: pathItems(item).map(leaf => worldPathData(s.ep.paper, leaf)),
           radius: radiusOf(item), sig: shapeSig(item) };
-      if (isRasterLayer(item) && !rig.source.length) throw Error('그림이 비어 있어 뼈를 넣을 수 없습니다.');
+      const parts = isRasterLayer(item) ? [] : groupParts(item);
+      if (parts.length) rig.parts = parts.map(raster => partBase(s, raster));
+      if ((isRasterLayer(item) || rig.parts) && !rig.source.length && !(rig.parts || []).some(part => part.source.length))
+        throw Error('그림이 비어 있어 뼈를 넣을 수 없습니다.');
       s.rigs.set(item, rig);
       from = 0;
     }
@@ -5057,7 +5421,10 @@
         renderBitmapPose(s, item, null);
         // 모양 정보에 남긴 관절도 지운다(저장할 때 그림에 뼈대 데이터가 없으면 기록을 그대로 두므로)
         if (s.picture?.dimension) delete s.picture.dimension[BITMAP_RIG];
-      } else if (leaves.length === rig.source.length) leaves.forEach((leaf, i) => setWorldPathData(s.ep.paper, leaf, rig.source[i]));
+      } else {
+        if (leaves.length === rig.source.length) leaves.forEach((leaf, i) => setWorldPathData(s.ep.paper, leaf, rig.source[i]));
+        if (rig.parts) renderParts(s, item, null); // 묶음 안 그림도 휘기 전 그림으로
+      }
       s.rigs.delete(item);
       s.selectedJoint = -1;
       commit(s, item, '이 레이어의 뼈대를 모두 지웠습니다');
@@ -5108,11 +5475,11 @@
   }
   // 휘기 전 모양의 범위(기준 모양 글이 바뀔 때만 다시 잰다).
   function restBounds(s, item, rig) {
-    const key = rig.source.join('\n');
+    const all = rig.source.concat(...(rig.parts || []).map(part => part.source)), key = all.join('\n');
     let cached = s.restBounds.get(item);
     if (cached?.key !== key) {
       let bounds = null;
-      for (const data of rig.source) {
+      for (const data of all) {
         const path = new s.ep.paper.CompoundPath({ pathData: data, insert: false });
         bounds = bounds ? bounds.unite(path.bounds) : path.bounds;
       }
@@ -5156,10 +5523,15 @@
   function restPreview(s, item) {
     if (isRasterLayer(item)) return restImagePreview(s, item);
     const rig = s.rigs.get(item), data = rig ? rig.source : pathItems(item).map(leaf => worldPathData(s.ep.paper, leaf));
-    const key = data.join('\n');
+    // 묶음 안 그림은 휘기 전 그림을 그 자리에(경로 아래)
+    const pictures = groupParts(item).map((raster, i) => ({ raster, rest: restCanvasOf(raster),
+      at: rig?.parts?.[i]?.bitmap || restCanvases.get(raster)?.at || partRestHere(raster).at }));
+    const key = data.join('\n') + pictures.map(p => `|${restUrlOf(p.raster)?.length}:${p.at.x},${p.at.y}`).join('');
     let cached = s.previews.get(item);
     if (cached?.key !== key) {
       const group = svg('g', { class: 'evr-rig-rest' }), leaves = pathItems(item);
+      for (const p of pictures) if (p.rest) group.append(svg('image', { href: restUrlOf(p.raster), x: p.at.x, y: p.at.y, width: p.rest.width, height: p.rest.height,
+        preserveAspectRatio: 'none', ...(objectPixel(s.object) > 0 ? { style: 'image-rendering:pixelated' } : {}) }));
       const css = color => color && color.type !== 'gradient' ? color.toCSS(false) : null;
       data.forEach((d, i) => {
         const leaf = leaves[i], fill = css(leaf?.fillColor), stroke = css(leaf?.strokeColor);
@@ -5572,7 +5944,7 @@
       // 엔트리 선택을 풀면 잘라 든 조각이 그림에 합쳐진다. 그 뒤 그림 한 장을 칸만큼 넓혀 둔다.
       // 넓히기 전에 검사한다(넓히기는 행렬을 빼고 원래 화소로 다시 그려, 크기를 바꾸거나 돌린 그림이 말없이 되돌아갔다)
       const first = c.layer.children.find(isRasterLayer);
-      if (first && !plainRaster(first)) throw Error('크기를 바꾸거나 돌린 비트맵이라 뼈대를 쓸 수 없습니다. 저장한 뒤 다시 열어 주세요.');
+      if (first && !plainRaster(first)) throw Error('크기를 바꾸거나 돌리거나 뒤집은 비트맵이라 뼈대를 쓸 수 없습니다. 저장한 뒤 다시 열어 주세요.');
       const raster = fillRasterToStage(c);
       if (!raster || rasterInk(raster) === null) throw Error('그림이 비어 있습니다.');
       // 휜 채로 남긴 휘기 전 그림(data URL)은 그림으로 읽은 뒤 연다.
@@ -5591,7 +5963,7 @@
       }
     } else {
       // 벡터 탭 그림 레이어도 휜 채 남긴 휘기 전 그림을 다 읽은 뒤 연다
-      const waiting = c.layer.children.filter(item => isRasterLayer(item) && item.data?.[BITMAP_REST] && !restCanvasOf(item));
+      const waiting = c.layer.getItems({ match: item => isRasterLayer(item) && item.data?.[BITMAP_REST] && !restCanvasOf(item) }); // 묶음 안 그림 포함
       if (waiting.length) {
         let left = waiting.length;
         const done = () => { if (--left === 0 && !session) try { open(context() || c, opener); } catch (error) { window.alert(error.message || String(error)); } };
@@ -5600,7 +5972,7 @@
           image.onload = () => {
             const canvas = canvasOfSize(image.naturalWidth, image.naturalHeight);
             canvas.getContext('2d').drawImage(image, 0, 0);
-            restCanvases.set(raster, { canvas, url, at: savedRestAt(raster) });
+            restCanvases.set(raster, { canvas, url, at: savedRestAt(raster) || partRestAt(c, raster) });
             done();
           };
           image.onerror = () => { delete raster.data[BITMAP_REST]; done(); };
@@ -5893,9 +6265,9 @@
     // 이벤트(mousedown·mousemove·mouseup)도 생기지 않는다.
     area.addEventListener('pointerdown', event => {
       if (!(event.button === 0 || event.button === 1 || event.button === 2)) return;
-      // 그림판 칸 안에 띄운 확장 창(레이어 창·투명도 상자)은 화면 이동으로 가로채지 않는다 — 손 도구·스페이스일 때 창의 단추·밀대가
+      // 그림판 칸 안에 띄운 확장 창(레이어 창·투명도 상자·그라데이션 창)은 화면 이동으로 가로채지 않는다 — 손 도구·스페이스일 때 창의 단추·밀대가
       // 눌리지 않았다(검토로 찾음 2026-10-16)
-      if (event.target?.closest?.('.evr-layers, .evr-opacity-opts')) return;
+      if (event.target?.closest?.('.evr-layers, .evr-opacity-opts, .evr-grad-win')) return;
       const now = current();
       if (!now || (event.button === 0 && !painterSpace && !entryHandTool(now))) return;
       event.preventDefault();
@@ -6294,7 +6666,8 @@
           const tile = ep.mode === 'BITMAP' && wrapOn(ep) && areaTile(ep);
           if (tile && item.width && item.height && plainRaster(item) && !tile.contains(item.bounds)) {
             const b = item.bounds;
-            item.setImage(collapsedTile(ep, tile, item.canvas || item.image, b.x, b.y));
+            // 엔트리 비트맵 그림은 엔트리의 '불러오면 화면 가운데로·기록 비우기' 처리를 달고 있어 setImage가 그것을 다시 부른다(탐침으로 확인) — 떼고 바꾼다
+            replaceRasterImage(item, collapsedTile(ep, tile, item.canvas || item.image, b.x, b.y));
             item.position = tile.center;
           }
         } catch (error) { console.warn('[entry-vector-rig] 무한 배경 잇기', error); }
@@ -7382,6 +7755,8 @@
     const base = group.members[0];
     const b = base.visible && contentOf(base);
     if (!b) return null;
+    // 클리핑 레이어가 없으면 기준 그림을 그대로(부르는 쪽은 읽기만 함) — 묶음마다 복사하면 레이어가 많을 때 느렸다(실측 1000장 110ms)
+    if (group.members.length < 2) return { canvas: b.canvas, x: b.x, y: b.y, opacity: base.opacity };
     const canvas = copyCanvas(b.canvas), g = canvas.getContext('2d');
     for (const layer of group.members.slice(1)) {
       const c = layer.visible && contentOf(layer);
@@ -7392,15 +7767,18 @@
     }
     return { canvas, x: b.x, y: b.y, opacity: base.opacity };
   }
-  // 보이는 레이어 전부를 합친 그림 { canvas, x, y } (지금 레이어는 먼저 사본으로 남긴 뒤 부른다)
-  function composeLayers(ep, meta) {
-    const parts = clipGroups(meta.layers).map(group => groupComposite(group, layer => layerContent(ep, meta, layer))).filter(Boolean);
+  // 묶음 그림들({ canvas, x, y, opacity }, 아래부터)을 차례로 겹친 한 장 { canvas, x, y }(없으면 null)
+  function flattenParts(parts) {
     if (!parts.length) return null;
     const left = Math.min(...parts.map(p => p.x)), top = Math.min(...parts.map(p => p.y));
     const right = Math.max(...parts.map(p => p.x + p.canvas.width)), bottom = Math.max(...parts.map(p => p.y + p.canvas.height));
     const canvas = canvasOfSize(right - left, bottom - top), g = canvas.getContext('2d');
     for (const part of parts) { g.globalAlpha = part.opacity; g.drawImage(part.canvas, part.x - left, part.y - top); }
     return { canvas, x: left, y: top };
+  }
+  // 보이는 레이어 전부를 합친 그림 { canvas, x, y } (지금 레이어는 먼저 사본으로 남긴 뒤 부른다)
+  function composeLayers(ep, meta) {
+    return flattenParts(clipGroups(meta.layers).map(group => groupComposite(group, layer => layerContent(ep, meta, layer))).filter(Boolean));
   }
   function clearLayerDisplays(ep) {
     layerUi.displays.forEach(item => item.remove());
@@ -7430,12 +7808,15 @@
     const groups = clipGroups(meta.layers);
     const gi = groups.findIndex(group => group.members.some(layer => layer.id === meta.active));
     const contentOf = layer => layerContent(ep, meta, layer);
-    // 지금 묶음보다 아래 묶음들: 잘라 보이는 층 밖(아래)에 무대 틀로 잘라 둔다(지금 묶음의 클리핑이 이것까지 쓰지 않게)
-    const below = groups.slice(0, gi).map(group => groupComposite(group, contentOf)).filter(Boolean);
-    if (below.length) {
+    // 지금 묶음보다 아래 묶음들: 잘라 보이는 층 밖(아래)에 무대 틀로 잘라 둔다(지금 묶음의 클리핑이 이것까지 쓰지 않게).
+    // 아래·위 묶음은 각각 미리 한 장으로 겹쳐 둔다 — 묶음마다 한 장씩 두면 화면을 다시 그릴 때마다 레이어 수만큼 그려 레이어가 많으면
+    // 붓질이 끊겼다(사용자 요청 10-18 "랙 안 걸릴 방법", 실측 1000장: 붓질 중 233ms 프레임). 포토샵·크리타처럼 지금 레이어 아래·위 투영을
+    // 한 장씩 두는 방식.
+    const below = flattenParts(groups.slice(0, gi).map(group => groupComposite(group, contentOf)).filter(Boolean));
+    if (below) {
       const mask = clip.children.find(item => item.className === 'Shape');
       const under = new P.Group({ insert: false, clipped: true,
-        children: [mask.clone({ insert: false }), ...below.map(part => display(part, part.opacity))] });
+        children: [mask.clone({ insert: false }), display(below, 1)] });
       under.locked = true;
       under.data.evrLayerDisplay = true;
       clip.parent.insertChild(clip.index, under);
@@ -7456,10 +7837,9 @@
     paint.opacity = active.visible && (at === 0 || base.visible) ? active.opacity : 0;
     if (at > 0) paint.blendMode = 'source-atop';
     if (group.members.length > 1) clip.opacity = 0.99999;
-    for (const upper of groups.slice(gi + 1)) {
-      const part = groupComposite(upper, contentOf);
-      if (!part) continue;
-      const raster = display(part, part.opacity);
+    const above = flattenParts(groups.slice(gi + 1).map(upper => groupComposite(upper, contentOf)).filter(Boolean));
+    if (above) {
+      const raster = display(above, 1);
       clip.insertChild(after++, raster);
       layerUi.displays.push(raster);
     }
@@ -7616,6 +7996,16 @@
     const at = meta.layers.findIndex(layer => layer.id === meta.active), to = at + step;
     if (to < 0 || to >= meta.layers.length) return;
     [meta.layers[at], meta.layers[to]] = [meta.layers[to], meta.layers[at]];
+    commitLayers(ep);
+  }
+  // 레이어 창에서 손잡이로 끌어 놓은 자리로(목록 아래부터 번호, 되돌리기 기록 한 번)
+  function moveLayerTo(ep, id, to) {
+    const meta = layerMeta(ep);
+    if (!meta) return;
+    const from = meta.layers.findIndex(layer => layer.id === id);
+    if (from < 0 || to < 0 || to >= meta.layers.length || from === to) return;
+    const [layer] = meta.layers.splice(from, 1);
+    meta.layers.splice(to, 0, layer);
     commitLayers(ep);
   }
   // 아래로 합치기(포토샵 "아래 레이어와 병합"): 지금 레이어를 불투명도·클리핑대로 아래 레이어에 그려 넣고 지운다
@@ -7828,6 +8218,27 @@
     const picked = new Set(selectedPaintItems(ep));
     return rows.filter(row => picked.has(row.item) || picked.has(row.unit));
   }
+  // 레이어 창에서 누른 줄 기록(layerUi.vectorPick)은 엔트리 선택이 다른 것으로 바뀌면 지운다 — 남아 있으면 그림판에서 딴 것을 골랐다 푼 뒤에도
+  // [필터] 설명이 "숨긴 레이어"로 나왔다(검토 M·N, 시험 재현). 창 다시 그리기(0.5초 점검·창 열림)는 그 사이 선택을 못 보므로 엔트리 store가
+  // 바뀔 때마다 보되, 선택 목록이 실제로 바뀐 때만 본다(줄을 누르면 도구 바꾸기가 먼저 올 수 있음). 누르면 store에 그 줄의 맨 위 항목이 바로
+  // 들어오므로(data.selected는 늦을 수 있음) 그때는 지우지 않는다.
+  const pickWatched = new WeakSet();
+  function watchVectorPick() {
+    const store = paintStore();
+    if (!store || pickWatched.has(store) || typeof store.subscribe !== 'function') return;
+    pickWatched.add(store);
+    let last = store.getState().paint?.selectedItems;
+    store.subscribe(() => {
+      try { // 구독 함수 예외는 엔트리 dispatch를 부른 쪽으로 번진다(redux) — 여기서 막는다(검토 O)
+        const picked = store.getState().paint?.selectedItems;
+        if (picked === last) return;
+        last = picked;
+        const pick = layerUi.vectorPick;
+        if (!pick || !picked?.length) return;
+        if (!picked.some(item => item === pick || pick.isDescendant?.(item) || item?.isDescendant?.(pick))) layerUi.vectorPick = null;
+      } catch (error) { console.warn('[entry-vector-rig] 레이어 창 고른 줄', error); }
+    });
+  }
   function vectorPrimary(ep, rows) {
     const on = vectorPicked(ep, rows);
     return on.find(row => row.item === layerUi.vectorPick) || on[on.length - 1] || null;
@@ -7903,6 +8314,21 @@
     selectVectorUnit(target);
     renderLayerPanel(ep, null);
   }
+  // 벡터 레이어를 끌어 놓은 자리로(줄 목록 아래부터 번호): 앞으로·뒤로 단추와 같은 길(그림 층 다시 짜기 + 엔트리 되돌리기 기록 한 번)
+  function vectorMoveTo(ep, id, to) {
+    const layer = paintLayer(ep)?.layer;
+    const rows = vectorRows(layer), from = rows.findIndex(row => String(row.item.id) === id);
+    if (from < 0 || to < 0 || to >= rows.length || from === to) return;
+    const list = rows.map(row => ({ item: row.item, clip: row.clip }));
+    const [moved] = list.splice(from, 1);
+    list.splice(to, 0, moved);
+    paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: [] });
+    restackVector(layer, ep.paper, list);
+    layerUi.vectorPick = moved.item;
+    if (!saveEntryHistory(ep)) console.warn('[entry-vector-rig] 벡터 레이어: 되돌리기 기록을 남기지 못함');
+    selectVectorUnit(moved.item);
+    renderLayerPanel(ep, null);
+  }
   // 다시 열었을 때(SVG에는 합성 모드가 안 남음) 맞추기: 잘라 그릴 그림 층으로 두고, 옛 클리핑 묶음(evrClipStack — 예전 저장 SVG)은 풀어
   // 맨 위 항목으로 옮긴다(첫 항목 = 기준, 나머지 = 클리핑 레이어, 감싼 묶음의 변환은 항목에). 이름은 data 값으로 되돌린다.
   function normalizeVectorLayers(ep) {
@@ -7975,26 +8401,14 @@
     const disarm = () => setTimeout(() => { if (layerUi.convert?.layer === layer) layerUi.convert = null; }, 0);
     if (from === 'VECTOR' && to === 'BITMAP') {
       const rows = vectorRows(layer);
-      // 레이어 창에서 손댄 줄(이름·클리핑 묶음·숨김·불투명도·투명 잠금 — 비트맵에서 온 레이어는 이름이 있음)은 레이어 하나씩, 손대지 않은
-      // 줄이 이어지면 한 레이어로 합친다. 엔트리봇(맨 위 묶음 16개)처럼 손대지 않은 그림은 엔트리처럼 한 장이다(줄마다 레이어로 나누면
-      // 레이어를 모르는 사용자는 지우개가 지금 레이어만 지워 그림이 안 지워진다고 느낀다).
-      // 클리핑 줄과 그 기준 줄(바로 위가 클리핑)도 손댄 줄이다(합치면 클리핑이 사라짐)
-      const marked = row => row.item !== row.unit || row.clip || !!rows[row.index + 1]?.clip || !!row.item.data?.evrName ||
-        !!row.item.data?.evrAlphaLock || !row.item.visible || row.item.opacity !== 1;
-      const groups = [];
-      for (const row of rows) {
-        const last = groups[groups.length - 1];
-        if (!marked(row) && last && !last.marked) last.rows.push(row);
-        else groups.push({ marked: marked(row), rows: [row] });
-      }
-      if (!groups.length || groups.length < 2 && !groups[0].marked) return;
+      // 벡터 레이어(맨 위 항목) 하나 = 비트맵 레이어 하나. 합치지 않는다(사용자 요청 10-18 "백터에서 비트맵으로 변환할 때 레이어 하나로
+      // 합치지 마" — 1.3.0 전에는 레이어 창에서 손대지 않은 줄이 이어지면 한 장으로 합쳤음). 엔트리봇(맨 위 묶음 16개)이면 비트맵 레이어
+      // 16개가 된다. 줄이 하나뿐이고 손대지 않았으면 엔트리 변환 그대로(결과도 한 장).
+      const touched = row => row.item !== row.unit || row.clip || !!row.item.data?.evrName || !!row.item.data?.evrAlphaLock ||
+        !row.item.visible || row.item.opacity !== 1;
+      if (!rows.length || rows.length < 2 && !touched(rows[0])) return;
       const pickedRow = vectorPrimary(ep, rows);
-      const picked = pickedRow ? groups.findIndex(group => group.rows.includes(pickedRow)) : -1;
-      const keep = groups.map((group, index) => {
-        const row = group.rows[0];
-        return group.marked ? { name: row.name, visible: row.item.visible, opacity: row.item.opacity, clip: row.clip, lock: !!row.item.data?.evrAlphaLock, count: 1 }
-          : { name: `레이어 ${index + 1}`, visible: true, opacity: 1, clip: false, lock: false, count: group.rows.length };
-      });
+      const keep = rows.map(row => ({ name: row.name, visible: row.item.visible, opacity: row.item.opacity, clip: row.clip, lock: !!row.item.data?.evrAlphaLock }));
       for (const child of [...layer.children]) if (isLayerHelper(child)) child.remove();
       rows.forEach(row => row.item.remove());
       layer.removeChildren();
@@ -8004,7 +8418,7 @@
         setClipBlend(row.item, false);
         layer.addChild(row.item);
       }
-      layerUi.convert = { to, layer, rows: keep, pieces: rows.length, active: picked >= 0 ? picked : keep.length - 1 };
+      layerUi.convert = { to, layer, rows: keep, active: pickedRow ? rows.indexOf(pickedRow) : keep.length - 1 };
       disarm();
     } else if (from === 'BITMAP' && to === 'VECTOR') {
       const meta = storedLayerMeta(layer);
@@ -8047,28 +8461,15 @@
   }
   function finishToBitmap(ep, layer, convert) {
     const pieces = layer.children.slice(1);
-    if (!isRasterLayer(layer.children[0]) || pieces.length !== convert.pieces || !pieces.every(isRasterLayer)) return null;
+    if (!isRasterLayer(layer.children[0]) || pieces.length !== convert.rows.length || !pieces.every(isRasterLayer)) return null;
     const meta = { v: 1, active: null, layers: [] };
-    let next = 0;
     convert.rows.forEach((row, index) => {
-      // 합친 줄은 엔트리 굽기처럼 차례로 겹쳐 한 장으로(조각은 정수 자리 — paper rasterize)
-      const parts = pieces.slice(next, next + row.count).filter(piece => piece.width && piece.height).map(piece => {
-        const b = piece.bounds;
-        return { canvas: rasterCopy(piece), x: Math.round(b.x), y: Math.round(b.y) };
-      });
-      next += row.count;
+      // 조각 하나 = 레이어 하나(조각은 정수 자리 — paper rasterize)
+      const piece = pieces[index];
       const item = { id: layerUid('L'), name: row.name, visible: row.visible, opacity: row.opacity, clip: !!row.clip && index > 0, lock: row.lock, ref: null };
-      if (parts.length) {
-        let content = parts[0];
-        if (parts.length > 1) {
-          const left = Math.min(...parts.map(p => p.x)), top = Math.min(...parts.map(p => p.y));
-          const canvas = canvasOfSize(Math.max(...parts.map(p => p.x + p.canvas.width)) - left, Math.max(...parts.map(p => p.y + p.canvas.height)) - top);
-          const g = canvas.getContext('2d');
-          for (const part of parts) g.drawImage(part.canvas, part.x - left, part.y - top);
-          content = { canvas, x: left, y: top };
-        }
-        const ref = layerUid('r');
-        layerCache.set(ref, content);
+      if (piece.width && piece.height) {
+        const b = piece.bounds, ref = layerUid('r');
+        layerCache.set(ref, { canvas: rasterCopy(piece), x: Math.round(b.x), y: Math.round(b.y) });
         item.ref = ref;
       }
       meta.layers.push(item);
@@ -8081,12 +8482,8 @@
   }
   function keepConvertLook(layer, convert) {
     const pieces = layer.children.slice(1);
-    if (pieces.length !== convert.pieces) return;
-    let next = 0;
-    for (const row of convert.rows) {
-      for (const piece of pieces.slice(next, next + row.count)) { piece.visible = row.visible; piece.opacity = row.opacity; }
-      next += row.count;
-    }
+    if (pieces.length !== convert.rows.length) return;
+    pieces.forEach((piece, index) => { piece.visible = convert.rows[index].visible; piece.opacity = convert.rows[index].opacity; });
   }
   function finishToVector(ep, layer, convert) {
     delete layer.data[LAYERS];
@@ -8309,17 +8706,13 @@
       const open = proto.open, send = proto.send;
       proto.open = function (method, url, ...rest) {
         this.__evrEnt = isEntDownload(method, url);
-        this.__evrSaveOp = saveOp(url);
-        this.__evrSaveUrl = this.__evrSaveOp ? String(url) : null;
         return open.call(this, method, url, ...rest);
       };
       proto.send = function (body) {
-        if (saveWatch && this.__evrSaveOp) watchSaveXhr(this, body);
         if (!this.__evrEnt || typeof body !== 'string') return send.call(this, body);
         withEntLayers(body).then(next => send.call(this, next), () => send.call(this, body));
         return undefined;
       };
-      proto.send.__evrSaveHook = true;
     }
     // axios가 fetch로 보내는 경우까지
     const fetch0 = window.fetch;
@@ -8328,326 +8721,246 @@
         const url = typeof input === 'string' ? input : input?.url;
         if (init && typeof init.body === 'string' && isEntDownload(init.method || 'GET', url))
           return withEntLayers(init.body).catch(() => init.body).then(body => fetch0.call(this, input, { ...init, body }, ...rest));
-        const pending = fetch0.call(this, input, init, ...rest);
-        const op = saveWatch && saveOp(input);
-        if (op) watchSaveFetch(op, input, init, pending);
-        return pending;
+        return fetch0.call(this, input, init, ...rest);
       };
       wrapped.__evrEntHook = true;
       window.fetch = wrapped;
     }
   }
-  // ---- 작품 저장 확인(1.2.1) ----
-  // 사용자 제보(2026-10-16, 카톡방): 확장을 쓰던 사람 2명의 작품이 서버에서 사라짐. 확장 코드에는 작품 저장·삭제 요청이 없다(전체 검색).
-  // 다만 엔트리 사이트 저장(_next 묶음의 #eu)은 저장 도중 예외를 콘솔에만 남기고 진행 창을 닫는다 — 저장이 안 됐는데 사용자는 모르고 나갈
-  // 수 있고, 새 작품이면 서버에 아예 없다. 사용자 요청: "서버에 안정적으로 저장되는 게 해결". 그래서 저장마다 ① 저장 전 열리지 않을 모양
-  // (그림 정보 없음)을 막고 ② 저장 요청·응답을 지켜보고(바꾸지 않음) ③ 성공이면 서버에서 다시 읽어 보낸 내용과 대조해, 성공은 작게 알리고
-  // 실패는 크게 알린다(다시 저장·.ent로 받기, 나갈 때 경고). 다시 읽기는 사이트와 같은 서버·같은 머리글(로그인 토큰)로만 보낸다.
-  // 확장 쪽 확인이 실패하면 저장을 막지 않는다(확인 없이 엔트리 원래대로 저장). 여러 번 저장하면 작은 알림은 마지막 저장만 띄우고,
-  // 앞 저장의 실패 경고는 더 새 저장이 서버에 받아들여졌을 때만 거둔다.
-  // saveChecking: 저장 전 확인창을 띄운 때(0이면 없음) — 답이 영영 안 와도 5분 뒤엔 다시 저장할 수 있게
-  let saveWatch = null, saveSeq = 0, lastOkSeq = 0, saveChecking = 0, siteFound = null, siteLookAt = 0;
-  const projectSaveHooked = new WeakSet();
-  // 저장 요청: 엔트리 서버(https playentry.org·*.playentry.org)로 가고 주소 경로 끝이 정확히 /graphql/CREATE_PROJECT·UPDATE_PROJECT인 것만
-  // (그 요청의 로그인 머리글로 다시 읽으므로 다른 곳은 잡지 않는다. 모든 XHR·fetch마다 불리므로 던지지 않는다)
-  const saveOp = input => {
-    try {
-      const url = new URL(String(input?.url ?? input ?? ''), location.href);
-      if (url.protocol !== 'https:' || !(url.hostname === 'playentry.org' || url.hostname.endsWith('.playentry.org'))) return null;
-      return url.pathname.endsWith('/graphql/CREATE_PROJECT') ? 'create' : url.pathname.endsWith('/graphql/UPDATE_PROJECT') ? 'update' : null;
-    } catch { return null; }
-  };
-  // 저장 요청을 지켜보는 감싸기가 아직 그 자리에 있는지(다른 코드가 fetch·XHR을 바꿔 끼우면 요청을 못 볼 수 있다)
-  const saveHooksIntact = () => window.fetch?.__evrEntHook === true && window.XMLHttpRequest?.prototype?.send?.__evrSaveHook === true;
-  // 엔트리 사이트 작업 공간 도우미(저장·알림)와 사이트 저장소(로그인 토큰). React 화면 나무에서 찾아 둔다(못 찾으면 5초 뒤 다시).
-  function siteWorkspace() {
-    const alive = siteFound?.helper && document.contains(siteFound.root);
-    if (alive && siteFound.store) return siteFound;
-    // 저장소를 아직 못 찾았으면 도우미는 그대로 쓰고 5초마다 다시 찾는다
-    if (Date.now() - siteLookAt < 5000) return alive ? siteFound : null;
-    siteLookAt = Date.now();
-    const root = document.getElementById('__next') || document.body.firstElementChild;
-    const key = root && Object.keys(root).find(k => k.startsWith('__reactContainer$') || k.startsWith('__reactFiber$'));
-    const start = key && root[key];
-    if (!start) return null;
-    const found = { root, helper: null, store: null };
-    const stack = [start.stateNode?.current || start];
-    for (let n = 0; stack.length && n < 200000; n++) {
-      const fiber = stack.pop();
-      if (!fiber) continue;
-      const props = fiber.memoizedProps, value = props?.value;
-      if (!found.helper && value && typeof value === 'object' && typeof value.saveProject === 'function' && 'modalProgress' in value) found.helper = value;
-      if (!found.store && typeof props?.store?.getState === 'function' && props.store.getState()?.common) found.store = props.store;
-      if (found.helper && found.store) break;
-      if (fiber.child) stack.push(fiber.child);
-      if (fiber.sibling) stack.push(fiber.sibling);
-    }
-    if (found.helper) siteFound = found;
-    else if (!alive) siteFound = null;
-    return siteFound;
-  }
-  function hookProjectSave() {
-    const helper = siteWorkspace()?.helper;
-    if (!helper || projectSaveHooked.has(helper)) return;
-    projectSaveHooked.add(helper);
-    for (const [name, event] of [['saveProject', 'saveWorkspace'], ['saveAsProject', 'saveAsWorkspace']]) {
-      const original = helper[name];
-      if (typeof original !== 'function') continue;
-      const wrapped = async function (...args) {
-        // 저장 전 확인창이 이미 떠 있으면 그 답을 기다린다(겹쳐 묻거나 확인 없이 저장하지 않음)
-        if (saveChecking && Date.now() - saveChecking < 300000) return undefined;
-        // 이미 저장 중이면 엔트리가 그냥 무시한다 — 지켜보지 않는다
-        if (helper.isSaving) return original.apply(this, args);
-        let go = true;
-        saveChecking = Date.now();
-        try { go = await checkPicturesBeforeSave(helper, name); }
-        catch (error) { console.warn('[entry-vector-rig] 저장 전 확인', error); }
-        finally { saveChecking = 0; }
-        if (!go) return undefined;
-        // 확인하는 동안 다른 길로 저장이 시작됐으면 엔트리에 넘긴다(엔트리가 겹친 저장을 무시함)
-        if (helper.isSaving) return original.apply(this, args);
-        const watch = { kind: name, seq: ++saveSeq, request: null, response: null, informed: false };
-        saveWatch = watch;
-        try { return await original.apply(this, args); }
-        finally {
-          if (saveWatch === watch) saveWatch = null;
-          verifySave(helper, watch).catch(error => console.warn('[entry-vector-rig] 저장 확인', error));
-        }
+  // ---- 그림 임시저장(1.3, 사용자 요청 2명 + 사용자 결정) ----
+  // 그림판에서 그리던 그림(지금 모양)을 서버에도 작품에도 넣지 않고 이 브라우저 안(IndexedDB)에 잠깐 저장했다가 다시 연다(사용자 "임시 저장은
+  // 그림 임시저장", "말 그대로 임시" — 댓글 요청 "작품에는 바로 적용되지 않지만 오브젝트 창에서는 편집하고 저장"). 엔트리 그림판 [저장하기]
+  // 펼침 메뉴(저장하기·새 모양으로 저장하기) 아래에 엔트리 항목과 같은 클래스로 [임시저장]과 이 모양의 임시저장 목록(모양마다 최근 5개)을
+  // 붙인다(사용자 결정). 연 그림은 작품에 바로 들어가지 않고 엔트리 [저장하기]를 눌러야 들어간다.
+  // 담는 것 = 엔트리 되돌리기 기록과 같은 그림 층 JSON(paper exportJSON — 자리·이름·확장 data 그대로) + 비트맵 레이어 그림(지금 레이어
+  // 말고는 확장 메모리 layerCache에만 있어 PNG로 같이 담음). 여는 것 = 엔트리 되돌리기처럼 그림 층 importJSON(확장 레이어 목록도 같이
+  // 돌아옴) 뒤 엔트리 되돌리기 기록 하나 — 되돌리면 연 직전(열 때 목록에 자동 기록을 남기지 않는다 — 사용자 "연 기록은 왜 뜨는 거야
+  // 복잡하게", 5개 한도에서 직접 저장한 것을 밀어냈음). 벡터·비트맵이 다르면 열지 않는다
+  // (그림 층 JSON이 모드마다 다름). 브라우저를 닫으면 지운다(/ws 경로 세션 쿠키가 없으면 새 브라우저 세션 → 모두 지움. 여러 탭은 쿠키를
+  // 같이 써서 서로 지우지 않음. 크롬 "중단한 위치에서 계속하기"는 세션 쿠키를 되살려 남을 수 있음). 엔트리 자체 임시 보관(localStorageProject)과
+  // 다른 칸이다. 목록(TEMP_STORE: id·작품 열쇠·모양 id·이름·모드·시각)과 내용(TEMP_DATA)을 따로 둔다 — 목록을 열 때 큰 그림을 다 읽지 않게.
+  // 작품 열쇠는 페이지 주소(/ws/<번호>·/ws/new) + 모양 id. 1.3.0 개발판의 작품 전체 임시저장(머리 줄 단추)은 사용자 결정으로 뺐다.
+  const TEMP_DB = 'entryVectorRig', TEMP_STORE = 'tempSaves', TEMP_DATA = 'tempData', TEMP_KEEP = 5, TEMP_COOKIE = 'evrTempSession';
+  const TEMP_NO_COOKIE_MAX_AGE = 24 * 3600e3; // 쿠키를 못 쓰는 브라우저: 브라우저 닫힘을 알 수 없어 하루 지난 것만 지운다
+  let tempDbPromise = null, tempSessionPromise = null, draftMenuHooked = false;
+  function tempDb() {
+    tempDbPromise ||= new Promise((resolve, reject) => {
+      const request = indexedDB.open(TEMP_DB, 2);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(TEMP_STORE)) db.createObjectStore(TEMP_STORE, { keyPath: 'id' });
+        if (!db.objectStoreNames.contains(TEMP_DATA)) db.createObjectStore(TEMP_DATA, { keyPath: 'id' });
       };
-      helper[name] = wrapped;
-      // 엔트리 머리 메뉴 [저장하기]·Ctrl+S는 처음 붙여 둔 원래 함수를 부른다 — 그 자리도 바꿔 끼운다(사이트가 다시 붙일 때는 바뀐 속성을 씀)
-      const list = window.Entry?.events_?.[event];
-      if (Array.isArray(list)) list.forEach((fn, i) => { if (fn === original) list[i] = wrapped; });
-    }
-    // 엔트리가 저장 중에 알림·확인창을 띄웠으면(로그인 필요·이름이 김·저장 실패 등) 사용자는 이미 안다 — 겹쳐 알리지 않는다.
-    // 저장 성공 뒤 "작품으로 이동할까요?" 같은 확인창은 셈하지 않는다(그때는 다시 읽어 대조함).
-    // 요청 전 확인창에서 "진행"(true)을 고르면 엔트리가 저장을 이어 간다 — 그 뒤 조용히 실패하면 알려야 하므로 알림으로 셈하지 않는다.
-    const informed = () => { if (saveWatch && !saveWatch.response?.ok) saveWatch.informed = true; };
-    for (const target of [helper, window.EntryModal].filter(Boolean)) {
-      for (const name of ['alert', 'confirm']) {
-        const original = target[name];
-        if (typeof original !== 'function' || original.__evrSaveSeen) continue;
-        const wrapped = function (...args) {
-          informed();
-          const result = original.apply(this, args);
-          const watch = saveWatch;
-          if (name === 'confirm' && watch) Promise.resolve(result).then(answer => { if (answer === true && !watch.request) watch.informed = false; }, () => {});
-          return result;
-        };
-        wrapped.__evrSaveSeen = true;
-        target[name] = wrapped;
-      }
-    }
-  }
-  // 작품 요약 — 보낸 것과 서버에서 다시 읽은 것을 견준다. 개수·파일 이름(크게 다르면 그 수를 알려 줌)과 objects 전체 글(블록·모양 등).
-  // 서버는 objects를 그대로 저장한다: 공개 작품을 편집기로 열어 내보낸 objects와 서버 objects가 글자까지 같았다(10-16, 작품 하나).
-  function projectDigest(objects) {
-    let list = objects;
-    if (typeof list === 'string') { try { list = JSON.parse(list); } catch { return null; } }
-    if (!Array.isArray(list)) return null;
-    const pictures = list.flatMap(object => Array.isArray(object?.sprite?.pictures) ? object.sprite.pictures : []);
-    return { objects: list.length, pictures: pictures.length, files: pictures.map(p => p?.filename).filter(Boolean).sort().join('|'), text: JSON.stringify(list) };
-  }
-  // 사이트가 저장 요청에 붙인 머리글 중 다시 읽기에 쓸 것(CSRF·로그인 토큰·클라이언트 종류)
-  function saveHeaders(raw) {
-    try {
-      const all = new Headers(raw || {});
-      return Object.fromEntries(['csrf-token', 'x-token', 'x-client-type'].map(name => [name, all.get(name)]).filter(([, value]) => value));
-    } catch { return {}; }
-  }
-  function noteSaveRequest(watch, op, body, url, headers) {
-    let variables = null;
-    try { variables = JSON.parse(typeof body === 'string' ? body : '')?.variables || null; } catch { variables = null; }
-    watch.request = { op, url, headers, id: variables?.id || null, digest: projectDigest(variables?.objects), sentAt: Date.now() };
-    // 요청 전에 뜬 알림(이메일 인증 확인 등)은 저장 결과와 상관없다
-    watch.informed = false;
-  }
-  // 응답 상태: ok(서버가 받음) · failed(거절·연결 실패) · unknown(응답을 읽지 못함 — 크게 알리지 않는다)
-  // json이 undefined면 읽지 못한 것. 업데이트는 엔트리가 보낸 작품 번호로 다시 읽는다(성공 판단은 엔트리처럼 오류 없음 — 실제 확인은 다시 읽기).
-  // serverDate: 응답 Date 머리글(서버 시계) — 업데이트가 이번 저장으로 바뀌었는지 볼 때 이 컴퓨터 시계 대신 쓴다.
-  function noteSaveResponse(watch, status, json, serverDate) {
-    const op = watch.request?.op;
-    const id = op === 'update' ? watch.request.id : json?.data?.createProject?.result?.id;
-    let state = 'ok';
-    if (status === 0 || status < 200 || status >= 300) state = status === -1 ? 'unknown' : 'failed';
-    else if (json === undefined) state = 'unknown';
-    else if (json?.errors?.length) state = 'failed';
-    else if (!id) state = op === 'update' ? 'unknown' : 'failed';
-    watch.response = { state, ok: state === 'ok', status, id: id || null, serverDate: Date.parse(serverDate || '') };
-    if (state === 'ok') lastOkSeq = Math.max(lastOkSeq, watch.seq);
-  }
-  function watchSaveFetch(op, input, init, pending) {
-    const watch = saveWatch;
-    try {
-      noteSaveRequest(watch, op, init?.body, String(input?.url ?? input), saveHeaders(init?.headers ?? input?.headers));
-      pending.then(response => {
-        const date = response.headers?.get?.('date');
-        return response.clone().json().then(json => noteSaveResponse(watch, response.status, json, date),
-          () => noteSaveResponse(watch, response.status, undefined, date));
-      }, () => noteSaveResponse(watch, 0, undefined))
-        .catch(() => noteSaveResponse(watch, -1, undefined));
-    } catch (error) { console.warn('[entry-vector-rig] 저장 지켜보기', error); }
-  }
-  function watchSaveXhr(xhr, body) {
-    const watch = saveWatch;
-    try {
-      noteSaveRequest(watch, xhr.__evrSaveOp, body, xhr.__evrSaveUrl, null);
-      xhr.addEventListener('loadend', () => {
-        let json, date = null;
-        try {
-          const type = xhr.responseType;
-          json = type === 'json' ? (xhr.response ?? undefined) : (!type || type === 'text') ? JSON.parse(xhr.responseText || 'null') : undefined;
-        } catch { json = undefined; }
-        try { date = xhr.getResponseHeader('date'); } catch { date = null; }
-        noteSaveResponse(watch, xhr.status, json, date);
-      });
-    } catch (error) { console.warn('[entry-vector-rig] 저장 지켜보기', error); }
-  }
-  // 서버에서 그 작품을 다시 읽는다 — 방금 저장 요청을 보낸 그 서버의 SELECT_PROJECT로, 사이트가 그 요청에 붙인 머리글 그대로
-  // (비공개 작품도 읽히도록 로그인 토큰 포함). 머리글을 모르면(XHR) 페이지 CSRF·사이트 저장소 토큰을 쓴다.
-  // 읽기 오류는 던지고(확인 못 함), 오류 없이 작품이 없다고 하면 missing.
-  async function readProjectBack(request) {
-    const headers = { 'Content-Type': 'application/json', ...(request.headers || {}) };
-    if (!headers['csrf-token']) headers['csrf-token'] = document.querySelector('meta[name="csrf-token"]')?.content || '';
-    if (!headers['x-client-type']) headers['x-client-type'] = 'Client';
-    if (!headers['x-token']) {
-      const token = siteWorkspace()?.store?.getState?.()?.common?.user?.xToken;
-      if (token) headers['x-token'] = token;
-    }
-    const target = new URL(request.url || '/graphql/SELECT_PROJECT', location.href);
-    target.pathname = target.pathname.replace(/(CREATE|UPDATE)_PROJECT$/, 'SELECT_PROJECT');
-    target.search = '';
-    const response = await fetch(target.href, { method: 'POST', credentials: 'include', headers,
-      body: JSON.stringify({ query: 'query SELECT_PROJECT($id: ID!){ project(id: $id){ id updated objects } }', variables: { id: request.id } }) });
-    if (!response.ok) throw Error(`다시 읽기 실패 (${response.status})`);
-    const json = await response.json();
-    if (json?.errors?.length) throw Error(`다시 읽기 오류: ${String(json.errors[0]?.message || '').slice(0, 60)}`);
-    const project = json?.data?.project;
-    // 로그인 토큰 없이 읽었으면 비공개 작품이 안 보인 것일 수 있다(authed로 가림)
-    return project ? { project } : { missing: true, authed: !!headers['x-token'] };
-  }
-  async function verifySave(helper, watch) {
-    // 더 새 저장이 시작됐으면 작은 알림은 그쪽에 맡긴다. 실패 경고는 더 새 저장이 서버에 받아들여졌을 때만 거둔다.
-    const stale = () => watch.seq !== saveSeq;
-    const notice = (text, ms) => { if (!stale()) toast(text, ms); };
-    const problem = text => { if (lastOkSeq <= watch.seq) saveProblem(helper, text); };
-    // 응답이 늦게 오면 조금 기다린다(사이트는 응답을 받은 뒤 끝나므로 보통 이미 와 있음)
-    for (let i = 0; i < 20 && watch.request && !watch.response; i++) await sleep(250);
-    if (!watch.request) {
-      // 요청이 나가지 않았다: 엔트리가 알림을 띄웠으면(로그인·이름·이메일 인증 확인 등) 그대로, 아니면 저장 도중 오류로 조용히 끝난 것
-      if (watch.informed) return;
-      // 지켜보는 감싸기가 다른 코드로 바뀌었으면 요청을 못 본 것일 수 있다 — 크게 알리지 않는다
-      if (!saveHooksIntact()) { notice('저장 요청을 지켜보지 못해 서버 저장을 확인하지 못했습니다.', 6000); return; }
-      problem('저장이 되지 않았습니다. 엔트리가 저장하다 오류로 멈췄습니다(서버로 저장 요청이 가지 않음).');
-      return;
-    }
-    const response = watch.response;
-    if (!response || response.state === 'unknown') {
-      notice('저장 응답을 읽지 못해 서버 저장을 확인하지 못했습니다.', 6000);
-      return;
-    }
-    if (response.state === 'failed') {
-      if (!watch.informed) problem(`서버가 저장을 받지 못했습니다(응답 ${response.status || '없음'}).`);
-      return;
-    }
-    await sleep(1500);
-    let read = null;
-    try { read = await readProjectBack({ ...watch.request, id: response.id }); }
-    catch (error) { notice(`저장 요청은 성공했지만 서버에서 다시 읽어 확인하지 못했습니다(${error.message}).`, 6000); return; }
-    if (read.missing) {
-      if (read.authed) problem('저장했다는 작품을 서버에서 찾을 수 없습니다.');
-      else notice('저장 요청은 성공했지만 로그인 정보 없이 다시 읽어 작품이 보이지 않았습니다(확인하지 못함).', 6000);
-      return;
-    }
-    const sent = watch.request.digest, saved = projectDigest(read.project.objects);
-    if (!sent || !saved) { notice('저장 요청은 성공했지만 내용을 견주지 못해 서버 저장을 확인하지 못했습니다.', 6000); return; }
-    if (sent.objects !== saved.objects || sent.pictures !== saved.pictures || sent.files !== saved.files) {
-      problem(`서버에 저장된 내용이 화면과 다릅니다(오브젝트 ${saved.objects}/${sent.objects}개, 모양 ${saved.pictures}/${sent.pictures}개).`);
-      return;
-    }
-    if (sent.text !== saved.text) {
-      problem('서버에 저장된 내용(블록·모양 정보 등)이 방금 저장한 것과 다릅니다.');
-      return;
-    }
-    // 업데이트: 서버 저장 시각이 이번 저장 뒤여야 "확인됨". 서버 시계(저장 응답 Date)로 보고, 없으면 이 컴퓨터 시계로 10분 안.
-    // 못 읽거나 앞서 있으면 작게만 알린다(내용은 같으므로 화면 내용이 서버에 있긴 함)
-    if (watch.request.op === 'update') {
-      const updated = typeof read.project.updated === 'number' ? read.project.updated : Date.parse(read.project.updated);
-      const fresh = Number.isFinite(response.serverDate) ? updated >= response.serverDate - 60000 : updated >= watch.request.sentAt - 10 * 60000;
-      if (!Number.isFinite(updated) || !fresh) {
-        notice('서버 내용은 화면과 같지만, 서버 저장 시각이 이번 저장보다 앞서 있어 이번 저장이 반영됐는지는 확인하지 못했습니다.', 6000);
-        return;
-      }
-    }
-    notice(`서버 저장 확인됨 — 오브젝트 ${saved.objects}개, 모양 ${saved.pictures}개`, 3500);
-  }
-  // 저장이 확인되지 않음: 크게 알리고, 나갈 때 경고를 다시 켠다(사이트는 저장을 시작하며 나가기 경고를 끈다)
-  function saveProblem(helper, message) {
-    try { helper.setBindUnload?.(true); } catch (error) { console.warn('[entry-vector-rig] 나가기 경고', error); }
-    document.querySelector('.evr-save-alert')?.remove();
-    const box = document.createElement('div');
-    box.className = 'evr-save-alert';
-    box.setAttribute('role', 'alertdialog');
-    const title = document.createElement('b');
-    title.textContent = '작품이 서버에 저장되지 않았을 수 있습니다';
-    const text = document.createElement('p');
-    text.textContent = `${message} 이 창을 닫거나 나가기 전에 다시 저장하거나 .ent 파일로 받아 두세요.`;
-    const row = document.createElement('div');
-    row.append(
-      button('다시 저장', () => { box.remove(); helper.saveProject?.(); }, { class: 'evr-save-again' }),
-      button('.ent로 받기', () => { helper.exportProjectData?.(); }, { class: 'evr-save-ent' }),
-      button('닫기', () => box.remove(), { class: 'evr-save-close' }));
-    box.append(title, text, row);
-    document.body.append(box);
-  }
-  // 저장 전: 그림 정보(파일 이름·주소)가 둘 다 없는 모양이 있으면 그 작품은 다시 열 때 엔트리가 통째로 못 연다(오브젝트 0개).
-  // 아틀라스 칸 표시가 있으면 원래 주소로 고치고, 못 고치면 저장을 멈출지 묻는다(멈추면 서버의 지난 저장본이 그대로 남음).
-  // [그래도 저장]만 저장을 이어 간다. [저장 멈춤]·닫기(X)·모르는 답은 멈추고 알린다(엔트리 나가기 경고는 저장을 시작하지 않았으니 그대로 켜져 있음).
-  // 엔트리 확인창이 실패하면 브라우저 확인창으로 묻는다 — 묻지 못한 채 저장을 막지 않는다.
-  // 확인창이 답 없이 사라지면(다른 창이 덮는 등) 멈춤으로 본다 — 답을 영영 기다리며 저장이 굳지 않게.
-  function modalGone(text) {
-    let timer = 0;
-    const done = new Promise(resolve => {
-      let seen = false, missing = 0, tries = 0;
-      timer = setInterval(() => {
-        const visible = [...document.querySelectorAll('.entry-modal-modal')].some(m => m.getBoundingClientRect().width && m.innerText.includes(text));
-        if (visible) { seen = true; missing = 0; }
-        else if (seen && ++missing >= 3) { clearInterval(timer); resolve('gone'); }
-        // 10초 안에 창을 못 찾으면(창 모양이 바뀜) 지켜보기를 그만두고 답만 기다린다
-        else if (!seen && ++tries > 20) clearInterval(timer);
-      }, 500);
+      request.onsuccess = () => {
+        const db = request.result;
+        // 확장을 업데이트한 뒤 다른 탭(옛 코드가 남아 있음)이 판을 올리려 하면 막지 않고 닫는다 — 다음에 다시 연다(검토 지적)
+        db.onversionchange = () => { db.close(); tempDbPromise = null; };
+        resolve(db);
+      };
+      request.onerror = () => reject(request.error || Error('임시저장소를 열 수 없습니다.'));
     });
-    return { done, stop: () => clearInterval(timer) };
+    tempDbPromise.catch(() => { tempDbPromise = null; });
+    return tempDbPromise;
   }
-  async function checkPicturesBeforeSave(helper, kind) {
-    const broken = [];
-    for (const object of window.Entry?.container?.getAllObjects?.() || []) {
-      for (const picture of object.pictures || []) {
-        if (!picture || picture.filename || picture.fileurl) continue;
-        const atlas = atlasOf(picture);
-        if (atlas) { picture.fileurl = atlas.base || atlasUrl(atlas); continue; }
-        broken.push(`${object.name}/${picture.name}`);
-      }
-    }
-    if (!broken.length) return true;
-    const target = kind === 'saveAsProject' ? '복사본을 저장하면 그 복사본은' : '저장하면';
-    const message = `그림 정보가 없는 모양 ${broken.length}개가 있습니다(${broken.slice(0, 5).join(', ')}${broken.length > 5 ? ' 등' : ''}). ` +
-      `이대로 ${target} 다시 열 때 작품 전체가 열리지 않을 수 있습니다. 그 모양을 지우거나 다시 그린 뒤 저장하세요.`;
-    let go;
+  async function tempTx(mode, work) {
+    const db = await tempDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([TEMP_STORE, TEMP_DATA], mode);
+      let result;
+      Promise.resolve(work(tx.objectStore(TEMP_STORE), tx.objectStore(TEMP_DATA))).then(value => { result = value; }, reject);
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = tx.onabort = () => reject(tx.error || Error('임시저장소 오류'));
+    });
+  }
+  const tempRequest = request => new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+  // 작품 열쇠: 저장한 작품 = 주소(/ws/<번호>). 저장 안 한 새 작품(/ws/new)은 엔트리 시작 작품의 모양 id가 늘 같아서(엔트리봇 'vx80' — 실측)
+  // 새 작품끼리 임시저장이 섞이고 서로의 5개 정리에 지워졌다(검토 지적) — 탭마다 정한 표(sessionStorage: 같은 탭 새로고침이면 그대로)를
+  // 붙인다. 처음 저장해 주소가 생기면 그 표의 임시저장을 새 주소로 옮기고 표를 새로 정한다(다음 새 작품과 섞이지 않게).
+  const TEMP_TAB = 'evrTempTab';
+  let tempTabFallback = null;
+  function tempTab(renew) {
+    const make = () => Math.random().toString(36).slice(2, 10);
     try {
-      if (typeof helper.confirm !== 'function') throw Error('확인창 없음');
-      // 글자 결과: 저장 멈춤 "ok" · 그래도 저장 "cancel" · 닫기 "close". 글자 결과를 안 주는 판이면 false(그래도 저장·닫기 못 가림)를 진행으로 본다
-      const gone = modalGone('그림 정보가 없는 모양');
-      let answer;
-      try { answer = await Promise.race([helper.confirm(message, '저장 전 확인', { positiveButtonText: '저장 멈춤', negativeButtonText: '그래도 저장', resultType: 'string' }), gone.done]); }
-      finally { gone.stop(); }
-      go = answer === 'cancel' || answer === false;
-    } catch (error) {
-      console.warn('[entry-vector-rig] 저장 전 확인창', error);
-      go = window.confirm(`${message} 그래도 저장할까요?`);
+      let tab = sessionStorage.getItem(TEMP_TAB);
+      if (!tab || renew) { tab = make(); sessionStorage.setItem(TEMP_TAB, tab); }
+      return tab;
+    } catch { return (tempTabFallback = !tempTabFallback || renew ? make() : tempTabFallback); }
+  }
+  function tempProjectKey() {
+    const path = location.pathname.replace(/\/+$/, '') || '/ws/new';
+    return path === '/ws/new' ? `/ws/new#${tempTab(false)}` : path;
+  }
+  // 이 탭의 새 작품 임시저장을 처음 저장해 생긴 주소로 옮긴다(엔트리가 주소를 바꾸든 새로 열든 — 표는 탭에 남아 있음)
+  async function moveNewProjectDrafts() {
+    const key = tempProjectKey();
+    if (key.startsWith('/ws/new')) return;
+    let tab = null;
+    try { tab = sessionStorage.getItem(TEMP_TAB); } catch { tab = tempTabFallback; }
+    if (!tab) return;
+    const from = `/ws/new#${tab}`;
+    const moved = await tempTx('readwrite', async store => {
+      let n = 0;
+      for (const item of await tempRequest(store.getAll())) if (item.project === from) { item.project = key; store.put(item); n++; }
+      return n;
+    });
+    if (moved) tempTab(true);
+  }
+  const hasTempCookie = () => document.cookie.split(';').some(part => part.trim().startsWith(`${TEMP_COOKIE}=`));
+  // 새 브라우저 세션이면 모두 지운다(쿠키 없음 = 브라우저를 닫았다 다시 엶). 쿠키가 막힌 브라우저는 쿠키를 써도 안 보여 매번 "새 세션"이
+  // 되므로(검토 지적) 다 지우지 않고 하루 지난 것만 지운다. 페이지마다 한 번 — 저장·목록은 이 지우기가 끝난 뒤에 한다(먼저 넣은 것이
+  // 같이 지워지지 않게).
+  function tempSessionCheck() {
+    tempSessionPromise ||= (async () => {
+      if (hasTempCookie()) return;
+      document.cookie = `${TEMP_COOKIE}=1; path=/ws; SameSite=Lax`;
+      const cookieWorks = hasTempCookie();
+      try {
+        await tempTx('readwrite', async (store, data) => {
+          if (cookieWorks) { store.clear(); data.clear(); return; }
+          for (const item of await tempRequest(store.getAll())) {
+            if (Date.now() - item.savedAt > TEMP_NO_COOKIE_MAX_AGE) { store.delete(item.id); data.delete(item.id); }
+          }
+        });
+      } catch (error) { console.warn('[entry-vector-rig] 임시저장 지우기', error); }
+    })();
+    return tempSessionPromise;
+  }
+  const tempTime = time => new Date(time).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  function currentPicture(painter) {
+    const id = painter?.file?.id;
+    return id && window.Entry?.playground?.object?.pictures?.find(picture => picture.id === id) || null;
+  }
+  const isDraftOf = (item, picture) => item.kind === 'picture' && item.project === tempProjectKey() && item.picture === picture.id;
+  async function draftList(painter) {
+    await tempSessionCheck();
+    await moveNewProjectDrafts();
+    const picture = currentPicture(painter);
+    if (!picture) return [];
+    const all = await tempTx('readonly', store => tempRequest(store.getAll()));
+    // 1.3.0 개발판의 '열기 전 자동' 기록은 보이지 않게(다음 임시저장 때 지움)
+    return (all || []).filter(item => isDraftOf(item, picture) && !item.auto).sort((a, b) => b.savedAt - a.savedAt);
+  }
+  // 지금 그림판 그림 → 임시저장 내용(엔트리 되돌리기 기록과 같은 그림 층 JSON + 비트맵 레이어 그림)
+  function draftPayload(ep) {
+    const parts = paintLayer(ep);
+    if (!parts) throw Error('그림판을 찾지 못했습니다.');
+    const refs = {};
+    const meta = ep.mode === 'BITMAP' ? storedLayerMeta(parts.layer) : null;
+    for (const layer of meta?.layers || []) {
+      // 지금 레이어 그림은 그림 층 JSON에 들어 있다(참조는 낡은 사본일 수 있어 담지 않음)
+      const content = layer.id !== meta.active && layer.ref && layerCache.get(layer.ref);
+      if (content) refs[layer.ref] = { x: content.x, y: content.y, png: content.canvas.toDataURL('image/png') };
     }
-    if (!go) toast('저장을 멈췄습니다. 그림 정보가 없는 모양을 지우거나 다시 그린 뒤 저장하세요.', 6000);
-    return go;
+    return { v: 1, mode: ep.mode, json: parts.layer.exportJSON({ asString: true }), refs };
+  }
+  async function draftSaveNow(painter) {
+    await tempSessionCheck();
+    await moveNewProjectDrafts();
+    const ep = painter?.entryPaint, picture = currentPicture(painter);
+    if (!ep || !picture) throw Error('그림판에 연 모양이 없습니다.');
+    if (painter.__evrLoading) throw Error('모양 그림을 불러오는 중입니다. 그림이 보인 뒤 다시 하세요.');
+    const payload = draftPayload(ep);
+    const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, kind: 'picture', project: tempProjectKey(), picture: picture.id,
+      name: String(picture.name || ''), mode: ep.mode, savedAt: Date.now() };
+    await tempTx('readwrite', async (store, data) => {
+      store.put(item);
+      data.put({ id: item.id, data: JSON.stringify(payload) });
+      // 모양마다 최근 TEMP_KEEP개. 방금 넣은 것은 시계가 뒤로 가도 지우지 않는다. 예전 '열기 전 자동' 기록은 지운다
+      const others = (await tempRequest(store.getAll())).filter(entry => isDraftOf(entry, picture) && entry.id !== item.id).sort((a, b) => b.savedAt - a.savedAt);
+      const kept = others.filter(entry => !entry.auto);
+      for (const old of [...others.filter(entry => entry.auto), ...kept.slice(TEMP_KEEP - 1)]) { store.delete(old.id); data.delete(old.id); }
+    });
+    return item;
+  }
+  async function draftOpen(painter, id) {
+    const ep = painter?.entryPaint, picture = currentPicture(painter);
+    const item = await tempTx('readonly', store => tempRequest(store.get(id)));
+    const stored = item && await tempTx('readonly', (store, data) => tempRequest(data.get(id)));
+    if (!item || !stored?.data) throw Error('그 임시저장을 찾을 수 없습니다(브라우저를 닫아 지워졌을 수 있습니다).');
+    if (!ep || !picture || !isDraftOf(item, picture)) throw Error('지금 연 모양의 임시저장이 아닙니다.');
+    if (painter.__evrLoading) throw Error('모양 그림을 불러오는 중입니다. 그림이 보인 뒤 다시 여세요.');
+    if (session) throw Error('뼈대 모드를 끈 뒤 여세요.');
+    const payload = JSON.parse(stored.data);
+    if (payload.mode !== ep.mode) throw Error(`${payload.mode === 'BITMAP' ? '비트맵' : '벡터'}에서 임시저장한 그림입니다. 그 모드로 바꾼 뒤 여세요.`);
+    // 비트맵 레이어 그림을 먼저 되살린다(그림 층 JSON의 레이어 목록이 이 참조를 씀 — 참조는 한 번 만들면 바뀌지 않음)
+    for (const [ref, content] of Object.entries(payload.refs || {})) {
+      if (!layerCache.has(ref)) layerCache.set(ref, { canvas: canvasOfImage(await loadImage(content.png)), x: content.x, y: content.y });
+    }
+    if (painter.file?.id !== picture.id || ep.mode !== payload.mode) throw Error('그 사이 모양이나 모드가 바뀌어 열지 않았습니다.');
+    paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: [] });
+    // 연 직전 상태를 되돌리기 기록에 남긴다 — 그림 전체 이동처럼 기록을 남기지 않는 변경도 되돌리기 한 번에 돌아오게(검토 지적)
+    saveEntryHistory(ep);
+    paintLayer(ep).layer.importJSON(payload.json);
+    ep.project.view.update();
+    saveEntryHistory(ep);
+    painter.file.modified = true;
+    return item;
+  }
+  // 엔트리 그림판 [저장하기]를 누르면 엔트리가 펼침 메뉴를 새로 그린다 — 몇 프레임 동안 찾아 확장 항목을 붙인다. 확장 항목은 누르기를
+  // 엔트리로 보내지 않아(엔트리 항목으로 읽히지 않게) 메뉴가 열린 채라, 일을 마치면 [저장하기]를 한 번 더 눌러 닫는다(10-18 실험: 닫힘).
+  function hookDraftMenu() {
+    if (draftMenuHooked) return;
+    draftMenuHooked = true;
+    document.addEventListener('click', event => {
+      if (!event.isTrusted) return; // 확장이 메뉴를 닫으려고 누른 것
+      const save = event.target.closest?.('#entryPainter button');
+      if (!save || save.textContent.trim() !== '저장하기') return;
+      let tries = 0;
+      const look = () => {
+        const first = document.querySelector('[value="SAVE_PICTURE"]');
+        if (first?.parentElement) addDraftItems(first.parentElement, first, save).catch(error => console.warn('[entry-vector-rig] 그림 임시저장 메뉴', error));
+        else if (++tries < 20) requestAnimationFrame(look);
+      };
+      requestAnimationFrame(look);
+    }, true);
+  }
+  async function addDraftItems(inner, sample, save) {
+    if (inner.querySelector('.evr-draft-item')) return;
+    const painter = window.Entry?.playground?.painter;
+    const close = () => { if (inner.isConnected && save.isConnected) save.click(); };
+    const item = (text, cls, title) => {
+      const element = document.createElement('div');
+      element.className = `${sample.className} evr-draft-item ${cls}`;
+      element.textContent = text;
+      if (title) element.title = title;
+      for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) element.addEventListener(type, event => event.stopPropagation());
+      return element;
+    };
+    const run = async (work, done) => {
+      close();
+      try { toast(done(await work()), 4000); } catch (error) { toast(error.message || String(error), 5000); }
+    };
+    const now = item('임시저장', 'evr-draft-save', '확장: 이 모양 그림을 서버·작품에 넣지 않고 이 브라우저에 잠깐 저장(브라우저를 닫으면 지워짐, 모양마다 최근 5개)');
+    now.addEventListener('click', () => run(() => draftSaveNow(painter),
+      saved => `그림을 임시저장했습니다(${tempTime(saved.savedAt)}). 작품에는 [저장하기]를 눌러야 들어갑니다. 브라우저를 닫으면 지워집니다.`));
+    // [임시저장]은 바로 붙이고 목록은 받은 뒤에(저장소가 늦거나 막혀도 저장은 되게 — 검토 지적)
+    inner.append(now);
+    const added = [];
+    let drafts = [];
+    try { drafts = await draftList(painter); } catch (error) { console.warn('[entry-vector-rig] 그림 임시저장 목록', error); }
+    if (!inner.isConnected || inner.querySelector('.evr-draft-row')) return;
+    const mode = painter?.entryPaint?.mode;
+    for (const draft of drafts) {
+      const other = draft.mode !== mode;
+      const row = item(`임시저장 ${tempTime(draft.savedAt)} 열기`, 'evr-draft-row',
+        other ? `${draft.mode === 'BITMAP' ? '비트맵' : '벡터'}에서 저장한 그림 — 그 모드로 바꾼 뒤 열 수 있습니다` : '이 임시저장을 그림판에 엽니다(되돌리기 한 번에 연 직전으로)');
+      row.dataset.id = draft.id;
+      if (other) row.dataset.off = 'true';
+      const del = document.createElement('span');
+      del.className = 'evr-draft-del';
+      del.textContent = '×';
+      del.title = '이 임시저장 지우기';
+      row.append(del);
+      row.addEventListener('click', event => {
+        if (event.target === del) {
+          run(() => tempTx('readwrite', (store, data) => { store.delete(draft.id); data.delete(draft.id); }), () => '임시저장 하나를 지웠습니다.');
+          return;
+        }
+        run(() => draftOpen(painter, draft.id), opened => `${tempTime(opened.savedAt)}에 임시저장한 그림을 열었습니다. 작품에 넣으려면 [저장하기], 되돌리면 연 직전.`);
+      });
+      added.push(row);
+    }
+    inner.append(...added);
   }
   // .ent로 불러온 레이어 모양: 합친 PNG(새 파일)와 담겨 온 레이어 원본으로 레이어 SVG를 다시 올리고 모양을 그 파일로 바꾼다
   const entLayerJobs = new Set(), entLayerFailed = new Map(); // 모양 id → 실패한 때(30초 뒤 다시)
@@ -8696,7 +9009,57 @@
     list.addEventListener('scroll', () => {
       if (!thumbFrame) thumbFrame = requestAnimationFrame(() => { thumbFrame = 0; fillVisibleThumbs(ep(), panel); });
     });
+    // 손잡이 끌기: 놓은 줄 사이에 넣는다(목록 위 = 앞). 끄는 동안 넣을 자리에 선을 보이고, 목록 끝에 가면 굴린다.
+    let reorder = null, swallowClick = false;
+    const dropIndex = y => {
+      const rows = [...list.children];
+      let at = rows.length;
+      for (let i = 0; i < rows.length; i++) { const r = rows[i].getBoundingClientRect(); if (y < r.top + r.height / 2) { at = i; break; } }
+      return at;
+    };
+    const markDrop = at => {
+      [...list.children].forEach((row, i) => {
+        const mark = at === i ? 'before' : at === list.children.length && i === list.children.length - 1 ? 'after' : '';
+        if ((row.dataset.drop || '') !== mark) { if (mark) row.dataset.drop = mark; else delete row.dataset.drop; }
+      });
+    };
+    list.addEventListener('pointerdown', event => {
+      const grip = event.target.closest('.evr-layer-grip'), row = grip?.closest('.evr-layer');
+      if (!row || event.button !== 0 || list.children.length < 2) return;
+      event.preventDefault();
+      reorder = { id: row.dataset.id, from: [...list.children].indexOf(row), at: null, pointer: event.pointerId };
+      row.dataset.dragging = 'true';
+      panel.dataset.reordering = 'true'; // 끄는 동안 창을 다시 그리지 않는다(줄이 바뀌면 끌기가 끊김)
+      try { grip.setPointerCapture(event.pointerId); } catch {}
+    });
+    list.addEventListener('pointermove', event => {
+      if (!reorder || event.pointerId !== reorder.pointer) return;
+      const box = list.getBoundingClientRect();
+      if (event.clientY < box.top + 16) list.scrollTop -= 8;
+      else if (event.clientY > box.bottom - 16) list.scrollTop += 8;
+      reorder.at = dropIndex(event.clientY);
+      markDrop(reorder.at);
+    });
+    const endReorder = event => {
+      if (!reorder || event.pointerId !== reorder.pointer) return;
+      const job = reorder;
+      reorder = null;
+      delete panel.dataset.reordering;
+      swallowClick = true;
+      setTimeout(() => { swallowClick = false; }, 0);
+      [...list.children].forEach(row => { delete row.dataset.drop; delete row.dataset.dragging; });
+      if (event.type !== 'pointerup' || job.at === null) return;
+      // 화면 줄(위 = 앞)에서 넣을 자리 → 레이어 목록(아래부터) 번호
+      const n = list.children.length, place = job.at > job.from ? job.at - 1 : job.at;
+      if (place === job.from) return;
+      const editor = ep(), to = n - 1 - place;
+      if (vector()) vectorMoveTo(editor, job.id, to); else moveLayerTo(editor, job.id, to);
+    };
+    list.addEventListener('pointerup', endReorder);
+    list.addEventListener('pointercancel', endReorder);
+    list.addEventListener('lostpointercapture', endReorder); // 놓기를 못 받았을 때도 끌기 상태를 정리(옮기지는 않음)
     list.addEventListener('click', event => {
+      if (swallowClick || event.target.closest('.evr-layer-grip')) return;
       const row = event.target.closest('.evr-layer');
       if (!row) return;
       const id = row.dataset.id, editor = ep();
@@ -8766,9 +9129,11 @@
     }, { class: 'evr-brush-toggle evr-layers-clip', title: '클리핑 마스크: 바로 아래 레이어의 칠해진 모양 안에서만 보이게(지워지지 않음)' });
     const lock = button('투명 잠금', () => { if (vector()) return; toggleAlphaLock(); renderLayerPanel(ep(), layerMeta(ep())); },
       { class: 'evr-brush-toggle evr-layers-lock' });
+    const filter = button('필터', () => openFilterPanel(ep()),
+      { class: 'evr-brush-toggle evr-layers-filter', title: '지금 레이어에 필터(밝기·대비·채도·색조·흑백·세피아·색 반전·흐림·모자이크·외곽선·그림자)' });
     const props = document.createElement('div');
     props.className = 'evr-layers-props';
-    props.append(level, clip, lock);
+    props.append(level, clip, lock, filter);
     // 같은 단추가 모드에 따라 비트맵 레이어 또는 벡터 레이어(맨 위 도형)를 고친다
     const act = (label, cls, title, bitmap, kind) => button(label, () => {
       const editor = ep();
@@ -8798,18 +9163,32 @@
     const layers = meta ? meta.layers : [{ id: '', name: '레이어 1', visible: true, opacity: 1, clip: false, lock: pixelPen.alphaLock }];
     const active = meta ? activeLayer(meta) : layers[0];
     const parts = paintLayer(ep), paintId = parts?.layer.children[0]?.id ?? '';
+    const stageKey = parts?.stage ? [parts.stage.x, parts.stage.y, parts.stage.width, parts.stage.height].map(Math.round) : null;
+    const structKey = [layers.map(l => [l.id, l.name, l.visible, l.opacity, l.clip, l.lock, l.ref]), active.id, stageKey]; // 무대 크기: 다른 줄 작은 그림이 바뀜
+    const used = new Set(); // 이번에 그리는 목록에 이미 넣은 작은 그림(같은 내용을 두 줄이 쓰면 둘째부터 사본)
     return {
       rows: layers, primary: active, selected: new Set([active.id]), canAdd: true, canLock: true,
-      key: [layers.map(l => [l.id, l.name, l.visible, l.opacity, l.clip, l.lock, l.ref]), active.id, paintId],
+      key: [...structKey, paintId], structKey,
       thumb: layer => {
-        const thumb = canvasOfSize(40, 24), stage = parts?.stage;
-        const content = layer === active ? paintSnapshot(ep) : layer.ref && layerCache.get(layer.ref);
-        if (content && stage) {
-          const g = thumb.getContext('2d'), k = Math.min(40 / stage.width, 24 / stage.height);
-          g.drawImage(content.canvas, (content.x - stage.x) * k + (40 - stage.width * k) / 2, (content.y - stage.y) * k + (24 - stage.height * k) / 2,
-            content.canvas.width * k, content.canvas.height * k);
-        }
-        return thumb;
+        const stage = parts?.stage;
+        const draw = content => {
+          const thumb = canvasOfSize(40, 24);
+          if (content && stage) {
+            const g = thumb.getContext('2d'), k = Math.min(40 / stage.width, 24 / stage.height);
+            g.drawImage(content.canvas, (content.x - stage.x) * k + (40 - stage.width * k) / 2, (content.y - stage.y) * k + (24 - stage.height * k) / 2,
+              content.canvas.width * k, content.canvas.height * k);
+          }
+          return thumb;
+        };
+        if (layer === active) return draw(paintSnapshot(ep));
+        // 다른 레이어: 그림 참조는 한 번 만들면 바뀌지 않으므로 작은 그림을 그 내용에 붙여 두고 사본만 돌려준다(레이어가 많으면 창을 다시
+        // 그릴 때마다 큰 그림을 줄마다 줄여 그려 느렸다 — 실측 1000장 100ms)
+        const content = layer.ref && layerCache.get(layer.ref), key = stage && `${stage.x},${stage.y},${stage.width},${stage.height}`;
+        if (!content) return draw(null);
+        if (!content.thumb || content.thumbKey !== key) { content.thumb = draw(content); content.thumbKey = key; }
+        if (used.has(content.thumb)) return copyCanvas(content.thumb);
+        used.add(content.thumb);
+        return content.thumb;
       },
     };
   }
@@ -8821,7 +9200,8 @@
     const primary = primaryRow ? view[primaryRow.index] : null, selected = new Set(picked.map(row => String(row.item.id)));
     return {
       rows: view, primary, selected, canAdd: false, canLock: false,
-      key: [view.map(l => [l.id, l.name, l.visible, l.opacity, l.clip]), primary?.id ?? null, [...selected], layerUi.vectorEpoch],
+      // 창에서 누른 줄 기록도 넣는다 — 기록만 지워지면(선택은 앞뒤 모두 없음) 창을 다시 안 그려 [필터] 설명이 낡은 채 남았음(시험)
+      key: [view.map(l => [l.id, l.name, l.visible, l.opacity, l.clip]), primary?.id ?? null, [...selected], layerUi.vectorEpoch, layerUi.vectorPick ? String(layerUi.vectorPick.id) : null],
       thumb: layer => vectorThumb(ep, layer.item, true),
     };
   }
@@ -8846,15 +9226,31 @@
     const area = document.querySelector('#entryPainter .canvas_area');
     let panel = layerUi.panel;
     const mode = ep?.mode;
-    if (!area || mode !== 'BITMAP' && mode !== 'VECTOR' || session) { panel?.remove(); return; }
+    // 창을 치울 때 끄는 중 표시도 지운다(남으면 다음에 창을 다시 그리지 않음 — 검토 지적)
+    if (!area || mode !== 'BITMAP' && mode !== 'VECTOR' || session) { if (panel) { delete panel.dataset.reordering; panel.remove(); } return; }
     if (!panel) panel = layerUi.panel = buildLayerPanel();
     if (panel.parentElement !== area) area.append(panel);
+    if (panel.dataset.reordering === 'true') return;
     // 접혀 있으면 줄 수만 센다(0.5초마다 도므로 선택·작은 그림 계산은 펼쳤을 때만)
     const view = !layerUi.open ? { rows: { length: mode === 'VECTOR' ? vectorRows(paintLayer(ep)?.layer).length : meta ? meta.layers.length : 1 } }
       : mode === 'VECTOR' ? vectorLayerView(ep) : bitmapLayerView(ep, meta);
     const key = JSON.stringify([mode, layerUi.open ? view.key : view.rows.length, layerUi.open]);
     if (panel.dataset.key === key) return;
+    // 비트맵에서 지금 레이어 그림만 바뀌었으면(붓질마다 엔트리가 그림을 새로 바꿈) 그 줄 작은 그림만 바꾼다 — 레이어가 많으면 줄 전체를
+    // 다시 그려 붓질마다 느렸다(실측 1000장)
+    const struct = layerUi.open && mode === 'BITMAP' && view.structKey ? JSON.stringify(view.structKey) : '';
+    if (struct && panel.dataset.struct === struct) {
+      const old = [...panel.querySelectorAll('.evr-layer')].find(row => row.dataset.id === view.primary.id)?.querySelector('.evr-layer-thumb');
+      if (old) {
+        const thumb = view.thumb(view.primary);
+        thumb.className = 'evr-layer-thumb';
+        old.replaceWith(thumb);
+        panel.dataset.key = key;
+        return;
+      }
+    }
     panel.dataset.key = key;
+    panel.dataset.struct = struct;
     panel.dataset.open = String(layerUi.open);
     panel.dataset.graphics = mode;
     const toggle = panel.querySelector('.evr-layers-toggle');
@@ -8883,7 +9279,12 @@
       const badges = document.createElement('span');
       badges.className = 'evr-layer-badges';
       badges.textContent = [layer.lock ? '잠금' : '', layer.opacity !== 1 ? `${Math.round(layer.opacity * 100)}%` : ''].filter(Boolean).join(' ');
-      row.append(eye, thumb, name, badges);
+      // 순서 바꾸기 손잡이(이비스페인트 레이어 창처럼 줄 오른쪽, 위아래로 끌기)
+      const grip = document.createElement('span');
+      grip.className = 'evr-layer-grip';
+      grip.textContent = '≡';
+      grip.title = '위아래로 끌어 순서 바꾸기';
+      row.append(eye, thumb, name, badges, grip);
       return row;
     }));
     layerUi.panelRows = mode === 'VECTOR' ? view.rows : null;
@@ -8898,6 +9299,19 @@
     lock.setAttribute('aria-pressed', String(!!active?.lock));
     lock.disabled = !view.canLock;
     lock.title = view.canLock ? '이 레이어의 칠해진 곳에만 그림(붓·선·영역 채우기)' : '투명 잠금은 비트맵 레이어에서만(포토샵도 벡터 모양 레이어에는 없음)';
+    const filterButton = panel.querySelector('.evr-layers-filter');
+    // 포토샵처럼 숨긴 레이어·여러 레이어에는 걸지 않는다(숨긴 레이어는 결과가 안 보이고, 여러 줄이면 어디에 걸지 모름 — 예전엔 숨긴 채 걸리거나
+    // 여러 줄 중 하나에만 말없이 걸렸음, 10-19)
+    // 벡터는 숨긴 도형을 엔트리 선택에서 곧 빼므로(선택 윤곽선 다시 맞추기) 레이어 창에서 숨긴 줄을 누르면 고른 레이어가 없어진다 — 그때도 숨김이 이유.
+    // 창에서 누른 줄 기록이 낡으면 watchVectorPick이 지운다.
+    const pickedHidden = mode === 'VECTOR' && !active && layerUi.vectorPick?.visible === false && view.rows?.some?.(row => row.item === layerUi.vectorPick);
+    const pickedMany = mode === 'VECTOR' && (view.selected?.size || 0) > 1, hiddenActive = (!!active && active.visible === false) || !!pickedHidden;
+    filterButton.disabled = (mode === 'VECTOR' && !active) || pickedMany || hiddenActive;
+    filterButton.title = hiddenActive ? '숨긴 레이어에는 필터를 걸 수 없습니다 — 보이게 한 뒤 거세요(포토샵과 같음)'
+      : pickedMany ? '레이어를 하나만 고르세요 — 필터는 한 번에 레이어 하나에 겁니다(포토샵과 같음)'
+        : mode === 'BITMAP' ? '지금 레이어에 필터(밝기·대비·채도·색조·흑백·세피아·색 반전·흐림·모자이크·외곽선·그림자)'
+          : active ? '고른 레이어에 필터 — 색 필터는 도형 색만 바꿔 벡터로 남고, 흐림·모자이크·외곽선·그림자는 그 레이어를 그림으로 바꿔 적용'
+            : '필터를 걸 레이어를 먼저 고르세요';
     add.disabled = !view.canAdd;
     add.title = view.canAdd ? '새 레이어(지금 레이어 위)' : '벡터는 새로 그린 도형 하나가 레이어 하나입니다';
     const rows = view.rows, at = active ? rows.indexOf(active) : -1, many = rows.length > 1;
@@ -8907,6 +9321,457 @@
     panel.querySelector('.evr-layers-merge').disabled = !active || !many || at === 0;
     panel.querySelector('.evr-layers-del').disabled = !active || !many;
     clip.disabled = !active || at === 0;
+  }
+  // ---- 필터(1.3, 사용자 요청 "각종 필터") ----
+  // 비트맵 지금 레이어(그림 층 내용)에 건다. 벡터 도형은 흐림 같은 필터가 저장 SVG에 남지 않아 비트맵만. 계산은 표준 그대로: 색·흐림·그림자 =
+  // 캔버스 filter(CSS 필터 함수), 모자이크 = 줄였다 보간 없이 키우기, 외곽선 = 실루엣을 반지름 안 정수 칸마다 찍기(도장 외곽선).
+  // 미리보기는 그림 층에 결과 한 장을 넣어 보이고, [취소]는 떼어 둔 원래 항목을 그대로 되돌리고, [적용]은 되돌리기 기록을 한 번 남긴다.
+  // 투명 잠금이 켜져 있으면 원래 칠해진 곳의 투명도를 그대로 둔다(색만 바뀜, 외곽선·그림자는 칠해진 곳 밖에 안 생김).
+  const FILTERS = [
+    { id: 'brightness', label: '밝기', params: [{ key: 'v', label: '밝기', min: 0, max: 200, value: 120, unit: '%' }], css: p => `brightness(${p.v}%)` },
+    { id: 'contrast', label: '대비', params: [{ key: 'v', label: '대비', min: 0, max: 200, value: 130, unit: '%' }], css: p => `contrast(${p.v}%)` },
+    { id: 'saturate', label: '채도', params: [{ key: 'v', label: '채도', min: 0, max: 300, value: 150, unit: '%' }], css: p => `saturate(${p.v}%)` },
+    { id: 'hue', label: '색조', params: [{ key: 'v', label: '돌리기', min: -180, max: 180, value: 90, unit: '°' }], css: p => `hue-rotate(${p.v}deg)` },
+    { id: 'grayscale', label: '흑백', params: [{ key: 'v', label: '세기', min: 0, max: 100, value: 100, unit: '%' }], css: p => `grayscale(${p.v}%)` },
+    { id: 'sepia', label: '세피아', params: [{ key: 'v', label: '세기', min: 0, max: 100, value: 100, unit: '%' }], css: p => `sepia(${p.v}%)` },
+    { id: 'invert', label: '색 반전', params: [{ key: 'v', label: '세기', min: 0, max: 100, value: 100, unit: '%' }], css: p => `invert(${p.v}%)` },
+    { id: 'blur', label: '흐림', params: [{ key: 'v', label: '반지름', min: 0, max: 20, value: 2, unit: 'px' }], css: p => `blur(${p.v}px)`, pad: p => Math.ceil(p.v * 3) },
+    { id: 'mosaic', label: '모자이크', params: [{ key: 'v', label: '칸 크기', min: 2, max: 32, value: 8, unit: 'px' }] },
+    { id: 'outline', label: '외곽선', params: [{ key: 'v', label: '두께', min: 1, max: 10, value: 2, unit: 'px' }, { key: 'color', label: '색', type: 'color', value: '#000000' }], pad: p => p.v + 1 },
+    { id: 'shadow', label: '그림자', params: [{ key: 'x', label: '가로', min: -20, max: 20, value: 4, unit: 'px' }, { key: 'y', label: '세로', min: -20, max: 20, value: 4, unit: 'px' },
+      { key: 'b', label: '흐림', min: 0, max: 20, value: 2, unit: 'px' }, { key: 'a', label: '진하기', min: 0, max: 100, value: 50, unit: '%' }, { key: 'color', label: '색', type: 'color', value: '#000000' }],
+    css: p => `drop-shadow(${p.x}px ${p.y}px ${p.b}px ${hexAlpha(p.color, p.a / 100)})`, pad: p => Math.max(Math.abs(p.x), Math.abs(p.y)) + Math.ceil(p.b * 3) },
+  ];
+  const hexAlpha = (hex, alpha) => {
+    const n = parseInt(String(hex).slice(1), 16) || 0;
+    return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${Math.max(0, Math.min(1, alpha))})`;
+  };
+  // 칠해진 범위로 자른 사본(픽셀 모양은 칸 크기 grid에 맞춰 — 확장이 픽셀 모양 그림 왼쪽 위를 칸 배수로 맞추므로 어긋나지 않게).
+  // 하나도 안 칠해졌으면 null.
+  function trimFilterContent(content, grid = 1) {
+    if (!content) return null;
+    const { width: w, height: h } = content.canvas;
+    const d = content.canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let y = 0, p = 3; y < h; y++) for (let x = 0; x < w; x++, p += 4) {
+      if (!d[p]) continue;
+      if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    if (maxX < 0) return null;
+    const x0 = Math.floor(minX / grid) * grid, y0 = Math.floor(minY / grid) * grid;
+    const x1 = Math.min(w, Math.ceil((maxX + 1) / grid) * grid), y1 = Math.min(h, Math.ceil((maxY + 1) / grid) * grid);
+    if (x0 === 0 && y0 === 0 && x1 === w && y1 === h) return content;
+    const canvas = canvasOfSize(x1 - x0, y1 - y0);
+    canvas.getContext('2d').drawImage(content.canvas, -x0, -y0);
+    return { canvas, x: content.x + x0, y: content.y + y0 };
+  }
+  // 원본 { canvas, x, y } → 필터 건 { canvas, x, y }(번지는 필터는 둘레를 넓힘 — 픽셀 모양은 칸 크기 배수로)
+  function filteredContent(source, filter, params, keepAlpha, grid = 1) {
+    const pad = filter.pad ? Math.ceil(Math.max(0, filter.pad(params)) / grid) * grid : 0;
+    const w = source.canvas.width + pad * 2, h = source.canvas.height + pad * 2;
+    const out = canvasOfSize(w, h), g = out.getContext('2d', { willReadFrequently: true });
+    if (filter.id === 'mosaic') {
+      const k = Math.max(1, params.v), sw = Math.max(1, Math.ceil(source.canvas.width / k)), sh = Math.max(1, Math.ceil(source.canvas.height / k));
+      const small = canvasOfSize(sw, sh), sg = small.getContext('2d');
+      sg.imageSmoothingEnabled = true; sg.imageSmoothingQuality = 'high';
+      sg.drawImage(source.canvas, 0, 0, sw, sh);
+      g.imageSmoothingEnabled = false;
+      g.drawImage(small, 0, 0, sw, sh, pad, pad, sw * k, sh * k);
+    } else if (filter.id === 'outline') {
+      // 실루엣(외곽선 색)을 반지름 안 정수 칸마다 찍고 그 위에 원본
+      const tint = canvasOfSize(source.canvas.width, source.canvas.height), tg = tint.getContext('2d');
+      tg.drawImage(source.canvas, 0, 0);
+      tg.globalCompositeOperation = 'source-in';
+      tg.fillStyle = params.color;
+      tg.fillRect(0, 0, tint.width, tint.height);
+      const r = params.v;
+      for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) if (dx * dx + dy * dy <= r * r + r) g.drawImage(tint, pad + dx, pad + dy);
+      g.drawImage(source.canvas, pad, pad);
+    } else {
+      g.filter = filter.css(params);
+      g.drawImage(source.canvas, pad, pad);
+      g.filter = 'none';
+    }
+    if (keepAlpha) {
+      // 투명 잠금: 원래 칠해진 곳 투명도 그대로(둘레는 투명)
+      const base = canvasOfSize(w, h), bg = base.getContext('2d', { willReadFrequently: true });
+      bg.drawImage(source.canvas, pad, pad);
+      const a = bg.getImageData(0, 0, w, h).data, image = g.getImageData(0, 0, w, h), d = image.data;
+      for (let p = 0; p < d.length; p += 4) {
+        if (!a[p + 3]) { d[p + 3] = 0; continue; }
+        if (!d[p + 3]) { d[p] = a[p]; d[p + 1] = a[p + 1]; d[p + 2] = a[p + 2]; }
+        d[p + 3] = a[p + 3];
+      }
+      g.putImageData(image, 0, 0);
+    }
+    return { canvas: out, x: source.x - pad, y: source.y - pad };
+  }
+  // 필터 창이 열려 있는 동안은 이비스페인트 필터 화면처럼 나머지를 막는다(덮개 + 단축키 막기, Esc = 취소, Enter = 적용) — 미리보기가
+  // 모양 바꾸기·저장(Ctrl+S)·되돌리기로 다른 곳에 저장되거나 꼬이지 않게.
+  let filterUi = null; // { panel, shade, keys, ep, fileId, layer, original: [항목], preview, source, filter, params }
+  function contentRaster(ep, content) {
+    const raster = new ep.paper.Raster({ canvas: content.canvas, insert: false });
+    raster.position = new ep.paper.Point(content.x + content.canvas.width / 2, content.y + content.canvas.height / 2);
+    return raster;
+  }
+  function openFilterPanel(ep) {
+    if (filterUi) return;
+    if (ep?.mode === 'VECTOR') { openVectorFilterPanel(ep); return; }
+    if (ep?.mode !== 'BITMAP') return;
+    const parts = paintLayer(ep), area = document.querySelector('#entryPainter .canvas_area');
+    if (!parts || !area) return;
+    const meta = layerMeta(ep), shown = meta ? activeLayer(meta) : null;
+    if (shown && shown.visible === false) { toast('숨긴 레이어에는 필터를 걸 수 없습니다 — 보이게 한 뒤 거세요.', 3000); return; }
+    paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: [] });
+    // 칠해진 범위로 자른 원본(새 레이어는 투명한 그림 한 장이라 그림이 있어도 칠해진 화소가 없을 수 있음 → null). 범위만 계산해
+    // 큰 그림판에서도 외곽선 등이 가볍다(검토 지적).
+    const c = context(), grid = c && pixelOf(c.picture) ? editorScale(c) : 1;
+    const source = trimFilterContent(paintSnapshot(ep), grid);
+    if (!source) { toast('지금 레이어에 그림이 없어 필터를 걸 수 없습니다.', 2500); return; }
+    // 첫 미리보기를 원본을 떼기 전에 만든다 — 계산이 실패하면 아무것도 바꾸지 않는다(검토 지적: 떼고 나서 실패하면 빈 레이어가 적용될 수 있었음)
+    let first;
+    try { first = filteredContent(source, FILTERS[0], Object.fromEntries(FILTERS[0].params.map(param => [param.key, param.value])), !!pixelPen.alphaLock, grid); }
+    catch (error) { console.warn('[entry-vector-rig] 필터', error); toast('필터를 열 수 없습니다.', 2500); return; }
+    const original = parts.layer.removeChildren() || [];
+    mountFilterUi(ep, area, { kind: 'bitmap', layer: parts.layer, original, source, grid }, first);
+  }
+  // 필터 창 띄우기(비트맵·벡터 같이): 덮개, 키 막기, 창 자리. state에 대상별 값(kind 등)
+  function mountFilterUi(ep, area, state, first) {
+    const fileId = window.Entry?.playground?.painter?.file?.id;
+    const shade = document.createElement('div');
+    shade.className = 'evr-filter-shade';
+    for (const type of ['mousedown', 'pointerdown', 'click', 'dblclick', 'wheel', 'contextmenu']) shade.addEventListener(type, event => { event.preventDefault(); event.stopPropagation(); });
+    const panel = buildFilterPanel(ep);
+    const block = event => { event.preventDefault(); event.stopImmediatePropagation(); };
+    const keys = event => {
+      // 엔트리 색 고르기 창(창 밖, 페이지 맨 위) 안: Esc는 고르기 창만 닫고(검토 지적: 예전엔 필터 전체가 취소됨), 다른 키는 그 칸에 둔다
+      // (고르기 창이 키를 그림판으로 보내지 않음 — openEntryPicker)
+      if (event.target?.closest?.('.evr-entry-picker')) {
+        if (event.key === 'Escape') { block(event); closeEntryPicker(); }
+        // 단축키(Ctrl·Cmd·Alt)는 칸 안 편집(Ctrl+A 등)만 하고 엔트리로는 보내지 않는다(기본 동작은 막지 않음 — 검토 지적)
+        else if (event.ctrlKey || event.metaKey || event.altKey) event.stopImmediatePropagation();
+        return;
+      }
+      if (event.key === 'Escape') { block(event); closeFilterPanel(false); return; }
+      // 단추에 초점이 있으면 Enter는 그 단추 누르기(필터 고르기·취소)로 둔다 — 예전엔 어디서든 적용돼 [취소]에서 Enter가 적용됐다(검토 지적)
+      if (event.key === 'Enter' && panel.contains(event.target) && event.target?.tagName === 'BUTTON') return;
+      if (event.key === 'Enter') { block(event); closeFilterPanel(true); return; }
+      // 단축키(Ctrl·Cmd·Alt — 저장·되돌리기 등)는 초점이 어디든 엔트리로 보내지 않는다(창 단추를 누른 뒤엔 초점이 창 안이라 시험에서 잡힘).
+      // 창 안 막대 조절 키(방향키 등)만 통과, 창 밖 키는 모두 막는다.
+      if (event.ctrlKey || event.metaKey || event.altKey || !panel.contains(event.target)) block(event);
+    };
+    window.addEventListener('keydown', keys, true);
+    filterUi = { ...state, panel, shade, keys, ep, fileId, preview: null, result: null, filter: FILTERS[0], params: null };
+    const rect = area.getBoundingClientRect();
+    Object.assign(panel.style, { left: `${Math.round(rect.left + 12)}px`, top: `${Math.round(rect.top + 12)}px` });
+    document.body.append(shade, panel);
+    showFilterResult(first);
+    selectFilter(FILTERS[0]);
+  }
+  // ---- 벡터 필터(1.3, 사용자 요청 10-18 "백터에서도 필터 돼게", 사용자 결정: 색 필터는 벡터 그대로) ----
+  // 대상 = 레이어 창의 지금 벡터 레이어(맨 위 항목). 색 필터(밝기·대비·채도·색조·흑백·세피아·색 반전)는 칠·선 색(그라데이션 정지점 포함)과
+  // 안에 든 그림 화소만 바꿔 벡터로 남긴다 — 색 계산은 비트맵과 같은 브라우저 표준 CSS 필터(1×1 칸에 그려 읽음). 흐림·모자이크·외곽선·
+  // 그림자는 저장 SVG에 남길 수 없어 그 레이어를 그림(Raster, 그림 좌표 1:1)으로 구운 뒤 비트맵과 같은 계산으로 건다(이름·불투명도·
+  // 클리핑 표시는 그대로). 미리보기 동안 원래 항목은 숨겨 두고 바로 위에 미리보기 항목을 둔다. 적용 = 원래 항목을 결과로 바꾸고 되돌리기 기록 한 번.
+  const COLOR_FILTERS = new Set(['brightness', 'contrast', 'saturate', 'hue', 'grayscale', 'sepia', 'invert']);
+  let filterColorCtx = null;
+  const filterColorCache = new Map();
+  function filterColor(paper, color, css) {
+    if (!color) return color;
+    if (color.gradient) {
+      return new paper.Color({ gradient: { stops: color.gradient.stops.map(stop => new paper.GradientStop(filterColor(paper, stop.color, css), stop.offset)), radial: color.gradient.radial },
+        origin: color.origin, destination: color.destination, highlight: color.highlight });
+    }
+    const r = Math.round(color.red * 255), g = Math.round(color.green * 255), b = Math.round(color.blue * 255), key = `${css}|${r},${g},${b}`;
+    let out = filterColorCache.get(key);
+    if (!out) {
+      filterColorCtx ||= canvasOfSize(1, 1).getContext('2d', { willReadFrequently: true });
+      const ctx = filterColorCtx;
+      ctx.clearRect(0, 0, 1, 1);
+      ctx.filter = css;
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(0, 0, 1, 1);
+      ctx.filter = 'none';
+      out = ctx.getImageData(0, 0, 1, 1).data.slice(0, 3);
+      if (filterColorCache.size > 4096) filterColorCache.clear();
+      filterColorCache.set(key, out);
+    }
+    return new paper.Color(out[0] / 255, out[1] / 255, out[2] / 255, color.alpha);
+  }
+  function filterRasterPixels(raster, css) {
+    const w = raster.width, h = raster.height;
+    if (!w || !h) return;
+    const canvas = canvasOfSize(w, h), g = canvas.getContext('2d');
+    g.filter = css;
+    g.drawImage(raster.canvas, 0, 0);
+    replaceRasterImage(raster, canvas);
+  }
+  // 대상 항목에 필터를 건 새 항목(문서에 넣지 않음). cache = 창 하나 동안 구운 원본을 두는 곳(막대를 움직일 때마다 다시 굽지 않게 — 검토 지적)
+  function vectorFilteredItem(ep, target, filter, params, cache) {
+    const P = ep.paper;
+    if (COLOR_FILTERS.has(filter.id)) {
+      const css = filter.css(params), copy = target.clone({ insert: false });
+      const from = [target, ...target.getItems({ match: () => true })], to = [copy, ...copy.getItems({ match: () => true })];
+      to.forEach((item, i) => {
+        // paper 복제는 같은 부모 안 이름이 겹치면 " 1"을 붙인다(안쪽 이름이 필터마다 쌓였음 — 시험으로 재현) — 원래 이름으로. 복제는 data를
+        // 통째로 복사하므로 엔트리 선택 표시·윤곽선 참조는 지운다(레이어 복제와 같음)
+        if (from.length === to.length && item.name !== from[i].name) item.name = from[i].name;
+        delete item.data.selected;
+        delete item.data.guideItem;
+      });
+      for (const item of to) {
+        // 클리핑 마스크 틀(과 그 안)은 칠이 지워진 채 색을 따로 적어 둔다 — 그 적어 둔 색에 건다(새 객체 — 복제는 data를 얕게 복사해 원래와 같이 씀)
+        if (item.data?.evrMaskStyle) item.data.evrMaskStyle = filterMaskStyle(P, item.data.evrMaskStyle, css);
+        if (item.clipMask) continue; // 틀 모양은 색이 아니라 모양만 쓴다
+        if (item.className === 'Raster') { filterRasterPixels(item, css); continue; }
+        // 묶음의 색은 자식 색을 읽고 쓰는 길이다(paper 0.12.15 Style: 자식 색이 같으면 그 색, 넣으면 자식 모두에 퍼짐) — 묶음에 걸고 자식에
+        // 또 걸면 두 번 걸렸다(같은 색 묶음에 색 반전 = 그대로, 시험으로 재현). 묶음은 건너뛰고 도형마다 한 번만. 복합 경로는 자기 색이다.
+        if (item.children && item.className !== 'CompoundPath') continue;
+        if (item.fillColor) item.fillColor = filterColor(P, item.fillColor, css);
+        if (item.strokeColor) item.strokeColor = filterColor(P, item.strokeColor, css);
+      }
+      copy.visible = true;
+      return copy;
+    }
+    // 그림으로 구워 비트맵과 같은 계산: 불투명도·숨김·합성 모드는 빼고 내용만 굽고(항목 속성으로 되돌림). 클리핑 레이어도 잘리지 않은 내용으로
+    // 굽는다(결과에 클리핑 표시를 그대로 두어 화면에서 다시 잘림 — 예전엔 잘린 채 굳어 기준 밖이 사라졌음, 시험으로 재현. 작은 그림과 같음)
+    const opacity = target.opacity, visible = target.visible, blendMode = target.blendMode;
+    let source = cache?.vectorSource;
+    if (!source) {
+      target.opacity = 1; target.visible = true; target.blendMode = 'normal';
+      clipDrawOff++;
+      let raster;
+      try { raster = target.rasterize({ resolution: 72, insert: false }); }
+      finally { clipDrawOff--; target.opacity = opacity; target.visible = visible; target.blendMode = blendMode; }
+      if (!raster?.width || !raster.height) throw Error('그림으로 바꿀 내용이 없습니다');
+      const b = raster.bounds;
+      source = { canvas: rasterCopy(raster), x: Math.round(b.x), y: Math.round(b.y) };
+      if (cache) cache.vectorSource = source;
+    }
+    const filtered = trimFilterContent(filteredContent(source, filter, params, false, 1), 1);
+    // 다 투명해졌으면 원본 그대로(구운 원본은 다음 미리보기에도 쓰므로 사본으로)
+    const out = contentRaster(ep, filtered || { canvas: rasterCopy({ width: source.canvas.width, height: source.canvas.height, canvas: source.canvas }), x: source.x, y: source.y });
+    out.opacity = opacity;
+    if (blendMode !== 'normal') out.blendMode = blendMode;
+    for (const key of ['evrName', 'evrClip', 'evrAlphaLock']) if (target.data?.[key] !== undefined) out.data[key] = target.data[key];
+    if (target.name) out.name = target.name;
+    return out;
+  }
+  function openVectorFilterPanel(ep) {
+    const parts = paintLayer(ep), area = document.querySelector('#entryPainter .canvas_area');
+    const target = parts && vectorPrimary(ep, vectorRows(parts.layer))?.item;
+    if (!parts || !area) return;
+    if (!target) { toast('필터를 걸 레이어를 먼저 고르세요(레이어 창에서 줄을 누르거나 그림을 선택).', 3000); return; }
+    if (vectorPicked(ep, vectorRows(parts.layer)).length > 1) { toast('레이어를 하나만 고르세요 — 필터는 한 번에 레이어 하나에 겁니다.', 3000); return; }
+    if (!target.visible) { toast('숨긴 레이어에는 필터를 걸 수 없습니다 — 보이게 한 뒤 거세요.', 3000); return; }
+    let first;
+    try { first = vectorFilteredItem(ep, target, FILTERS[0], Object.fromEntries(FILTERS[0].params.map(param => [param.key, param.value]))); }
+    catch (error) { console.warn('[entry-vector-rig] 벡터 필터', error); toast('필터를 열 수 없습니다.', 2500); return; }
+    paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: [] });
+    mountFilterUi(ep, area, { kind: 'vector', layer: parts.layer, target, wasVisible: target.visible }, first);
+  }
+  function showFilterResult(result) {
+    const ui = filterUi;
+    if (!ui) return;
+    ui.result = result;
+    if (ui.kind === 'vector') {
+      ui.preview?.remove();
+      ui.preview = result;
+      result.visible = ui.wasVisible;
+      ui.target.visible = false;
+      ui.target.parent.insertChild(ui.target.index + 1, result);
+      ui.ep.project.view.update();
+      return;
+    }
+    ui.layer.removeChildren();
+    ui.preview = contentRaster(ui.ep, result);
+    ui.layer.addChild(ui.preview);
+    ui.ep.project.view.update();
+  }
+  function previewFilter() {
+    const ui = filterUi;
+    if (!ui) return;
+    let result;
+    try {
+      result = ui.kind === 'vector' ? vectorFilteredItem(ui.ep, ui.target, ui.filter, ui.params, ui)
+        : filteredContent(ui.source, ui.filter, ui.params, !!pixelPen.alphaLock, ui.grid);
+    } catch (error) {
+      // 앞 미리보기는 그대로 두되 [적용]은 끈다 — 칩은 새 필터로 눌려 있는데 적용하면 앞 필터 결과가 들어갔다(검토 지적)
+      console.warn('[entry-vector-rig] 필터 미리보기', error);
+      setFilterApplyOk(ui, false);
+      toast('이 필터는 이 레이어에 걸 수 없습니다.', 2500);
+      return;
+    }
+    setFilterApplyOk(ui, true);
+    showFilterResult(result);
+  }
+  function setFilterApplyOk(ui, ok) {
+    ui.stale = !ok;
+    const apply = ui.panel.querySelector('.evr-filter-apply');
+    if (apply) apply.disabled = !ok;
+  }
+  function selectFilter(filter) {
+    const ui = filterUi;
+    if (!ui) return;
+    ui.filter = filter;
+    ui.params = Object.fromEntries(filter.params.map(param => [param.key, param.value]));
+    renderFilterParams();
+    previewFilter();
+    // 그림으로 바꾸는 필터는 레이어 뼈대를 옮길 수 없다(뼈대는 도형 모양 기준) — 말없이 사라지지 않게 알린다(검토 지적)
+    if (ui.kind === 'vector' && !COLOR_FILTERS.has(filter.id) && ui.target.data?.[BONES]) toast('이 필터는 레이어를 그림으로 바꿔서 뼈대가 빠집니다(적용 뒤 되돌리기로 되돌릴 수 있음).', 4000);
+  }
+  // 닫기: apply면 결과를 남기고 되돌리기 기록 한 번, 아니면 떼어 둔 원래 항목을 그대로 되돌린다
+  function closeFilterPanel(apply) {
+    const ui = filterUi;
+    if (!ui || (apply && ui.stale)) return; // 계산이 안 된 필터는 적용하지 않는다(창은 그대로)
+    filterUi = null;
+    if (entryPicker && ui.panel.contains(entryPicker.anchor)) closeEntryPicker();
+    ui.panel.remove();
+    ui.shade.remove();
+    window.removeEventListener('keydown', ui.keys, true);
+    if (ui.kind === 'vector') {
+      if (!apply || !ui.preview || !ui.preview.isInserted() || !ui.target.isInserted()) {
+        ui.preview?.remove();
+        if (ui.target.isInserted()) ui.target.visible = ui.wasVisible;
+        ui.ep.project.view.update();
+        return;
+      }
+      ui.target.remove(); // 원래 자리(바로 위)에 미리보기 항목이 결과로 남는다
+      ui.preview.visible = ui.wasVisible;
+      ui.ep.project.view.update();
+      if (!saveEntryHistory(ui.ep)) console.warn('[entry-vector-rig] 필터: 되돌리기 기록을 남기지 못함');
+      layerUi.vectorEpoch++;
+      layerUi.signature = null;
+      // 결과 레이어를 골라 둔다(비트맵은 지금 레이어가 그대로 — 예전엔 적용 뒤 선택이 풀려 [필터]가 꺼졌음, 검토 지적)
+      layerUi.vectorPick = ui.preview;
+      selectVectorUnit(ui.preview);
+      refreshLayers(ui.ep);
+      return;
+    }
+    if (!apply || !ui.preview || !ui.result) {
+      ui.layer.removeChildren();
+      ui.layer.addChildren(ui.original);
+      ui.ep.project.view.update();
+      return;
+    }
+    // 적용: 번진 둘레의 투명한 여백은 칸에 맞춰 잘라 낸다(적용할 때마다 그림이 커지지 않게 — 검토 지적). 떼어 둔 항목 중 기준점 상자는
+    // 다시 넣는다(상자는 그림이 아니라 필터 대상이 아님 — 빠지면 다음 저장까지 사라졌음, 검토 지적).
+    const kept = trimFilterContent(ui.result, ui.grid), stage = paintLayer(ui.ep)?.stage;
+    ui.layer.removeChildren();
+    // 다 투명해졌으면 작업 영역만 한 빈 그림(엔트리 비트맵 그림 층은 그림 한 장을 기대함)
+    if (kept) ui.layer.addChild(contentRaster(ui.ep, kept));
+    else if (stage) ui.layer.addChild(contentRaster(ui.ep, { canvas: canvasOfSize(Math.max(1, Math.round(stage.width)), Math.max(1, Math.round(stage.height))), x: Math.round(stage.x), y: Math.round(stage.y) }));
+    for (const item of ui.original) if (item.data?.entryVectorCanvasBox === '1') ui.layer.addChild(item);
+    ui.ep.project.view.update();
+    if (!saveEntryHistory(ui.ep)) console.warn('[entry-vector-rig] 필터: 되돌리기 기록을 남기지 못함');
+    layerUi.signature = null;
+    refreshLayers(ui.ep);
+  }
+  function buildFilterPanel(ep) {
+    const panel = document.createElement('div');
+    panel.className = 'evr-filter-panel';
+    const title = document.createElement('b');
+    title.className = 'evr-filter-title';
+    title.textContent = '필터 — 지금 레이어';
+    const chips = document.createElement('div');
+    chips.className = 'evr-filter-list';
+    for (const filter of FILTERS) {
+      chips.append(button(filter.label, () => selectFilter(filter), { class: 'evr-brush-toggle evr-filter-chip', 'data-filter': filter.id }));
+    }
+    const params = document.createElement('div');
+    params.className = 'evr-filter-params';
+    const row = document.createElement('div');
+    row.className = 'evr-filter-actions';
+    row.append(button('적용', () => closeFilterPanel(true), { class: 'evr-layers-act evr-filter-apply' }),
+      button('취소', () => closeFilterPanel(false), { class: 'evr-layers-act evr-filter-cancel' }));
+    panel.append(title, chips, params, row);
+    for (const type of ['mousemove', 'pointermove', 'mousedown', 'pointerdown', 'wheel']) panel.addEventListener(type, event => event.stopPropagation());
+    return panel;
+  }
+  function renderFilterParams() {
+    const ui = filterUi;
+    if (!ui) return;
+    for (const chip of ui.panel.querySelectorAll('.evr-filter-chip')) chip.setAttribute('aria-pressed', String(chip.dataset.filter === ui.filter.id));
+    let frame = 0;
+    const later = () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; previewFilter(); }); };
+    const box = ui.panel.querySelector('.evr-filter-params');
+    if (entryPicker && box.contains(entryPicker.anchor)) closeEntryPicker();
+    box.replaceChildren(...ui.filter.params.map(param => {
+      const label = document.createElement('label');
+      label.className = 'evr-brush-level evr-filter-param';
+      label.dataset.key = param.key;
+      const text = document.createElement('span');
+      text.textContent = param.label;
+      if (param.type === 'color') {
+        // 색은 엔트리 색 고르기 창으로(그라데이션 끝 색과 같은 칸)
+        label.append(text, entryColorField(ui.params[param.key], color => { ui.params[param.key] = color; later(); }, 'evr-filter-color'));
+        return label;
+      }
+      const input = document.createElement('input');
+      Object.assign(input, { type: 'range', min: String(param.min), max: String(param.max), step: '1', value: String(param.value) });
+      const value = document.createElement('b');
+      value.textContent = `${param.value}${param.unit || ''}`;
+      input.addEventListener('input', () => { ui.params[param.key] = Number(input.value); value.textContent = `${input.value}${param.unit || ''}`; later(); });
+      label.append(text, input, value);
+      return label;
+    }));
+  }
+  // 모양·모드가 바뀌었거나 그림판이 사라지면 필터 창을 닫고 원래대로(미리보기가 다른 모양에 남지 않게)
+  function checkFilterPanel(painter) {
+    const ui = filterUi;
+    if (!ui) return;
+    const ep = painter?.entryPaint;
+    if (ui.kind === 'vector') {
+      // 미리보기나 원래 항목이 다른 길(엔트리 되돌리기 등)로 빠졌거나 모양·모드가 바뀌었으면 취소로 닫는다(빠진 것은 다시 넣지 않음)
+      if (ep !== ui.ep || ep?.mode !== 'VECTOR' || painter?.file?.id !== ui.fileId || !ui.target.isInserted() || !ui.preview?.isInserted() || !document.contains(ui.panel)) closeFilterPanel(false);
+      return;
+    }
+    // 미리보기 그림이 다른 길(엔트리 되돌리기 등)로 빠졌으면 원래 항목을 되돌리지 않고 창만 닫는다(겹쳐 넣지 않게)
+    if (ui.preview && !ui.preview.isInserted()) { ui.original = null; ui.preview = null; }
+    if (!ui.original || ep !== ui.ep || ep?.mode !== 'BITMAP' || painter?.file?.id !== ui.fileId || !ui.layer.isInserted() || !document.contains(ui.panel)) {
+      if (!ui.original) { filterUi = null; ui.panel.remove(); ui.shade.remove(); window.removeEventListener('keydown', ui.keys, true); return; }
+      closeFilterPanel(false);
+    }
+  }
+  // ---- 비트맵 선택이 반투명 화소를 지우지 않게(1.3) ----
+  // 엔트리 비트맵 선택 도구는 고른 부분을 떼어 낼 때(getCutRaster → getAliasingRaster) 화소 투명도를 128 기준으로 0/255로 깎는다
+  // (entry-paint 261015 소스 — 확장 없이도 같음: 30%·10% 화소가 박스를 놓는 순간 사라지고 60%는 100%가 됨, 10-18 실험). 엔트리 붓·선은
+  // 원래 번짐 없이 그리지만, 흐림 필터·부드러운 붓·불투명도·불러온 그림의 반투명 화소까지 선택 한 번에 망가졌다(사용자 제보 10-18 "필터
+  // 적용 뒤 선택 박스 → 필터가 사라짐", 넓혀 본 탐색 95가지 중 흐림+선택 6가지만 실패). 떼어 낼 때 엔트리처럼 같은 해상도로 굽되 깎는
+  // 단계만 건너뛴다 — 반투명이 없는 그림(픽셀 아트)은 결과가 같다.
+  function ensureSelectKeepsAlpha(painter) {
+    const tool = painter?.entryPaint?.paper?.tools?.find(item => item.MY_MODE?.toolMode === 'SELECT' && item.MY_MODE?.graphicsMode === 'BITMAP');
+    if (!tool || own(tool, '__evrKeepAlpha') || typeof tool.getCutRaster !== 'function') return;
+    Object.defineProperty(tool, '__evrKeepAlpha', { value: true });
+    // 엔트리(261015)와 같은 모양일 때만 바꾼다: 떼어 내기 = getSubRaster 뒤 getAliasingRaster, 부르는 쪽 = 같은 사각으로 removeRect.
+    // 엔트리가 바뀌었으면 손대지 않는다(엔트리 원래대로 — 검토 지적)
+    const cutSource = String(tool.getCutRaster), callerSource = String(tool.constructor);
+    if (!/getSubRaster/.test(cutSource) || !/getAliasingRaster/.test(cutSource) ||
+      !/getCutRaster\((\w+),(\w+)\)[\s\S]{0,200}removeRect\(\1,\2\.width,\2\.height,\2\.point\)/.test(callerSource)) {
+      console.warn('[entry-vector-rig] 엔트리 선택 도구가 예상과 달라 반투명 지키기를 건너뜀');
+      return;
+    }
+    tool.getCutRaster = function (raster, rect) {
+      const m = raster.matrix;
+      if (Math.abs(m.a - 1) < 1e-9 && Math.abs(m.d - 1) < 1e-9 && Math.abs(m.b) < 1e-9 && Math.abs(m.c) < 1e-9) {
+        // 늘리거나 돌리지 않은 그림(평소)은 화소 칸 그대로 떼어 내고 다시 그리지 않는다: 반 화소 자리(홀수 크기 그림을 가운데 둔 때 등)에서
+        // 다시 그리면 불투명 가장자리에 반투명 띠가 생겼다(탐침으로 재현 — 엔트리는 깎아서 가리는 대신 불투명 화소 한 줄을 잃음). 반 화소 자리
+        // 그림은 먼저 0.5px 옮겨 그림 칸에 맞춘다(놓을 때 엔트리가 굽는 단계가 칸에 맞추며 다시 그려 띠가 생겼음). 엔트리는 이 사각(같은
+        // 객체)으로 원래 그림을 지우므로(removeRect) 사각도 같은 화소 칸으로 맞춘다 — 남은 그림과 조각이 화소 단위로 딱 나뉜다.
+        const b = raster.bounds, dx = Math.round(b.x) - b.x, dy = Math.round(b.y) - b.y;
+        if (dx || dy) raster.translate(dx, dy);
+        // 사각은 옮기기 전 그림 기준이라 옮긴 만큼 빼고 맞춘다(예전엔 반 화소 그림에서 선택 상자가 끈 자리보다 1px 오른쪽·아래 — 검토 L)
+        const x0 = Math.round(rect.x - dx), y0 = Math.round(rect.y - dy);
+        const w = Math.max(1, Math.round(rect.x + rect.width - dx) - x0), h = Math.max(1, Math.round(rect.y + rect.height - dy) - y0);
+        rect.x = x0; rect.y = y0; rect.width = w; rect.height = h;
+        const piece = raster.getSubRaster(x0, y0, w, h);
+        piece.remove();
+        return piece;
+      }
+      const piece = raster.getSubRaster(rect);
+      piece.remove();
+      return piece.rasterize({ resolution: 72, insert: false });
+    };
   }
   // ---- 영역 채우기(벡터·비트맵) ----
   // 엔트리 채우기(entry-paint 260921)는 벡터에서는 누른 도형 하나의 색만 바꿔 선으로 둘러싼 빈 곳은 못 채우고, 비트맵에서는
@@ -8999,7 +9864,397 @@
     const color = new paper.Color(value || '#000000');
     return [color.red * 255, color.green * 255, color.blue * 255, (color.alpha ?? 1) * 255];
   }
-  // 벡터: 그림 레이어 전체를 무대 크기 그림으로 그려 영역을 찾고, 윤곽을 경로로 만들어 누른 곳의 도형 바로 위(그 위 선들 아래)에 넣는다
+  // ---- 엔트리 색 고르기 다시 쓰기(1.3, 사용자 요청 "우리가 따로 색을 고르게 한 거를 엔트리 css로 재사용") ----
+  // 확장이 따로 둔 색 칸(그라데이션 끝 색, 필터 외곽선·그림자 색)은 브라우저 기본 색 칸 대신 엔트리 그림판 색 칸과 같은 모양으로 그리고,
+  // 누르면 엔트리 색 고르기 창(EntryTool.ColorPicker — 엔트리 그림판 채우기·윤곽선 색이 띄우는 것과 같은 부품, 10-18 실험)을 띄운다.
+  // 색 칸 모양은 그림판 아래 막대의 ColorBox를 복제한다(엔트리 styled-components 이름은 빌드마다 바뀌어 직접 쓰지 않음). 아직 못 봤으면
+  // 확장 칸으로 대신한다. 창 밖을 누르면 닫는다(필터 덮개가 누르기를 막아 엔트리 바깥 누르기 감지가 못 받으므로 캡처 단계에서 직접 봄).
+  let colorBoxTemplate = null, entryPicker = null;
+  function rememberColorBox() {
+    if (!colorBoxTemplate) {
+      const box = document.querySelector('#entryPainter .bottom_area .ColorBox');
+      if (box?.querySelector('.color')) colorBoxTemplate = box.cloneNode(true);
+    }
+    return colorBoxTemplate;
+  }
+  // 엔트리 색 고르기가 주는 값을 #rrggbb로(캔버스 fillStyle 표준 변환 — 불투명 색만 #으로 나옴, 투명은 버림). 캔버스는 읽을 수 없는 값을
+  // 말없이 무시하므로 서로 다른 두 시작값으로 넣어 보고 같을 때만 쓴다(검토 지적: 예전엔 잘못된 값이 검정이 됨)
+  function cssHex(value) {
+    if (typeof value !== 'string' || !value) return null;
+    const ctx = canvasOfSize(1, 1).getContext('2d');
+    const read = start => { ctx.fillStyle = start; ctx.fillStyle = value; return ctx.fillStyle; };
+    const a = read('#000000'), b = read('#ffffff');
+    return a === b && /^#[0-9a-f]{6}$/i.test(a) ? a.toLowerCase() : null;
+  }
+  function entryColorField(value, onPick, className) {
+    const field = document.createElement('button');
+    field.type = 'button';
+    field.className = `evr-color-field ${className || ''}`.trim();
+    field.setAttribute('aria-expanded', 'false');
+    const template = rememberColorBox();
+    const face = template ? template.cloneNode(true) : document.createElement('span');
+    if (!template) face.className = 'evr-color-face';
+    face.querySelector('.color')?.classList.remove('multi');
+    field.dataset.entryLook = String(!!template);
+    field.append(face);
+    field.setColor = color => {
+      if (field.dataset.color === color) return;
+      field.dataset.color = color;
+      (face.querySelector('.color') || face).style.background = color;
+    };
+    field.setColor(value);
+    field.addEventListener('click', () => {
+      // 열린 고르기 창이 이 칸 것이면 닫기만(엔트리 창이 스스로 숨었으면 다시 연다 — 검토 지적: 두 번 눌러야 열림)
+      const shown = entryPicker?.picker && (typeof entryPicker.picker.isShow === 'function' ? entryPicker.picker.isShow() : entryPicker.picker.isShow);
+      if (entryPicker?.anchor === field && shown !== false) { closeEntryPicker(); return; }
+      openEntryPicker(field, field.dataset.color, color => { field.setColor(color); onPick(color); });
+    });
+    return field;
+  }
+  function openEntryPicker(anchor, color, onPick) {
+    closeEntryPicker();
+    if (typeof window.EntryTool?.ColorPicker !== 'function') { nativeColorPicker(anchor, color, onPick, '엔트리 색 고르기 창을 찾지 못해 브라우저 색 고르기로 엽니다.'); return; }
+    const container = document.createElement('div');
+    container.className = 'evr-entry-picker';
+    // 숫자 칸 입력(방향키·지우기·Ctrl+Z 등)은 칸 안에서만 — 그림판 단축키(도형 지우기·되돌리기)로 가지 않게. Esc = 고르기 창만 닫기
+    container.addEventListener('keydown', event => { event.stopPropagation(); if (event.key === 'Escape') closeEntryPicker(); });
+    document.body.append(container);
+    const state = { anchor, container, picker: null };
+    state.outside = event => { if (!container.contains(event.target) && !anchor.contains(event.target)) closeEntryPicker(); };
+    window.addEventListener('pointerdown', state.outside, true);
+    entryPicker = state;
+    anchor.setAttribute('aria-expanded', 'true');
+    try {
+      state.picker = new window.EntryTool.ColorPicker({ data: { color, positionDom: anchor, canTransparent: false, outsideExcludeDom: [anchor],
+        onOutsideClick: () => { if (entryPicker === state) closeEntryPicker(); } }, container });
+      state.picker.on('change', next => { const hex = cssHex(next); if (hex && entryPicker === state) onPick(hex); });
+    } catch (error) {
+      console.warn('[entry-vector-rig] 엔트리 색 고르기 창 열기 실패', error);
+      closeEntryPicker();
+      nativeColorPicker(anchor, color, onPick, '엔트리 색 고르기 창을 열지 못해 브라우저 색 고르기로 엽니다.');
+    }
+  }
+  // 엔트리 고르기 창을 쓸 수 없을 때(엔트리가 바뀜 등) 색을 바꿀 길이 없어지지 않게 브라우저 기본 색 고르기로 대신한다(검토 지적)
+  function nativeColorPicker(anchor, color, onPick, message) {
+    toast(message, 4000);
+    document.querySelectorAll('.evr-native-color').forEach(old => old.remove()); // 고르기 창은 초점을 안 줘 blur가 안 올 수 있음 — 쌓이지 않게
+    const input = Object.assign(document.createElement('input'), { type: 'color', value: cssHex(color) || '#000000' });
+    input.className = 'evr-native-color';
+    anchor.after(input);
+    input.addEventListener('input', () => onPick(input.value.toLowerCase()));
+    input.addEventListener('change', () => input.remove());
+    input.addEventListener('blur', () => setTimeout(() => input.remove(), 0));
+    try { input.showPicker(); } catch { input.click(); }
+  }
+  function closeEntryPicker() {
+    const state = entryPicker;
+    if (!state) return;
+    entryPicker = null;
+    window.removeEventListener('pointerdown', state.outside, true);
+    try { state.picker?.hide?.(); state.picker?.remove?.(); } catch (error) { console.warn('[entry-vector-rig] 엔트리 색 고르기 창 닫기', error); }
+    state.container.remove();
+    state.anchor.setAttribute('aria-expanded', 'false');
+  }
+  // 색 칸이 화면에서 빠졌으면(도구 바꿈·창 닫힘) 고르기 창도 닫는다
+  function checkEntryPicker() {
+    rememberColorBox();
+    if (entryPicker && !entryPicker.anchor.isConnected) closeEntryPicker();
+  }
+  // ---- 그라데이션 도구(1.3, 사용자 요청 10-18 "영역 채우기 안에 그라데이션 하지 말고, 따로 별도의 도구로") ----
+  // 엔트리 도구 막대 [채우기] 바로 아래에 엔트리 단추와 같은 모양(같은 클래스, 40×40 아이콘, 엔트리 아이콘 색 규칙 — 보통 회색 #979797,
+  // 고르면 파랑 #4F80FF + 주황 #FFB500)의 [그라데이션]을 둔다. 누르면 엔트리 채우기 도구를 고르고(시작 색 = 엔트리 채우기 색, 되돌리기·
+  // 저장은 엔트리 채우기 그대로) 선으로 둘러싼 곳을 누른 채 끌어 그라데이션으로 칠한다(끌지 않고 누르면 한 색). 엔트리는 채우기를 고른
+  // 것으로 알고 있으므로 단추 표시만 바꾼다(그라데이션 = 고름, 채우기 = 안 고름). 엔트리 도구 단추(채우기 포함)를 누르거나 채우기가 아닌
+  // 도구가 되면 그라데이션 도구는 꺼진다. 고름/안 고름 클래스는 엔트리 단추에서 읽는다(styled-components 이름은 빌드마다 바뀜).
+  const gradientIcon = on => {
+    const line = on ? '#4F80FF' : '#979797', from = on ? '#FFB500' : '#979797';
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="0">' +
+      `<stop offset="0" stop-color="${from}"/><stop offset="1" stop-color="#FFF"/></linearGradient></defs><g fill="none" fill-rule="nonzero">` +
+      `<rect x="8.75" y="8.75" width="22.5" height="15.5" rx="2" fill="url(#g)" stroke="${line}" stroke-width="1.5"/>` +
+      `<path stroke="${line}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M11 30.5h17m-3-3l3 3-3 3"/></g></svg>`;
+    return `data:image/svg+xml;base64,${btoa(svg)}`;
+  };
+  const toolLook = { on: null, off: null };
+  let gradientToolHooked = false;
+  const entryToolButtons = () => [...document.querySelectorAll('#entryPainter .ToolButtonWrapper')].filter(button => !button.classList.contains('evr-grad-tool'));
+  function ensureGradientTool() {
+    const buttons = entryToolButtons(), fill = buttons.find(button => button.innerText.trim() === '채우기');
+    let mine = document.querySelector('#entryPainter .evr-grad-tool');
+    if (!fill) { mine?.remove(); return; }
+    // 엔트리 단추 클래스: 많은 쪽 = 안 고름, 하나뿐인 쪽 = 고름
+    const counts = new Map();
+    for (const button of buttons) counts.set(button.className, (counts.get(button.className) || 0) + 1);
+    if (counts.size === 2) {
+      const [a, b] = [...counts.entries()].sort((x, y) => y[1] - x[1]);
+      toolLook.off = a[0];
+      toolLook.on = b[0];
+    } else if (counts.size === 1 && !toolLook.off) toolLook.off = [...counts.keys()][0];
+    if (!mine) {
+      mine = document.createElement('span');
+      mine.className = `${toolLook.off || 'ToolButtonWrapper'} evr-grad-tool`; // 표시는 syncGradientTool이 맞춤(찾는 표시 evr-grad-tool은 처음부터)
+      mine.setAttribute('role', 'button');
+      mine.title = '확장: 누른 채 끌면 그 방향으로 그라데이션(Shift = 15° 단위) — 비트맵은 지금 레이어 전체, 벡터는 누른 도형(빈 곳은 칠하지 않음). 시작 색은 엔트리 채우기 색, 끝 색·종류·단계는 그라데이션 창';
+      const img = Object.assign(document.createElement('img'), { alt: '그라데이션', draggable: false });
+      mine.append(img, document.createElement('br'), document.createTextNode('그라데이션'));
+      mine.addEventListener('click', () => {
+        const button = entryToolButtons().find(item => item.innerText.trim() === '채우기');
+        if (!button) return;
+        if (!gradientFill.on) cancelGradientDrag();
+        window.Entry?.playground?.painter?.entryPaint?.paper?.tools?.forEach(item => item.__evrClearHover?.()); // 엔트리 채우기 마우스 올림 미리 칠하기 지우기(검토 L)
+        button.click(); // 엔트리 채우기 도구 고르기(엔트리 단추 누르기 — 아래 캡처에서 그라데이션을 끄므로 그 뒤에 켠다)
+        gradientFill.on = true;
+        syncGradientTool();
+        // 엔트리가 채우기 도구로 바꾼 뒤에 옵션 줄·창을 맞춘다(바꾸기 전에 맞추면 '채우기가 아님'으로 보고 그라데이션을 끔)
+        setTimeout(() => {
+          try { ensureFillOptions(window.Entry?.playground?.painter); } catch (error) { console.warn('[entry-vector-rig] 그라데이션 도구', error); }
+          syncGradientTool();
+        }, 0);
+      });
+    }
+    if (mine.previousElementSibling !== fill) fill.after(mine);
+    if (!gradientToolHooked) {
+      gradientToolHooked = true;
+      // 엔트리 도구 단추를 누르면(채우기 포함) 그라데이션 도구를 끈다
+      document.addEventListener('click', event => {
+        const button = event.target.closest?.('#entryPainter .ToolButtonWrapper');
+        if (!button || button.classList.contains('evr-grad-tool') || !gradientFill.on) return;
+        gradientFill.on = false;
+        cancelGradientDrag();
+        setTimeout(() => {
+          try { ensureFillOptions(window.Entry?.playground?.painter); } catch (error) { console.warn('[entry-vector-rig] 그라데이션 도구', error); }
+          syncGradientTool();
+        }, 0);
+      }, true);
+    }
+    syncGradientTool();
+  }
+  function syncGradientTool() {
+    const mine = document.querySelector('#entryPainter .evr-grad-tool');
+    const fill = entryToolButtons().find(button => button.innerText.trim() === '채우기');
+    if (!mine || !fill || !toolLook.off) return;
+    const isFill = window.Entry?.playground?.painter?.entryPaint?.paper?.tool?.MY_MODE?.toolMode === 'FILL';
+    const on = gradientFill.on && isFill;
+    const cls = `${on && toolLook.on ? toolLook.on : toolLook.off} evr-grad-tool`;
+    if (mine.className !== cls) mine.className = cls;
+    const img = mine.querySelector('img'), src = gradientIcon(on);
+    if (img.getAttribute('src') !== src) img.setAttribute('src', src);
+    mine.setAttribute('aria-pressed', String(on));
+    // 엔트리 채우기 단추: 그라데이션일 때는 안 고름으로 보이게, 아니면 엔트리가 정한 대로. 되돌릴 때는 우리가 써 둔 글자가 그대로일 때만,
+    // 엔트리 상태(저장소의 도구)가 채우기면 원래 글자로(엔트리는 도구가 바뀔 때만 단추를 다시 그려 우리 글자가 남을 수 있음 — 검토 지적)
+    const entryFill = () => (paintStore()?.getState?.()?.tool?.toolMode ?? window.Entry?.playground?.painter?.entryPaint?.paper?.tool?.MY_MODE?.toolMode) === 'FILL';
+    if (on && fill.className !== toolLook.off) { fill.dataset.evrLook = fill.className; fill.dataset.evrSet = toolLook.off; fill.className = toolLook.off; }
+    else if (!on && fill.dataset.evrLook) {
+      if (entryFill() && fill.className === fill.dataset.evrSet) fill.className = fill.dataset.evrLook;
+      delete fill.dataset.evrLook;
+      delete fill.dataset.evrSet;
+    }
+    // 엔트리는 고른 도구의 아이콘도 색 아이콘으로 바꾼다 — 그라데이션일 때는 [채우기]를 회색 아이콘으로(사용자: "채우기 아이콘도 골라진 듯").
+    // 회색 아이콘은 엔트리가 안 고른 채우기에 쓰는 그림을 배워 두고, 아직 못 봤으면 색 아이콘의 파랑·주황을 엔트리 회색으로 바꿔 만든다
+    const fillImg = fill.querySelector('img');
+    if (fillImg) {
+      // 배운 회색 아이콘은 모드(벡터·비트맵)마다 따로 둔다(모드마다 아이콘이 다를 수 있음 — 검토 지적)
+      const mode = window.Entry?.playground?.painter?.entryPaint?.mode || '';
+      toolLook.fillIconOff ||= {};
+      if (!on && !fill.dataset.evrIcon && fill.className === toolLook.off) toolLook.fillIconOff[mode] = fillImg.getAttribute('src');
+      if (on) {
+        const gray = toolLook.fillIconOff[mode] || grayToolIcon(fillImg.getAttribute('src'));
+        if (fillImg.getAttribute('src') !== gray) { fill.dataset.evrIcon = fillImg.getAttribute('src'); fill.dataset.evrIconSet = gray; fillImg.setAttribute('src', gray); }
+      } else if (fill.dataset.evrIcon) {
+        if (entryFill() && fillImg.getAttribute('src') === fill.dataset.evrIconSet) fillImg.setAttribute('src', fill.dataset.evrIcon);
+        delete fill.dataset.evrIcon;
+        delete fill.dataset.evrIconSet;
+      }
+    }
+    // 아래 막대 왼쪽 도구 이름(엔트리 ToolTitleComp — 엔트리는 채우기로 알고 있어 '채우기')도 그라데이션으로(사용자: "아래 막대가 '채우기'").
+    // 엔트리가 도구를 바꾸며 다시 그릴 때 꼬이지 않게 글자 칸은 바꿔 끼우지 않고 안의 글자·그림만 고친다
+    const title = document.querySelector('#entryPainter .ToolTitleComp');
+    const titleImg = title?.querySelector('img'), titleText = title && [...title.querySelectorAll('div')].map(div => div.firstChild).find(node => node?.nodeType === 3);
+    if (titleImg && titleText) {
+      const icon = gradientIcon(true);
+      if (on && titleText.nodeValue !== '그라데이션') {
+        title.dataset.evrText = titleText.nodeValue; title.dataset.evrIcon = titleImg.getAttribute('src');
+        titleText.nodeValue = '그라데이션'; titleImg.setAttribute('src', icon);
+      } else if (!on && title.dataset.evrText) {
+        if (titleText.nodeValue === '그라데이션') titleText.nodeValue = title.dataset.evrText;
+        if (titleImg.getAttribute('src') === icon) titleImg.setAttribute('src', title.dataset.evrIcon);
+        delete title.dataset.evrText;
+        delete title.dataset.evrIcon;
+      }
+    }
+  }
+  // 엔트리 고른 도구 아이콘(파랑 #4F80FF·주황 #FFB500)을 안 고른 아이콘 색(회색 #979797)으로
+  function grayToolIcon(src) {
+    try {
+      const [head, body] = String(src).split(',');
+      if (!/base64/.test(head)) return src;
+      return `${head},${btoa(atob(body).replace(/#4F80FF|#FFB500/gi, '#979797'))}`;
+    } catch { return src; }
+  }
+  // ---- 그라데이션 창(1.3, 사용자 요청 "그라데이션은 따로 창으로"): 그라데이션 도구를 고르면 그림 칸 오른쪽 아래에 뜬다. 종류·끝 색·
+  // 끝 투명·단계를 여기서 고르고, 머리를 끌어 옮긴다(옮긴 자리는 이 페이지 동안 기억). [×] = 그라데이션 도구 끄기(채우기로).
+  let gradientWinPos = null;
+  function ensureGradientWindow(show) {
+    const area = document.querySelector('#entryPainter .canvas_area');
+    let win = document.querySelector('#entryPainter .evr-grad-win');
+    if (!show || !area) {
+      if (win) { if (entryPicker && win.contains(entryPicker.anchor)) closeEntryPicker(); win.remove(); }
+      return;
+    }
+    if (!win) win = buildGradientWindow();
+    if (win.parentElement !== area) area.append(win);
+    placeGradientWindow(win);
+    syncGradientWindow(win);
+  }
+  function placeGradientWindow(win) {
+    const area = win.parentElement;
+    if (!gradientWinPos || !area) return;
+    const x = Math.round(Math.max(0, Math.min(gradientWinPos.x, area.clientWidth - win.offsetWidth)));
+    const y = Math.round(Math.max(0, Math.min(gradientWinPos.y, area.clientHeight - win.offsetHeight)));
+    if (win.style.left !== `${x}px` || win.style.top !== `${y}px`) Object.assign(win.style, { left: `${x}px`, top: `${y}px`, right: 'auto', bottom: 'auto' });
+  }
+  function buildGradientWindow() {
+    const win = document.createElement('div');
+    win.className = 'evr-grad-win';
+    const head = document.createElement('div');
+    head.className = 'evr-grad-win-head';
+    head.title = '끌어서 창 옮기기';
+    const title = document.createElement('span');
+    title.className = 'evr-grad-win-title';
+    title.textContent = '그라데이션';
+    const close = button('×', () => {
+      gradientFill.on = false;
+      cancelGradientDrag();
+      const box = document.querySelector('#entryPainter .evr-fill-opts');
+      if (box) syncFillOptions(box); else ensureGradientWindow(false);
+      syncGradientTool();
+    }, { class: 'evr-grad-win-close', title: '그라데이션 도구 끄기(채우기로)', 'aria-label': '그라데이션 도구 끄기' });
+    head.append(title, close);
+    head.addEventListener('pointerdown', event => {
+      const area = win.parentElement;
+      if (event.button !== 0 || event.target.closest('button') || !area) return;
+      event.preventDefault();
+      const a = area.getBoundingClientRect(), r = win.getBoundingClientRect(), dx = event.clientX - r.left, dy = event.clientY - r.top;
+      head.setPointerCapture(event.pointerId);
+      const move = e => { gradientWinPos = { x: e.clientX - a.left - dx, y: e.clientY - a.top - dy }; placeGradientWindow(win); };
+      const stop = () => {
+        head.removeEventListener('pointermove', move);
+        head.removeEventListener('pointerup', stop);
+        head.removeEventListener('pointercancel', stop);
+      };
+      head.addEventListener('pointermove', move);
+      head.addEventListener('pointerup', stop);
+      head.addEventListener('pointercancel', stop);
+    });
+    const sync = () => syncGradientWindow(win);
+    const kind = button('직선', () => { gradientFill.radial = !gradientFill.radial; sync(); },
+      { class: 'evr-brush-toggle evr-grad-kind', title: '직선: 누른 곳에서 놓은 곳 방향으로 / 원형: 누른 곳이 가운데, 놓은 곳까지가 반지름' });
+    const endWrap = document.createElement('label');
+    endWrap.className = 'evr-brush-level evr-grad-endwrap';
+    endWrap.title = '끝 색(시작 색은 엔트리 채우기 색)';
+    const endText = document.createElement('span');
+    endText.textContent = '끝 색';
+    const end = entryColorField(gradientFill.end, color => { gradientFill.end = color; gradientFill.endClear = false; sync(); }, 'evr-grad-end');
+    endWrap.append(endText, end);
+    const clear = button('끝 투명', () => { gradientFill.endClear = !gradientFill.endClear; sync(); },
+      { class: 'evr-brush-toggle evr-grad-clear', title: '끝을 투명하게(시작 색이 점점 사라짐)' });
+    const stepsWrap = document.createElement('label');
+    stepsWrap.className = 'evr-brush-level evr-grad-steps';
+    stepsWrap.title = '단계: 매끈하게 이어지는 대신 2~8단계 색 띠로 끊어 칠함(픽셀 아트)';
+    const stepsText = document.createElement('span');
+    stepsText.textContent = '단계';
+    const steps = document.createElement('input');
+    Object.assign(steps, { type: 'range', min: '1', max: String(GRADIENT_STEPS_MAX), step: '1' });
+    steps.className = 'evr-grad-steps-range';
+    steps.addEventListener('input', () => { gradientFill.steps = Number(steps.value); sync(); });
+    steps.addEventListener('keydown', event => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key))
+        event.stopPropagation();
+    });
+    const stepsValue = document.createElement('b');
+    stepsValue.className = 'evr-grad-steps-value';
+    stepsWrap.append(stepsText, steps, stepsValue);
+    const row = (...children) => { const div = document.createElement('div'); div.className = 'evr-grad-win-row'; div.append(...children); return div; };
+    win.append(head, row(kind), row(endWrap, clear), row(stepsWrap));
+    return win;
+  }
+  function syncGradientWindow(win) {
+    const kind = win.querySelector('.evr-grad-kind'), kindText = gradientFill.radial ? '원형' : '직선';
+    if (kind.textContent !== kindText) kind.textContent = kindText;
+    const clear = win.querySelector('.evr-grad-clear');
+    if (clear.getAttribute('aria-pressed') !== String(gradientFill.endClear)) clear.setAttribute('aria-pressed', String(gradientFill.endClear));
+    const end = win.querySelector('.evr-grad-end');
+    end.setColor(gradientFill.end);
+    if (end.dataset.off !== String(gradientFill.endClear)) end.dataset.off = String(gradientFill.endClear);
+    const steps = win.querySelector('.evr-grad-steps-range');
+    if (Number(steps.value) !== gradientFill.steps) steps.value = String(gradientFill.steps);
+    const stepsValue = win.querySelector('.evr-grad-steps-value'), stepsText = gradientFill.steps < 2 ? '매끈' : `${gradientFill.steps}`;
+    if (stepsValue.textContent !== stepsText) stepsValue.textContent = stepsText;
+  }
+  // ---- 그라데이션 채우기(1.3, 사용자 요청 3명) ----
+  // 그라데이션 도구에서 누른 채 끌어 방향을 정한다(포토샵·크리타 그라데이션 도구와 같은 끌기, Shift = 15° 단위). 칠하는 범위는 포토샵·
+  // 일러스트레이터 방식(사용자 결정 10-18 — 선으로 둘러싼 곳만 칠하니 "달고나 틀로 잘라 낸 것처럼 잘린다"): 비트맵 = 지금 레이어 전체(작업
+  // 영역)에 덮어 칠함(투명 잠금이면 칠해진 화소의 색만), 벡터 = 누른 도형의 칠 전체(도형 모양 그대로), 빈 곳이면 그림 칸 크기 사각형을 맨
+  // 아래(배경)에 — 맨 위면 그림을 다 덮으므로(내 결정). 끌지 않고 누르면 아무것도 안 한다. 시작 색 = 엔트리 채우기 색, 끝 색 = 확장 끝 색(투명이면 시작 색을
+  // 투명하게 — 캔버스 그라데이션은 미리 곱하지 않은 색으로 섞여 흰 투명으로 가면 중간이 뿌옇게 됨). 색 계산은 표준 그대로: 벡터 = paper
+  // 그라데이션(저장 SVG linear/radialGradient), 비트맵 = 캔버스 createLinearGradient/createRadialGradient. 단계(2~8, 픽셀 아트):
+  // 같은 위치에 색 정지점을 두 개씩 둬 띠로 끊는다. 원형은 누른 곳이 가운데, 놓은 곳까지가 반지름.
+  const gradientFill = { on: false, radial: false, end: '#ffffff', endClear: false, steps: 1 };
+  const GRADIENT_STEPS_MAX = 8;
+  const GRADIENT_DRAG_MIN = 4; // 화면 px — 이보다 덜 끌면 칠하지 않음
+  let gradientDrag = null; // { tool, event(누른 곳), end }
+  function gradientStops(paper, startValue) {
+    const a = new paper.Color(startValue || '#000000');
+    const b = gradientFill.endClear ? a.clone() : new paper.Color(gradientFill.end);
+    if (gradientFill.endClear) b.alpha = 0;
+    const n = gradientFill.steps;
+    if (n < 2) return [[a, 0], [b, 1]];
+    const mix = t => new paper.Color(a.red + (b.red - a.red) * t, a.green + (b.green - a.green) * t, a.blue + (b.blue - a.blue) * t,
+      (a.alpha ?? 1) + ((b.alpha ?? 1) - (a.alpha ?? 1)) * t);
+    const stops = [];
+    for (let i = 0; i < n; i++) { const color = mix(i / (n - 1)); stops.push([color, i / n], [color.clone(), (i + 1) / n]); }
+    return stops;
+  }
+  function gradientPaperColor(paper, startValue, start, end) {
+    return new paper.Color({ gradient: { stops: gradientStops(paper, startValue).map(([color, offset]) => new paper.GradientStop(color, offset)),
+      radial: gradientFill.radial }, origin: start, destination: end });
+  }
+  // 비트맵: 그림 화소 좌표의 시작·끝으로 그림 크기 그라데이션 화소(RGBA, 미리 곱하지 않음)
+  function gradientPixels(paper, startValue, w, h, s, e) {
+    const ctx = canvasOfSize(w, h).getContext('2d', { willReadFrequently: true });
+    const g = gradientFill.radial ? ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, Math.max(1e-6, s.getDistance(e)))
+      : ctx.createLinearGradient(s.x, s.y, e.x, e.y);
+    for (const [color, offset] of gradientStops(paper, startValue)) g.addColorStop(Math.min(1, Math.max(0, offset)), color.toCSS(false));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+    return ctx.getImageData(0, 0, w, h).data;
+  }
+  // Shift: 시작점에서 15° 단위 방향으로
+  function gradientEnd(start, point, shift) {
+    if (!shift) return point;
+    const v = point.subtract(start), step = Math.PI / 12, angle = Math.round(Math.atan2(v.y, v.x) / step) * step;
+    return start.add(new start.constructor(Math.cos(angle) * v.length, Math.sin(angle) * v.length));
+  }
+  // 끄는 동안 화면 위 방향선(그림 층에는 아무것도 넣지 않아 저장·되돌리기에 섞이지 않음)
+  function showGradientGuide(ep, start, end) {
+    const view = ep.project.view, canvas = view.element, rect = canvas.getBoundingClientRect();
+    const k = rect.width / view.viewSize.width, a = view.projectToView(start).multiply(k), b = view.projectToView(end).multiply(k);
+    const NS = 'http://www.w3.org/2000/svg';
+    let svg = document.querySelector('.evr-grad-guide');
+    if (!svg) {
+      svg = document.createElementNS(NS, 'svg');
+      svg.setAttribute('class', 'evr-grad-guide');
+      for (const tag of ['line', 'circle', 'circle']) svg.append(document.createElementNS(NS, tag));
+      document.body.append(svg);
+    }
+    Object.assign(svg.style, { left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
+    const [line, dot, ring] = svg.children;
+    for (const [key, value] of Object.entries({ x1: a.x, y1: a.y, x2: b.x, y2: b.y })) line.setAttribute(key, value);
+    for (const [key, value] of Object.entries({ cx: a.x, cy: a.y, r: 4 })) dot.setAttribute(key, value);
+    for (const [key, value] of Object.entries({ cx: a.x, cy: a.y, r: gradientFill.radial ? a.getDistance(b) : 0 })) ring.setAttribute(key, value);
+  }
+  function hideGradientGuide() { document.querySelector('.evr-grad-guide')?.remove(); }
+  function cancelGradientDrag() { gradientDrag = null; hideGradientGuide(); }
+  // 벡터: 그림 레이어 전체를 무대 크기 그림으로 그려 영역을 찾고, 윤곽을 경로로 만들어 누른 곳의 도형 바로 위(그 위 선들 아래)에 넣는다.
   function vectorRegionFill(ep, tool, event) {
     const found = paintLayer(ep);
     if (!found?.stage || !window.__evrD3Contour) return false;
@@ -9046,7 +10301,7 @@
     return true;
   }
   const FILL_SKIP = Symbol('채우지 않음');
-  // 비트맵: 그림(래스터) 화소에서 바로 영역을 찾아, 이미 있는 화소 아래로(destination-over) 칠한다
+  // 비트맵: 그림(래스터) 화소에서 바로 영역을 찾아, 이미 있는 화소 아래로(destination-over) 칠한다.
   function bitmapRegionFill(ep, tool, event) {
     const parts = paintLayer(ep);
     let raster = parts?.layer.children[0];
@@ -9068,7 +10323,10 @@
     const image = raster.getImageData(new ep.paper.Rectangle(0, 0, w, h)), d = image.data;
     // 선 밑으로 1.5 넓히기는 투명 잠금이면 하지 않는다: 잠금은 칠해진 화소 색만 바꾸므로 넓힌 띠에 든 선 안쪽 가장자리까지 색이
     // 바뀌었다(검토로 찾음 2026-10-16 — 잠금 없을 때는 불투명한 선 화소를 건너뛰어 괜찮음)
-    const region = fillRegion(d, w, h, sx, sy, regionFill.gap * perUnit, pixelPen.alphaLock ? 0 : FILL_EXPAND * perUnit);
+    // 경계(선)는 보이는 레이어를 모두 겹친 그림에서 찾는다(사용자 결정 10-18 — 레이어가 여럿이면 지금 레이어만 보고 찾아 선이 다른 레이어에
+    // 있으면 바깥까지 칠해졌음, 포토샵·이비스페인트의 '모든 레이어 참조'와 같은 방식). 칠은 지금 레이어에.
+    const bounds = visibleLayersPixels(ep, raster, w, h) || d;
+    const region = fillRegion(bounds, w, h, sx, sy, regionFill.gap * perUnit, pixelPen.alphaLock ? 0 : FILL_EXPAND * perUnit);
     if (!region) return null;
     const [R, G, B, A] = fillColorOf(ep.paper, tool.fillColor), fa0 = A / 255;
     for (let i = 0, p = 0; i < region.length; i++, p += 4) {
@@ -9089,6 +10347,120 @@
     const q = (sy * w + sx) * 4;
     return `rgba(${d[q]},${d[q + 1]},${d[q + 2]},${d[q + 3] / 255})`;
   }
+  // 누른 곳에 보이는 맨 위 도형. 칠해진 곳·선 위, 그리고 선만 있는 닫힌 도형의 안쪽(사용자 결정 10-19 — 엔트리 채우기와 같음).
+  // 보이지 않는 곳은 대상이 아니다(검토 L: 확장 클리핑의 기준 밖·엔트리 클립 묶음의 틀 밖·작업 영역 밖에서 숨은 도형이 칠해졌음):
+  // 숨김·불투명도 0·잠금·확장 도우미도 뺀다. 엔트리 그림판 안내선(선택 윤곽선 등)은 그림 층 밖이라 여기 없다.
+  function gradientTargetAt(ep, layer, stage, point) {
+    if (stage && !stage.contains(point)) return null;
+    const P = ep.paper;
+    const unitOf = item => { let unit = item; while (unit.parent && unit.parent !== layer) unit = unit.parent; return unit.parent === layer ? unit : null; };
+    const alphaAt = raster => {
+      if (!raster.width || !raster.height) return 0;
+      const at = raster.globalToLocal(point).add(new P.Point(raster.width / 2, raster.height / 2));
+      if (at.x < 0 || at.y < 0 || at.x >= raster.width || at.y >= raster.height) return 0;
+      return raster.getImageData(new P.Rectangle(Math.floor(at.x), Math.floor(at.y), 1, 1)).data[3];
+    };
+    // 이 항목이 누른 곳에 그려지는가(Item#contains는 부모 좌표 점을 받는다)
+    const paints = node => {
+      if (!node.visible) return false;
+      if (node.className === 'Raster') return alphaAt(node) > 0;
+      if (node.children && node.className !== 'CompoundPath') return node.children.some(child => !child.clipMask && paints(child));
+      if (node.contains(node.parent ? node.parent.globalToLocal(point) : point)) return true;
+      if (node.className === 'Path' && !node.closed && !node.hasFill()) return false; // 칠 없는 열린 선은 칠할 대상이 아니다
+      if (!node.hasStroke?.() || typeof node.getNearestPoint !== 'function') return false;
+      const local = node.globalToLocal(point), near = node.getNearestPoint(local);
+      return !!near && near.getDistance(local) <= (Number(node.strokeWidth) || 0) / 2;
+    };
+    const shownHere = node => {
+      for (let n = node; n && n !== layer; n = n.parent) {
+        if (!n.visible || n.opacity === 0 || n.locked) return false;
+        const mask = n.parent?.clipped && n.parent.children.find(child => child.clipMask);
+        if (mask && mask !== n && !mask.contains(n.parent.globalToLocal(point))) return false;
+      }
+      const unit = unitOf(node);
+      if (!unit || isLayerHelper(unit)) return false;
+      // 확장 클리핑 레이어: 기준이 숨었으면 안 보이고, 기준이 그려지는 곳에서만 보인다(hookClipDraw와 같은 규칙)
+      const base = unit.data?.evrClip ? clipBaseOf(unit) : null;
+      if (base && (!base.visible || !base.opacity || !paints(base))) return false;
+      return true;
+    };
+    const leaves = layer.getItems({ match: node => !node.clipMask && (node.className === 'Raster' || node.className === 'CompoundPath' ||
+      node.className === 'Shape' || node.className === 'PointText' || (node.className === 'Path' && node.parent?.className !== 'CompoundPath')) });
+    for (let i = leaves.length - 1; i >= 0; i--) if (shownHere(leaves[i]) && paints(leaves[i])) return leaves[i];
+    return null;
+  }
+  // 그라데이션 칠하기(포토샵·일러스트레이터 방식 — 위 그라데이션 설명). grad = { start, end }(그림 좌표). 바꿨으면 true.
+  function vectorGradientFill(ep, tool, point, grad) {
+    const parts = paintLayer(ep), P = ep.paper;
+    if (!parts) return false;
+    const target = gradientTargetAt(ep, parts.layer, parts.stage, point);
+    // 빈 곳은 칠하지 않는다(사용자 결정 10-19 — 예전엔 작업 영역 크기 배경 사각형을 깔아 저장 모양이 무대만 해졌음: 캐릭터 크기·충돌이 바뀜)
+    if (!target) { toast('도형 위에서 끄세요 — 빈 곳에서는 칠하지 않습니다.', 2500); return false; }
+    if (target.className === 'Raster') { toast('그림(이미지)에는 그라데이션을 칠할 수 없습니다 — 도형 위에서 끄세요.', 3000); return false; }
+    // paper는 그라데이션 점을 그 항목의 부모 좌표로 읽는다(Color#toCanvasStyle이 항목 행렬을 거꾸로 건다 — 검토 L, 엔트리 번들 paper 확인).
+    // 자기 변환을 가진 경로(엔트리 선 도구로 닫은 경로 = applyMatrix false, 옮기면 행렬에 남음)는 저장 SVG가 그 변환을 따로 적어 다시 열면 점이
+    // 어긋나므로 먼저 변환을 점에 반영한다(다시 연 뒤와 같은 상태).
+    // 돌리거나 늘린 글상자·SVG 도형(자기 변환이 남는 항목)도 칠한다 — 저장 SVG에서는 그 요소의 좌표로 읽히므로 저장 때 바꿔 쓴다
+    // (hookGradientSvgSpace — 10-19, 예전엔 안내만 띄움)
+    if ((target.className === 'Path' || target.className === 'CompoundPath') && !target.applyMatrix && !target.matrix.isIdentity()) target.applyMatrix = true;
+    const into = at => target.parent ? target.parent.globalToLocal(at) : at;
+    target.fillColor = gradientPaperColor(P, tool.fillColor, into(grad.start), into(grad.end));
+    return true;
+  }
+  function bitmapGradientFill(ep, tool, grad) {
+    const parts = paintLayer(ep), P = ep.paper;
+    let raster = parts?.layer.children[0];
+    if (!(raster instanceof P.Raster) || !raster.width || !raster.height) return null;
+    // 작업 영역 전체를 칠한다 — 그림이 작으면 넓힌다(픽셀 모양은 넓히지 않음 — 영역 채우기와 같은 까닭)
+    if (!pixelOf(window.Entry?.playground?.object?.selectedPicture) && plainRaster(raster)) {
+      raster = fillRasterToStage({ layer: parts.layer, stage: parts.stage, ep }) || raster;
+      delete raster.__evrSigBefore; // 영역 채우기와 같은 까닭(넓히기 전 요약은 뼈대 열기용 — 곧 칠하므로 버림, 검토 L)
+    }
+    const w = raster.width, h = raster.height;
+    const toPixel = at => raster.globalToLocal(at).add(new P.Point(w / 2, h / 2));
+    const image = raster.getImageData(new P.Rectangle(0, 0, w, h)), d = image.data;
+    const gd = gradientPixels(P, tool.fillColor, w, h, toPixel(grad.start), toPixel(grad.end));
+    // 픽셀 아트 모양(원래 해상도로 못 연 k배 그림)은 칸마다 한 색 — 칸 가운데 색으로(필터·사각 펜과 같은 칸, 검토 L)
+    const c = context(), grid = c && pixelOf(c.picture) ? editorScale(c) : 1;
+    if (grid > 1) {
+      for (let cy = 0; cy < h; cy += grid) for (let cx = 0; cx < w; cx += grid) {
+        const sx = Math.min(w - 1, cx + (grid >> 1)), sy = Math.min(h - 1, cy + (grid >> 1)), src = (sy * w + sx) * 4;
+        const r = gd[src], g = gd[src + 1], b = gd[src + 2], a = gd[src + 3];
+        for (let y = cy; y < Math.min(h, cy + grid); y++) for (let x = cx; x < Math.min(w, cx + grid); x++) {
+          const q = (y * w + x) * 4; gd[q] = r; gd[q + 1] = g; gd[q + 2] = b; gd[q + 3] = a;
+        }
+      }
+    }
+    for (let p = 0; p < d.length; p += 4) {
+      const da = d[p + 3] / 255, fa = gd[p + 3] / 255;
+      // 투명 잠금: 칠해진 화소의 불투명도는 그대로 두고 그라데이션 투명도만큼 색을 섞는다(source-atop — 검토 L: 예전엔 투명한 끝도 시작 색 100%)
+      if (pixelPen.alphaLock) {
+        if (da > 0) for (let k = 0; k < 3; k++) d[p + k] = gd[p + k] * fa + d[p + k] * (1 - fa);
+        continue;
+      }
+      // 보통 혼합(포토샵 그라데이션 기본): 그라데이션을 기존 화소 위에
+      const oa = fa + da * (1 - fa);
+      if (oa <= 0) continue;
+      for (let k = 0; k < 3; k++) d[p + k] = (gd[p + k] * fa + d[p + k] * da * (1 - fa)) / oa;
+      d[p + 3] = oa * 255;
+    }
+    raster.setImageData(image, new P.Point(0, 0));
+    return raster;
+  }
+  // 비트맵 레이어가 둘 이상이면 보이는 레이어를 화면처럼 겹친 그림(클리핑·불투명도 그대로 — composeLayers)을 지금 레이어 그림의 화소 자리에
+  // 맞춘 RGBA. 한 장이면 null(지금 레이어 화소를 그대로 씀).
+  function visibleLayersPixels(ep, raster, w, h) {
+    const meta = layerMeta(ep);
+    if (!meta || meta.layers.length < 2) return null;
+    // 지금 레이어는 지금 그림(방금 넓힌 그림 포함)의 사본으로 — 레이어 목록·그림 보관은 건드리지 않는다(검토 지적: 예전엔 채울 때마다
+    // 큰 사본을 보관에 쌓고 표시·레이어 창을 통째로 다시 그렸음)
+    const now = paintSnapshot(ep);
+    const all = flattenParts(clipGroups(meta.layers).map(group => groupComposite(group, layer => layer.id === meta.active ? now : layerContent(ep, meta, layer))).filter(Boolean));
+    if (!all) return null;
+    const k = w / raster.bounds.width, canvas = canvasOfSize(w, h), g = canvas.getContext('2d', { willReadFrequently: true });
+    g.drawImage(all.canvas, Math.round((all.x - raster.bounds.x) * k), Math.round((all.y - raster.bounds.y) * k), all.canvas.width * k, all.canvas.height * k);
+    return g.getImageData(0, 0, w, h).data;
+  }
   function ensureRegionFill(painter) {
     const ep = painter?.entryPaint;
     for (const graphics of ['VECTOR', 'BITMAP']) {
@@ -9100,39 +10472,112 @@
       if (graphics === 'VECTOR') {
         // 영역 채우기일 때는 엔트리의 "마우스를 올린 도형 색 미리 바꾸기"를 하지 않는다(누르면 그 도형을 칠해 버림)
         const move = tool.onMouseMove;
-        if (typeof move === 'function') tool.onMouseMove = function (event) { if (!regionFill.on) return move.call(this, event); };
+        if (typeof move === 'function') tool.onMouseMove = function (event) { if (!regionFill.on && !gradientFill.on) return move.call(this, event); };
         tool.__evrClearHover = () => { try { move?.call(tool, { point: new ep.paper.Point(-1e7, -1e7), item: null }); } catch {} };
-        tool.onMouseDown = function (event) {
-          event = wrapToolEvent(ep, event);
-          if (regionFill.on) {
+        const fillAt = (self, event, grad) => {
+          if (grad) {
+            // 엔트리 채우기의 마우스 올림 상태(그 도형에 채우기 색을 미리 칠하고 표시를 닮)를 먼저 지운다 — 남아 있으면 그 도형을 못 고르고 색도 남음(검토 L)
+            tool.__evrClearHover?.();
+            let changed = false;
+            try { changed = vectorGradientFill(ep, tool, event.point, grad); } catch (error) { console.warn('[entry-vector-rig] 그라데이션', error); }
+            if (!changed) return undefined; // 바뀐 것이 없으면 되돌리기 기록을 남기지 않는다(검토 L: 빈 기록 칸이 생기고 '수정됨'이 됐음)
+          } else if (regionFill.on) {
             try { vectorRegionFill(ep, tool, event); } catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
           }
-          // 영역 채우기일 때 엔트리 쪽은 고를 도형이 없어 되돌리기 기록만 남긴다
-          return down.call(this, event);
+          // 영역 채우기·그라데이션일 때 엔트리 쪽은 고를 도형이 없어 되돌리기 기록만 남긴다
+          return down.call(self, event);
         };
-      } else {
         tool.onMouseDown = function (event) {
+          const raw = event?.point;
           event = wrapToolEvent(ep, event);
-          if (!regionFill.on) return down.call(this, event);
+          if (gradientFill.on && event?.point) return startGradientDrag(ep, tool, event, raw);
+          // 놓기를 못 받아 남은 끌기는 버린다(남으면 다음 놓기가 옛 자리로 칠함 — 검토 지적)
+          if (gradientDrag) cancelGradientDrag();
+          return fillAt(this, event, null);
+        };
+        hookGradientDrag(ep, tool, fillAt);
+      } else {
+        const fillAt = (self, event, grad) => {
+          if (!grad && !regionFill.on) return down.call(self, event);
           let seedColor = null;
-          try { seedColor = bitmapRegionFill(ep, tool, event); } catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
-          if (seedColor === FILL_SKIP) return;
-          if (!seedColor) return down.call(this, event);
+          if (grad) {
+            let painted = false;
+            try {
+              const raster = bitmapGradientFill(ep, tool, grad);
+              painted = !!raster;
+              const at = raster && raster.globalToLocal(event.point).add(new ep.paper.Point(raster.width / 2, raster.height / 2));
+              if (at && at.x >= 0 && at.y >= 0 && at.x < raster.width && at.y < raster.height) {
+                const q = raster.getImageData(new ep.paper.Rectangle(Math.floor(at.x), Math.floor(at.y), 1, 1)).data;
+                seedColor = `rgba(${q[0]},${q[1]},${q[2]},${q[3] / 255})`;
+              } else if (raster) seedColor = FILL_SKIP; // 누른 곳이 그림 밖 — 엔트리 채우기로 넘기지 않음(되돌리기 기록은 아래)
+            } catch (error) { console.warn('[entry-vector-rig] 그라데이션', error); }
+            if (!painted) return undefined; // 못 칠했으면 엔트리 단색 채우기로 넘기지 않는다(검토 L)
+            if (seedColor === FILL_SKIP) { saveEntryHistory(ep); return undefined; }
+          } else {
+            try { seedColor = bitmapRegionFill(ep, tool, event); } catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
+          }
+          if (seedColor === FILL_SKIP) return undefined;
+          if (!seedColor) return down.call(self, event);
           // 엔트리 비트맵 채우기는 누른 곳이 이미 그 색이면 아무것도 안 하고 되돌리기 기록만 남긴다 — 그 길로 기록만 남긴다
           const color = tool.fillColor;
           tool.fillColor = seedColor;
-          try { return down.call(this, event); } finally { tool.fillColor = color; }
+          try { return down.call(self, event); } finally { tool.fillColor = color; }
         };
+        tool.onMouseDown = function (event) {
+          const raw = event?.point;
+          event = wrapToolEvent(ep, event);
+          if (gradientFill.on && event?.point) return startGradientDrag(ep, tool, event, raw);
+          if (gradientDrag) cancelGradientDrag();
+          return fillAt(this, event, null);
+        };
+        hookGradientDrag(ep, tool, fillAt);
       }
     }
+  }
+  // 그라데이션 끌기: 누를 때 칠할 곳(영역은 누른 곳 기준)을 기억하고, 끄는 동안 방향선만 보이고, 놓을 때 칠한다(엔트리 쪽 누르기
+  // 처리 — 되돌리기 기록 — 도 그때 부른다). 무한 배경에서 누른 곳이 칸 안으로 접혔으면 끝점도 같은 만큼 옮긴다.
+  // paper 도구 이벤트의 point는 읽을 때마다 지금 마우스 자리를 준다(ToolEvent#getPoint → tool._point 복사) — 누른 순간 자리를 복사해
+  // 고정한 사본을 남긴다(그대로 두면 놓을 때 읽혀 시작점 = 끝점이 됨, 시험으로 잡음).
+  function startGradientDrag(ep, tool, event, raw) {
+    const point = event.point.clone();
+    gradientDrag = { tool, event: Object.create(event, { point: { value: point } }), raw: (raw || point).clone() };
+    showGradientGuide(ep, gradientDrag.raw, gradientDrag.raw);
+    return undefined;
+  }
+  function hookGradientDrag(ep, tool, fillAt) {
+    const drag = tool.onMouseDrag, up = tool.onMouseUp;
+    // Shift는 마우스 이벤트에서 읽는다(paper Key.modifiers는 키보드 이벤트로만 바뀜)
+    const shiftOf = event => !!(event.event?.shiftKey || event.modifiers?.shift);
+    tool.onMouseDrag = function (event) {
+      if (gradientDrag?.tool !== tool) return drag?.call(this, event);
+      showGradientGuide(ep, gradientDrag.raw, gradientEnd(gradientDrag.raw, event.point, shiftOf(event)));
+      return undefined;
+    };
+    tool.onMouseUp = function (event) {
+      if (gradientDrag?.tool !== tool) return up?.call(this, event);
+      const job = gradientDrag;
+      cancelGradientDrag();
+      const rawEnd = gradientEnd(job.raw, event.point, shiftOf(event));
+      const view = ep.project.view;
+      const moved = view.projectToView(job.raw).getDistance(view.projectToView(rawEnd)) >= GRADIENT_DRAG_MIN;
+      const end = rawEnd.add(job.event.point.subtract(job.raw));
+      // 끌지 않고 누르면 칠하지 않는다(포토샵 그라데이션 도구처럼 끌어야 칠함)
+      const result = moved ? fillAt(this, job.event, { start: job.event.point, end }) : undefined;
+      // 엔트리 쪽 누르기(fillAt 안)에 맞춰 놓기 처리도 부른다(다른 도구 훅과 같이 — 검토 지적)
+      up?.call(this, event);
+      return result;
+    };
   }
   // 채우기 옵션 줄 끝에 영역 채우기·틈 막기
   function ensureFillOptions(painter) {
     const ep = painter?.entryPaint, active = ep?.paper?.tool;
     const isFill = active?.MY_MODE?.toolMode === 'FILL';
+    // 끄는 도중 도구가 바뀌었으면 그라데이션 끌기를 버린다(방향선이 남지 않게)
+    if (gradientDrag && gradientDrag.tool !== active) cancelGradientDrag();
     const bar = document.querySelector('#entryPainter .bottom_area > div');
     let box = document.querySelector('#entryPainter .evr-fill-opts');
-    if (!isFill || !bar) { box?.remove(); return; }
+    if (!isFill && gradientFill.on) { gradientFill.on = false; cancelGradientDrag(); }
+    if (!isFill || !bar) { box?.remove(); ensureGradientWindow(false); return; }
     if (!box) box = buildFillOptions(ep);
     box.dataset.graphics = active.MY_MODE.graphicsMode;
     placeOptionBox(bar, box);
@@ -9146,6 +10591,7 @@
     title.textContent = '영역 채우기';
     const toggle = button('영역 채우기', () => {
       regionFill.on = !regionFill.on;
+      cancelGradientDrag();
       // 켜는 순간 엔트리가 미리 바꿔 둔 도형 색을 되돌린다
       if (regionFill.on) ep.paper.tools.forEach(tool => tool.__evrClearHover?.());
       syncFillOptions(box);
@@ -9185,7 +10631,15 @@
     const label = regionFill.gap ? `${regionFill.gap}px` : '끔';
     const value = box.querySelector('.evr-brush-level b');
     if (value.textContent !== label) value.textContent = label;
-    if (box.dataset.off !== String(!regionFill.on)) box.dataset.off = String(!regionFill.on);
+    // 그라데이션 도구: 영역 채우기 켜기 단추·틈 막기는 숨김(칠하는 범위는 레이어 전체·도형 — 위 그라데이션 설명)
+    const off = !regionFill.on && !gradientFill.on;
+    if (box.dataset.off !== String(off)) box.dataset.off = String(off);
+    if (toggle.hidden !== gradientFill.on) toggle.hidden = gradientFill.on;
+    const gapLevel = box.querySelector('.evr-brush-level'); // 틈 막기 — 그라데이션은 선으로 둘러싼 곳을 찾지 않으므로 숨김
+    if (gapLevel.hidden !== gradientFill.on) gapLevel.hidden = gradientFill.on;
+    const title = box.querySelector('.evr-brush-title'), titleText = gradientFill.on ? '그라데이션' : '영역 채우기';
+    if (title.textContent !== titleText) title.textContent = titleText;
+    ensureGradientWindow(gradientFill.on);
   }
   // ---- 고른 도형 투명도(벡터) ----
   // 엔트리 그림판에는 투명도 조절이 없다. 선택 도구로 고른 도형·이미지(레이어)의 불투명도(paper opacity, 저장 SVG의
@@ -9289,7 +10743,28 @@
   // SVG clipPath에도 칠이 안 남는다. 예전엔 틀 자신 것만 적어 둬, 묶음(엔트리봇 조각 등)을 틀로 했다 풀면 안 도형 색이 모두 사라졌다
   // (사용자 제보 "클리핑을 풀면 그림이 사라짐" — 실제 엔트리 재현). 틀과 그 안 항목마다 적어 두고 되살린다(위 항목부터 — 묶음 색을 먼저 칠한 뒤
   // 자식 색으로 덮음).
-  const maskCss = color => color && color.type !== 'gradient' ? color.toCSS(true) : null;
+  // 색은 글(CSS)로, 그라데이션은 정지점·점 자리로 적는다(저장 SVG의 data에도 남음). 예전엔 그라데이션을 빼고 적어, 그라데이션 칠한 도형을
+  // 틀로 했다 풀면 칠이 사라졌다(10-19 찾음). 색 글은 rgba로 적는다 — 16진 글(toCSS(true))은 투명도를 버려, 끝이 투명한 그라데이션·반투명
+  // 틀이 풀면 불투명해졌다(검토 M, 시험 재현). 예전에 적은 16진 글도 그대로 읽힌다.
+  const maskCss = color => {
+    if (!color) return null;
+    if (color.type !== 'gradient') return color.toCSS(false);
+    const at = point => point ? [point.x, point.y] : null;
+    return { gradient: { stops: color.gradient.stops.map(stop => [stop.color.toCSS(false), stop.offset]), radial: !!color.gradient.radial },
+      origin: at(color.origin), destination: at(color.destination), highlight: at(color.highlight) };
+  };
+  const maskColorOf = (P, value) => typeof value === 'string' ? new P.Color(value) : new P.Color({
+    gradient: { stops: value.gradient.stops.map(([css, offset]) => new P.GradientStop(new P.Color(css), offset)), radial: value.gradient.radial },
+    origin: value.origin, destination: value.destination, ...(value.highlight ? { highlight: value.highlight } : {}) });
+  // 적어 둔 틀 색에 색 필터를 건다(벡터 필터 — 틀은 칠이 지워져 있어 적어 둔 색에 걸어야 [마스크 풀기] 뒤에도 필터 색, 10-19 고침)
+  function filterMaskStyle(P, style, css) {
+    const one = value => {
+      if (!value) return value;
+      if (typeof value === 'string') return filterColor(P, new P.Color(value), css).toCSS(false);
+      return { ...value, gradient: { ...value.gradient, stops: value.gradient.stops.map(([c, offset]) => [filterColor(P, new P.Color(c), css).toCSS(false), offset]) } };
+    };
+    return { ...style, fill: one(style.fill), stroke: one(style.stroke) };
+  }
   function saveMaskStyles(mask) {
     for (const item of [mask, ...mask.getItems({})]) {
       const fill = maskCss(item.fillColor), stroke = maskCss(item.strokeColor);
@@ -9299,8 +10774,8 @@
   function restoreMaskStyle(P, item) {
     const style = item.data?.evrMaskStyle;
     if (!style) return;
-    if (style.fill) item.fillColor = new P.Color(style.fill);
-    if (style.stroke) { item.strokeColor = new P.Color(style.stroke); item.strokeWidth = style.width || 1; }
+    if (style.fill) item.fillColor = maskColorOf(P, style.fill);
+    if (style.stroke) { item.strokeColor = maskColorOf(P, style.stroke); item.strokeWidth = style.width || 1; }
     delete item.data.evrMaskStyle;
   }
   function restoreMaskStyles(P, mask) {
@@ -9351,6 +10826,31 @@
   // 묶음을 지움 — 외부 SVG의 잘라 보이기용). 확장이 만든 클리핑 마스크면 틀이 사용자 그림이라 통째로 사라졌다(사용자 제보 "클리핑을 풀면
   // 그림이 사라짐", 실제 엔트리 재현). 고른 것이 확장 마스크 묶음(틀에 색 기록)이면 엔트리 대신 [마스크 풀기]로 푼다. 다른 묶음은 엔트리 그대로.
   let ungroupHooked = false;
+  // 엔트리 [그룹 해제](Un)는 자식 행렬에 묶음 행렬을 붙여 모양만 옮기고 칠은 옮기지 않는다(t.matrix.prepend(e.matrix) → transform(null) —
+  // 번들 확인). paper는 그라데이션 점을 항목의 부모 좌표로 읽으므로, 옮겨 둔 엔트리 묶음 안 도형의 그라데이션이 풀고 나면 묶음을 옮긴 만큼
+  // 어긋났다(검토 M, 시험 재현). 엔트리가 푼 뒤 묶음에서 나온 자식(도형·겹친 경로 — 안쪽 묶음은 paper가 손자 칠까지 옮기거나 자기 행렬로
+  // 들고 감)의 그라데이션을 같은 묶음 행렬로 옮긴다. 엔트리는 풀 때 되돌리기 기록을 남기지 않아(번들 확인) 다음 기록에 고친 색이 들어간다.
+  function keepGradientsOnUngroup(ep) {
+    if (ep?.mode !== 'VECTOR') return;
+    const picked = paintStore()?.getState().paint?.selectedItems || []; // 엔트리 onUnGroup이 보는 선택
+    const group = picked.length === 1 && picked[0]?.className === 'Group' ? picked[0] : null;
+    if (!group || !group.matrix || group.matrix.isIdentity()) return;
+    const matrix = group.matrix.clone(), kids = group.children.slice();
+    setTimeout(() => {
+      try {
+        for (const kid of kids) {
+          if (kid.parent === group || !kid.isInserted() || (kid.children && kid.className !== 'CompoundPath')) continue;
+          for (const key of ['fillColor', 'strokeColor']) {
+            const color = kid[key];
+            if (!color?.gradient) continue;
+            const moved = new ep.paper.Color(color);
+            moved.transform(matrix);
+            kid[key] = moved;
+          }
+        }
+      } catch (error) { console.warn('[entry-vector-rig] 그룹 해제 뒤 그라데이션 자리', error); }
+    }, 0);
+  }
   function ownMaskGroup(ep) {
     if (ep?.mode !== 'VECTOR') return null;
     const picked = selectedPaintItems(ep);
@@ -9364,7 +10864,14 @@
     ungroupHooked = true;
     const take = event => {
       const ep = window.Entry?.playground?.painter?.entryPaint;
-      if (!ownMaskGroup(ep)) return false;
+      // 기준점 상자(확장 도우미 묶음)만 골려 있으면 풀지 않는다 — 풀면 상자가 1% 점 네 개의 보통 도형이 되어 그림·저장에 섞였다(10-19 시험 중 찾음)
+      const picked = ep?.mode === 'VECTOR' ? selectedPaintItems(ep) : [];
+      if (picked.length === 1 && isLayerHelper(picked[0])) {
+        event.preventDefault(); event.stopImmediatePropagation();
+        toast('기준점 상자는 그룹 해제하지 않습니다 — 그림 도형을 골라 주세요.', 2500); // 알림 없이 아무 일도 없으면 고장처럼 보임(검토 M)
+        return true;
+      }
+      if (!ownMaskGroup(ep)) { keepGradientsOnUngroup(ep); return false; }
       event.preventDefault();
       event.stopImmediatePropagation();
       releaseClipMask(ep);
@@ -9418,14 +10925,18 @@
     if (painter) {
       ensureSaveHook(painter);
       ensureLoadHook(painter);
+      try { ensureSvgIdFix(painter); } catch (error) { console.warn('[entry-vector-rig] SVG 이름 겹침', error); }
+      try { watchVectorPick(); } catch (error) { console.warn('[entry-vector-rig] 레이어 창 고른 줄', error); }
       try { ensurePainterNav(painter); } catch (error) { console.warn('[entry-vector-rig] 편집기 이동·확대', error); }
       try { ensureSmoothBrush(painter); ensureBrushOptions(painter); }
       catch (error) { console.warn('[entry-vector-rig] 부드러운 붓', error); }
-      try { ensureRegionFill(painter); ensureFillOptions(painter); }
+      try { ensureSelectKeepsAlpha(painter); } catch (error) { console.warn('[entry-vector-rig] 선택 반투명 지키기', error); }
+      try { ensureRegionFill(painter); ensureFillOptions(painter); ensureGradientTool(); }
       catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
       try { ensurePixelPen(painter); ensurePixelPenOptions(painter); }
       catch (error) { console.warn('[entry-vector-rig] 사각 펜·투명 잠금', error); }
       try { normalizeVectorLayers(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 벡터 레이어 정리', error); }
+      try { checkFilterPanel(painter); } catch (error) { console.warn('[entry-vector-rig] 필터 창', error); }
       try { refreshLayers(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 레이어', error); }
       try { fixStrayClipMasks(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 클리핑 마스크 정리', error); }
       try { healEntryOutlines(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 선택 윤곽선 맞추기', error); }
@@ -9433,6 +10944,8 @@
       try { ensureOpacityOptions(painter); } catch (error) { console.warn('[entry-vector-rig] 투명도', error); }
       try { ensureCanvasArea(painter); } catch (error) { console.warn('[entry-vector-rig] 캔버스 크기', error); }
     }
+    // 그림판이 아직 없어도(모양 탭을 열기 전) 그림판 클래스를 미리 감싼다 — 첫 그림부터 SVG 이름 겹침을 고친다
+    try { hookSvgIdProto(window.EntryPaint?.default?.prototype); } catch (error) { console.warn('[entry-vector-rig] SVG 이름 겹침', error); }
     ensurePixelDrawHook();
     const entity = window.Entry?.container?.selectedObject?.entity;
     if (entity?.setImage) ensurePivotHook(entity);
@@ -9456,7 +10969,8 @@
     restorePixelFileurls();
     try { ownPixelPictures(); } catch (error) { console.warn('[entry-vector-rig] 모양 자기 파일', error); }
     try { hookLoadRepair(); } catch (error) { console.warn('[entry-vector-rig] 모양 주소 잇기', error); }
-    try { hookProjectSave(); } catch (error) { console.warn('[entry-vector-rig] 작품 저장 확인', error); }
+    try { hookDraftMenu(); } catch (error) { console.warn('[entry-vector-rig] 그림 임시저장 메뉴', error); }
+    try { checkEntryPicker(); } catch (error) { console.warn('[entry-vector-rig] 엔트리 색 고르기 창', error); }
     // 모양을 바꾸는 틈(context()가 비어 있음)에는 십자·뼈대 버튼·도구 막대를 지우지 않고 그대로 둔다 — 지웠다 다시 만들면 켜 둔
     // "그림 전체 이동" 같은 모드가 풀렸다(검토로 찾음 2026-10-16)
     if (!pictureSwitching()) {
