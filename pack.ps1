@@ -33,6 +33,14 @@ $run = Get-Content -Raw -Encoding UTF8 $runPath | ConvertFrom-Json
 if ($run.version -ne $manifest.version) { Stop-Release "시험 기록 버전($($run.version))이 manifest($($manifest.version))와 다릅니다" }
 if ($run.contentHash -ne $contentHash) { Stop-Release '시험을 돌린 뒤 확장 파일이 바뀌었습니다 — 전체 시험을 다시 돌리세요' }
 if (-not $run.allPassed) { Stop-Release '전체 시험에 통과 못 한 것이 있습니다' }
+# 시험 폴더의 시험은 모두 이번 기록에 있어야 한다 — 시험을 새로 넣고 전체 시험을 다시 안 돌리면 새 시험이 관문을 거치지 않고 빠졌다(2026-10-19
+# 모양 섞임 시험을 넣으며 찾음, 사용자 "내가 테스트를 한다고 가정하지 말고"). 시험 폴더가 없는 사본(GitHub 사본)은 기록의 통과만 본다.
+$caseDir = Join-Path $root 'tests\cases'
+if (Test-Path $caseDir) {
+  if (-not $run.caseFiles) { Stop-Release '전체 시험 기록에 시험 파일 목록이 없습니다(예전 기록) — 전체 시험을 다시 돌리세요' }
+  $notRun = @(Get-ChildItem $caseDir -Filter '*.js' -File | ForEach-Object { $_.Name } | Where-Object { @($run.caseFiles) -notcontains $_ })
+  if ($notRun.Count) { Stop-Release "전체 시험 기록에 없는 시험이 있습니다($($notRun -join ', ')) — 전체 시험을 다시 돌리세요" }
+}
 $reviewPath = Join-Path $root "release\review-$($manifest.version).json"
 if (-not (Test-Path $reviewPath)) { Stop-Release "이 버전의 독립 검토 기록(release\review-$($manifest.version).json)이 없습니다" }
 $review = Get-Content -Raw -Encoding UTF8 $reviewPath | ConvertFrom-Json

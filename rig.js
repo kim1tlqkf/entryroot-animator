@@ -441,6 +441,16 @@
         toast('모양 그림을 불러오는 중이라 저장하지 않았습니다. 그림이 보인 뒤 다시 저장하세요.', 5000);
         return undefined;
       }
+      // 그림판 파일 이름은 그 파일 id의 모양 이름으로 맞춘다. 엔트리 모양 목록의 이름 칸은 칸을 떠날 때(blur) 열린 모양이 아니어도 그림판 파일
+      // 이름을 그 칸 모양 이름으로 바꾼다(entry.min.js 이름 칸: painter.file.name = 칸 글, id 확인 없음). 그린 뒤 다음 모양의 이름 칸을 눌러
+      // "저장할까요?" [확인]을 누르면 그 순간 이름 칸을 떠나, 저장한 앞 모양이 다음 모양 이름이 됐다(10-19 사용자 제보 "ID로 관리돼지 않아서
+      // 섞이는게 발생" 조사 중 확장 없이도 재현 — 이름이 둘 다 같아짐). 모양 이름을 직접 고치면 엔트리가 모양 정보 이름도 같이 바꾸므로 그대로다.
+      try {
+        const file = this.file, E = window.Entry;
+        const owner = (file?.objectId && E?.container?.getObject?.(file.objectId)) || E?.playground?.object;
+        const model = owner?.pictures?.find?.(picture => picture.id === file.id);
+        if (model && typeof model.name === 'string' && file.name !== model.name) file.name = model.name;
+      } catch (error) { console.warn('[entry-vector-rig] 모양 이름 맞추기', error); }
       // 비트맵 레이어: 저장하는 동안만 그림 층에 합친 그림을 넣는다(아래 무한 배경·기준점 상자·PNG 처리가 모두 합친 그림으로)
       let layerSwap = null;
       try { layerSwap = beginLayerSave(this.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 레이어 저장 준비 실패', error); }
@@ -1080,6 +1090,23 @@
     if (proto.__entryVectorLoadHook || typeof proto.addPicture !== 'function') return;
     const original = proto.addPicture;
     Object.defineProperty(proto, '__entryVectorLoadHook', { value: true });
+    // 엔트리는 번호(id) 없는 모양이면(오브젝트가 하나도 없을 때 — injectPicture가 빈 pictureSelected를 냄) addPicture를 거치지 않고 그림판만
+    // 비운다(entry.min.js afterModified). 그 사이 확장이 받던 앞 모양 그림이 그 뒤에 와서 빈 그림판에 들어갔다(10-19 시험: 오브젝트를 모두 지우면
+    // 지운 오브젝트 그림이 남음 — 엔트리만으로도 같음). 받던 표식을 새로 바꿔 늦게 온 그림을 버리고 불러오는 중 상태를 푼다.
+    if (typeof proto.afterModified === 'function') {
+      const afterModified = proto.afterModified;
+      proto.afterModified = function (picture, ...rest) {
+        if (!picture?.id) {
+          try {
+            this.__evrLoadToken = {};
+            this.__evrLoading = null;
+            clearTimeout(this.__evrLoadingTimer); clearTimeout(this.__evrLoadingSlowTimer);
+            showLoadingCover(this, false);
+          } catch (error) { console.warn('[entry-vector-rig] 번호 없는 모양', error); }
+        }
+        return afterModified.call(this, picture, ...rest);
+      };
+    }
     proto.addPicture = function (picture = {}, isImport, ...rest) {
       // 모양 바꾸기(afterModified)만 두 번째 인자가 참이다. 다른 호출은 엔트리 그대로 둔다.
       if (!isImport) return original.call(this, picture, isImport, ...rest);
