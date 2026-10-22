@@ -88,7 +88,29 @@ foreach ($change in @($changes.changes)) {
     default { Stop-Release "$label`: 출처 종류(origin)가 request·fix·hardening·removal이 아닙니다($($change.origin))" }
   }
 }
-Write-Output "출시 관문 통과: 시험 $(@($run.cases).Count)종 모두 통과($($run.at)), 검토 지적 $(@($review.findings).Count)개 처리됨, 바뀐 점 $(@($changes.changes).Count)개 출처 확인"
+# 4) release\open-risks.json — 시험이 닿지 않는 사용자 경로 목록(버전과 상관없이 이어짐). 가짜 서버 시험이 거치지 않는 길(실제 서버 왕복, 확장 없이
+#    .ent 열기, 재현 못 한 제보)에서 결함이 나왔다. 항목마다 tested(그 길을 거치는 시험이 이번 전체 시험 PASS — 실제 서버 길(realServer)은 안 됨) /
+#    verified(실제 환경 확인 증거 evidence + 사용자 확인 원문 quote) / accepted(사용자가 결과를 알고 받아들인 원문 quote + consequence) 중 하나.
+#    open이 하나라도 남으면 막는다.
+$risksPath = Join-Path $root 'release\open-risks.json'
+if (-not (Test-Path $risksPath)) { Stop-Release '미확인 경로 목록(release\open-risks.json)이 없습니다' }
+$risks = Get-Content -Raw -Encoding UTF8 $risksPath | ConvertFrom-Json
+$openRisks = @()
+foreach ($risk in @($risks.risks)) {
+  $label = "미확인 경로 $($risk.id)"
+  if (-not $risk.id -or -not $risk.path) { Stop-Release "$label`: id·path가 없습니다" }
+  switch ($risk.status) {
+    'tested' {
+      if ($risk.realServer -eq $true) { Stop-Release "$label`: 실제 서버 길은 가짜 서버 시험으로 닫을 수 없습니다 — verified(실제 확인) 또는 accepted로" }
+      if (-not (& $passedTest $risk.test)) { Stop-Release "$label`: 확인했다는 시험($($risk.test))이 이번 전체 시험에서 통과하지 않았습니다" }
+    }
+    'verified' { if (-not $risk.evidence -or -not $risk.quote) { Stop-Release "$label`: 실제로 확인했다는데 증거(evidence)·사용자 확인 원문(quote)이 없습니다" } }
+    'accepted' { if (-not $risk.quote -or -not $risk.consequence) { Stop-Release "$label`: 받아들였다는데 사용자 원문(quote)·결과 설명(consequence)이 없습니다" } }
+    default { $openRisks += "$($risk.id)" }
+  }
+}
+if ($openRisks.Count) { Stop-Release "확인 못 한 사용자 경로가 남아 있습니다($($openRisks -join ', ')) — release\open-risks.json" }
+Write-Output "출시 관문 통과: 시험 $(@($run.cases).Count)종 모두 통과($($run.at)), 검토 지적 $(@($review.findings).Count)개 처리됨, 바뀐 점 $(@($changes.changes).Count)개 출처 확인, 미확인 경로 $(@($risks.risks).Count)개 닫힘"
 
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force $dist | Out-Null

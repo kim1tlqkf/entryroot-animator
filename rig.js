@@ -381,7 +381,7 @@
   }
   // 엔트리 비트맵 저장(getDataURL)처럼 무대 밖을 자르고 투명하지 않은 범위로 줄인 원래 해상도 그림.
   function savedBitmapArt(c) {
-    const raster = c.layer.rasterize({ resolution: 72, insert: false });
+    const raster = ownRasterize(c.layer, { resolution: 72, insert: false });
     const bounds = raster.bounds, stage = c.stage || bounds;
     const left = Math.max(0, Math.round(stage.left - bounds.left));
     const top = Math.max(0, Math.round(stage.top - bounds.top));
@@ -482,9 +482,20 @@
           const raster = sc.layer.children.find(item => isRasterLayer(item) && item.data?.[BONES]);
           let rig = null;
           try { rig = raster && JSON.parse(raster.data[BONES]); } catch { rig = null; }
+          if (rig) rig = rigMovedTo(rig, rasterSig(raster));
           bitmapRig = !raster ? undefined : rig && validRig(rig) && rig.joints.length > 1 ? bitmapRigRecord(sc, rig, false) : null;
           if (rig && bitmapRig && this.file?.mode === 'new' && sc.picture.dimension)
             sc.picture.dimension[BITMAP_RIG] = bitmapRigRecord(sc, rig, true);
+          // 레이어 모양의 관절은 레이어마다 레이어 원본에 담는다(layerSvg). 모양 하나짜리 기록은 지운다 — 남기면 다시 열 때 지금 레이어에 붙는다.
+          // k배 픽셀 모양은 다시 열 때 레이어를 읽지 않고 합친 그림으로 여므로 기록을 그대로 둔다.
+          // 레이어를 한 장으로 줄여 저장하면 그 레이어 뼈대(파일에서 읽고 아직 안 연 관절, 필터 등으로 그림 data가 비어 레이어 쪽에만 남은 뼈대)를
+          // 모양 기록으로 남긴다.
+          const meta = layerMeta(this.entryPaint);
+          if (layerSwap) { if (!(pixelOf(sc.picture) > 1)) bitmapRig = null; }
+          else if (bitmapRig === undefined && meta) {
+            const record = layerJointsRecord(activeLayer(meta), crossPoint(sc));
+            if (record) bitmapRig = JSON.stringify(record);
+          }
         }
       } catch (error) { console.warn('[entry-vector-rig] 비트맵 뼈대 기록 실패', error); }
       if (!tile) {
@@ -522,8 +533,11 @@
       const E = window.Entry, previousDispatch = E.dispatchEvent;
       const ownDispatch = Object.prototype.hasOwnProperty.call(E, 'dispatchEvent');
       // 비트맵 레이어는 같은 저장 요청에 레이어 원본 SVG를 붙인다(보이는 것은 엔트리가 만든 합친 PNG).
+      // 모양 크기는 이때 실린 그림으로 잰다 — 저장 뒤엔 그림 층이 지금 레이어 한 장으로 돌아가 그 레이어 크기가 나온다.
+      let sentImage = null;
       if (pixelSvg || layerSwap) E.dispatchEvent = function (name, payload, ...rest) {
         if (name === 'saveCanvasImage' && payload?.file) {
+          sentImage = payload.image;
           let svg = pixelSvg;
           try { if (layerSwap) svg = layerSvg(layerSwap, payload.image, pixelSvg) || pixelSvg; }
           catch (error) { console.warn('[entry-vector-rig] 레이어 SVG 만들기 실패', error); }
@@ -551,7 +565,7 @@
       if (tile) pendingSaves.push({ object: tile.c.object, pictureId: tile.c.picture.id, mode: tile.mode,
         before: tile.before, size: pngSize(tile.png), tile: true, pixel: tile.pixel, pixelSvg: !!tile.svg, bitmapRig, layers: layerCount, at: Date.now() });
       try {
-        const size = prepared && (pngSize(fullPng) || savedSize(prepared.c, this.file?.svg));
+        const size = prepared && (pngSize(fullPng) || (layerSwap && pngSize(sentImage)) || savedSize(prepared.c, this.file?.svg));
         if (size) pendingSaves.push({ object: prepared.c.object,
           pictureId: prepared.c.picture.id, mode: prepared.mode,
           before: prepared.before, size, art: prepared.art, pixel: prepared.pixel, tile: vectorTile,
@@ -1336,7 +1350,7 @@
         const carried = picture.dimension[LAYER_ENT];
         if (!response.ok && !carried) throw Error(`레이어 SVG를 받을 수 없습니다 (${response.status})`);
         const text = response.ok ? await response.text() : entLayerSvgText(carried);
-        const read = await readLayerSvg(text, painter.entryPaint);
+        const read = await readLayerSvg(text, painter.entryPaint, picture.dimension[BITMAP_RIG]);
         if (read) return { ...picture, imageType: 'png', fileurl: read.frame.toDataURL('image/png'), __evrLayers: read.meta };
       } catch (error) { console.warn('[entry-vector-rig] 레이어 모양 열기 실패 — 합친 그림으로 엽니다', picture.name, error); }
     }
@@ -4227,6 +4241,9 @@
           const joints = bitmapMode(s) ? savedBitmapJoints(s) : null;
           rig = joints ? bitmapRigBase(s, item, joints) : null;
           if (rig) rig.sig = rasterSig(item);
+          // 파일에서 읽은 레이어 관절은 이제 그림 data 뼈대가 이어 간다(남겨 두면 관절을 다 지워도 다음에 열 때 되살아난다)
+          const meta = rig && layerMeta(s.ep), kept = meta && layerBonesOf(activeLayer(meta));
+          if (kept && !kept.bones) delete activeLayer(meta).bonesRef;
         }
         if (!validRig(rig)) {
           // 뼈대가 없는 그림은 지금 그림이 휘기 전 그림이다 — 묶음에서 풀었거나 관절을 모두 지운 뒤 남은 옛 휘기 전 그림(같은 탭 기억·그림 데이터)을
@@ -4697,13 +4714,31 @@
   // 무거우므로 끄는 동안에는 재지 않고 기록할 때(persist)만 잰다. 화소는 하나도 건너뛰지 않는다(건너뛰면 1px 획을 못 알아봐
   // 휜 그림을 휘기 전 그림으로 잘못 잡을 수 있었다 — 검토로 찾음). 자리(x, y)는 따로 둬 옮기기만 한 것을 알아본다.
   function rasterSig(raster) {
-    let h = 2166136261;
-    try {
-      const data = raster.getImageData({ x: 0, y: 0, width: raster.width, height: raster.height }).data;
-      for (let i = 0; i < data.length; i += 4) h = Math.imul(h ^ (data[i] | data[i + 1] << 8 | data[i + 2] << 16 | data[i + 3] << 24), 16777619);
-    } catch { h = 0; }
+    let data = null;
+    try { data = raster.getImageData({ x: 0, y: 0, width: raster.width, height: raster.height }).data; } catch { data = null; }
     const b = raster.bounds;
-    return { abs: `${(h >>> 0).toString(36)}:${raster.width}x${raster.height}`, x: clean(b.x), y: clean(b.y) };
+    return { abs: `${pixelHash(data)}:${raster.width}x${raster.height}`, x: clean(b.x), y: clean(b.y) };
+  }
+  // 레이어 사본({ canvas, x, y })의 같은 요약
+  function contentSig(content) {
+    const { canvas } = content;
+    let data = null;
+    try { data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data; } catch { data = null; }
+    return { abs: `${pixelHash(data)}:${canvas.width}x${canvas.height}`, x: clean(content.x), y: clean(content.y) };
+  }
+  function pixelHash(data) {
+    let h = 2166136261;
+    if (data) for (let i = 0; i < data.length; i += 4) h = Math.imul(h ^ (data[i] | data[i + 1] << 8 | data[i + 2] << 16 | data[i + 3] << 24), 16777619);
+    else h = 0;
+    return (h >>> 0).toString(36);
+  }
+  // 뼈대를 기록한 뒤 그림만 옮겼으면(그림 전체 이동 — 화소 같고 자리만 다름) 관절도 그만큼. 다시 열 때 reconcileBitmapRig가 하는 판단과 같다 —
+  // 저장은 다시 열기 전에도 하므로 기록할 때 맞춘다.
+  function rigMovedTo(rig, sig) {
+    if (!rig?.sig || !sig || rig.sig.abs !== sig.abs || !Number.isFinite(rig.sig.x) || !Number.isFinite(rig.sig.y)) return rig;
+    const dx = sig.x - rig.sig.x, dy = sig.y - rig.sig.y;
+    if (Math.abs(dx) <= .01 && Math.abs(dy) <= .01) return rig;
+    return { ...rig, joints: rig.joints.map(j => ({ ...j, x: clean(j.x + dx), y: clean(j.y + dy) })) };
   }
   // 칠해진 곳 윤곽선(그림 좌표 경로 글 목록). 큰 그림은 줄여서 딴다(화소 60만 개 안).
   function rasterOutline(paper, canvas, x, y) {
@@ -5040,9 +5075,16 @@
     return base;
   }
   // 모양 정보에 남긴 관절(십자 기준) → 지금 편집기 그림 좌표. 그림 데이터가 없을 때(PNG로 다시 연 모양) 쓴다.
+  // 레이어가 여럿이면 지금 레이어가 파일에서 읽은 관절만 쓴다(모양 하나짜리 기록은 레이어를 모르니 다른 레이어에 붙는다).
   function savedBitmapJoints(s) {
+    const meta = layerMeta(s.ep), own = meta && layerBonesOf(activeLayer(meta))?.joints;
+    if (own) return own.map(j => ({ ...j }));
+    if (meta && meta.layers.length > 1) return null;
+    return pictureRigJoints(s);
+  }
+  function pictureRigJoints(c) {
     try {
-      const saved = JSON.parse(s.picture?.dimension?.[BITMAP_RIG] || 'null'), center = crossPoint(s);
+      const saved = JSON.parse(c.picture?.dimension?.[BITMAP_RIG] || 'null'), center = crossPoint(c);
       if (!saved || !Array.isArray(saved.joints) || !saved.joints.length) return null;
       const joints = saved.joints.map(j => ({ id: j.id, parent: j.parent, x: clean(center.x + j.x), y: clean(center.y + j.y) }));
       return validRig({ joints, pose: {}, source: [], radius: 1 }) ? joints : null;
@@ -5342,6 +5384,13 @@
     const meta = layerMeta(ep);
     if (!meta || (!shift.x && !shift.y)) return;
     for (const layer of meta.layers) {
+      // 파일에서 읽고 아직 안 연 레이어 관절도 같이 옮긴다(연 뼈대는 그림 자리가 바뀐 만큼 열 때 따라감 — reconcileBitmapRig)
+      const kept = layerBonesOf(layer);
+      if (kept?.joints && !kept.bones) {
+        const ref = layerUid('b');
+        layerBones.set(ref, { ...kept, joints: kept.joints.map(j => ({ ...j, x: clean(j.x + shift.x), y: clean(j.y + shift.y) })) });
+        layer.bonesRef = ref;
+      }
       const content = layer.id !== meta.active && layer.ref && layerCache.get(layer.ref);
       if (!content) continue;
       const ref = layerUid('r'); // 참조는 한 번 만들면 바꾸지 않는다(되돌리기 기록이 옛 참조를 씀)
@@ -5361,8 +5410,13 @@
   // 고정된 모드는 지금 모드를 잊어 생기는 오류가 많으므로(Sellen·Kurtenbach·Buxton 1992) 단계를 단추·덮개·안내로 늘 보인다.
   const LAYER_COLORS = ['#4f80ff', '#ff6b4a', '#18a957', '#b05cff', '#f2a900', '#00a3c4',
     '#e0447a', '#7a8b00', '#8a5a2b', '#5b6bff'];
-  const layerColor = (s, item) =>
-    LAYER_COLORS[Math.max(0, s.layers.indexOf(item)) % LAYER_COLORS.length];
+  // 비트맵 탭은 그림 층에 지금 레이어 한 장뿐이라 레이어 창 순서로 색을 매긴다(레이어를 바꿔도 그 레이어 색 그대로)
+  const layerColor = (s, item) => {
+    const meta = bitmapMode(s) && isRasterLayer(item) ? layerMeta(s.ep) : null;
+    const index = meta ? meta.layers.findIndex(layer => layer.id === meta.active) : s.layers.indexOf(item);
+    return LAYER_COLORS[Math.max(0, index) % LAYER_COLORS.length];
+  };
+  const bitmapLayerColor = (meta, layer) => LAYER_COLORS[Math.max(0, meta.layers.indexOf(layer)) % LAYER_COLORS.length];
   function hintFor(s) {
     const rig = s.rigs.get(s.current);
     if (!s.current) return '휠 레이어를 그림에서 누르거나 오른쪽 목록에서 고르세요';
@@ -5448,6 +5502,8 @@
         renderBitmapPose(s, item, null);
         // 모양 정보에 남긴 관절도 지운다(저장할 때 그림에 뼈대 데이터가 없으면 기록을 그대로 두므로)
         if (s.picture?.dimension) delete s.picture.dimension[BITMAP_RIG];
+        const meta = bitmapMode(s) && layerMeta(s.ep);
+        if (meta) delete activeLayer(meta).bonesRef;
       } else {
         if (leaves.length === rig.source.length) leaves.forEach((leaf, i) => setWorldPathData(s.ep.paper, leaf, rig.source[i]));
         if (rig.parts) renderParts(s, item, null); // 묶음 안 그림도 휘기 전 그림으로
@@ -5540,6 +5596,88 @@
     for (let node = hit?.item; node; node = node.parent) if (s.layers.includes(node)) return node;
     return null;
   }
+  // 비트맵 탭: 그림 층에는 지금 레이어 한 장만 있고 나머지 레이어는 레이어 창 사본이다. 점에서 그 레이어의 불투명도(0~255).
+  // 레이어 사본의 칠해진 범위와 그 안 불투명도 — 사본은 바뀌지 않으므로 한 번만 읽는다(마우스를 움직일 때마다 캔버스를 다시 읽지 않게)
+  const inkMaps = new WeakMap();
+  function layerInkOf(canvas) {
+    if (inkMaps.has(canvas)) return inkMaps.get(canvas);
+    const w = canvas.width, h = canvas.height, data = w && h ? canvas.getContext('2d').getImageData(0, 0, w, h).data : null;
+    let left = w, top = h, right = -1, bottom = -1;
+    for (let y = 0; data && y < h; y++) for (let x = 0; x < w; x++) {
+      if (data[(y * w + x) * 4 + 3] <= 8) continue;
+      if (x < left) left = x;
+      if (x > right) right = x;
+      if (y < top) top = y;
+      bottom = y;
+    }
+    let ink = null;
+    if (right >= 0) {
+      const iw = right - left + 1, ih = bottom - top + 1, alpha = new Uint8Array(iw * ih);
+      for (let y = 0; y < ih; y++) for (let x = 0; x < iw; x++) alpha[y * iw + x] = data[((y + top) * w + x + left) * 4 + 3];
+      ink = { left, top, w: iw, h: ih, alpha };
+    }
+    inkMaps.set(canvas, ink);
+    return ink;
+  }
+  // 비트맵 탭: 그림 층에는 지금 레이어 한 장만 있고 나머지 레이어는 레이어 창 사본이다. 점에서 그 레이어의 불투명도(0~255).
+  function bitmapAlphaAt(s, meta, layer, p) {
+    if (layer.id === meta.active) {
+      const raster = s.current && isRasterLayer(s.current) ? s.current : null;
+      if (!raster?.width || !layer.visible) return 0;
+      const local = raster.globalToLocal(new s.ep.paper.Point(p.x, p.y)).add([raster.width / 2, raster.height / 2]);
+      const x = Math.floor(local.x), y = Math.floor(local.y);
+      if (x < 0 || y < 0 || x >= raster.width || y >= raster.height) return 0;
+      return raster.getImageData(new s.ep.paper.Rectangle(x, y, 1, 1)).data[3];
+    }
+    const content = layerContent(s.ep, meta, layer), ink = content && layerInkOf(content.canvas);
+    if (!ink) return 0;
+    const x = Math.floor(p.x - content.x) - ink.left, y = Math.floor(p.y - content.y) - ink.top;
+    return x < 0 || y < 0 || x >= ink.w || y >= ink.h ? 0 : ink.alpha[y * ink.w + x];
+  }
+  // 점에 보이는 다른 비트맵 레이어(위부터, 클리핑 레이어는 기준이 칠해진 곳만 — 맨 아래 클리핑 레이어는 그 자신이 기준). 지금 레이어가
+  // 칠해진 곳이면 null — 그 위에서는 평소처럼 뼈를 다룬다.
+  function bitmapLayerAt(s, p) {
+    const meta = bitmapMode(s) ? layerMeta(s.ep) : null, ink = 8;
+    if (!meta || meta.layers.length < 2 || bitmapAlphaAt(s, meta, activeLayer(meta), p) > ink) return null;
+    for (let i = meta.layers.length - 1; i >= 0; i--) {
+      const layer = meta.layers[i];
+      if (layer.id === meta.active || !layer.visible || !(layer.opacity > 0) || bitmapAlphaAt(s, meta, layer, p) <= ink) continue;
+      if (layer.clip) {
+        let base = null;
+        for (let j = i - 1; j >= 0 && !base; j--) if (!meta.layers[j].clip) base = meta.layers[j];
+        if (base && (!base.visible || !(base.opacity > 0) || bitmapAlphaAt(s, meta, base, p) <= ink)) continue;
+      }
+      return layer;
+    }
+    return null;
+  }
+  // 지금 비트맵 레이어의 칠해진 범위 근처인가(첫 뼈를 그 그림 둘레에서 시작할 수 있게 — 그림 층은 작업 영역만큼 넓혀 두어 늘 둘레 안이다)
+  function nearCurrentInk(s, p) {
+    const raster = s.current && isRasterLayer(s.current) ? s.current : null;
+    if (!raster?.width) return false;
+    const ink = layerInkOf(raster.getSubCanvas ? raster.getSubCanvas(new s.ep.paper.Rectangle(0, 0, raster.width, raster.height)) : raster.canvas);
+    if (!ink) return false;
+    const pad = 24 / (s.ep.paper.view.zoom || 1), b = raster.bounds;
+    return p.x >= b.left + ink.left - pad && p.x <= b.left + ink.left + ink.w + pad && p.y >= b.top + ink.top - pad && p.y <= b.top + ink.top + ink.h + pad;
+  }
+  // 다른 비트맵 레이어의 칠해진 범위(화면 사각형) — 가리킨 레이어를 점선으로 두를 때
+  function bitmapLayerRect(s, layer) {
+    const meta = layerMeta(s.ep), content = meta && layerContent(s.ep, meta, layer), ink = content && layerInkOf(content.canvas);
+    if (!ink) return null;
+    const x = content.x + ink.left, y = content.y + ink.top;
+    const a = screen(s, { x, y }), z = screen(s, { x: x + ink.w, y: y + ink.h });
+    return { x: Math.min(a.x, z.x), y: Math.min(a.y, z.y), width: Math.abs(z.x - a.x), height: Math.abs(z.y - a.y) };
+  }
+  // 뼈대 모드에서 다른 비트맵 레이어로: 지금 레이어 뼈대는 고칠 때마다 그림 data에 남아 있고(persist) 레이어를 바꾸면 레이어 쪽으로
+  // 옮겨진다(storeActive). 레이어를 바꾼 뒤 그 레이어로 다시 연다(벡터처럼 뼈대 모드를 끄지 않고 누르기만으로).
+  function switchBitmapLayer(s, layer) {
+    const meta = layerMeta(s.ep), ep = s.ep, opener = s.opener;
+    if (!meta || !layer || meta.active === layer.id || s.dragging) return;
+    close();
+    selectBitmapLayer(ep, layer.id);
+    try { const c = context(); if (c) open(c, opener); }
+    catch (error) { toast(error.message || String(error), 4000); }
+  }
   // 고른 레이어 둘레(조금 넓게) 안인가.
   function nearCurrent(s, p) {
     if (!s.current) return false;
@@ -5612,6 +5750,10 @@
         y: r.y - 3, width: r.width + 6, height: r.height + 6, stroke: layerColor(s, item) }));
     };
     if (s.hover && s.hover !== s.current && s.layers.includes(s.hover)) outline(s.hover, 'hover');
+    const hoverMeta = s.hoverLayer && layerMeta(s.ep), hoverLayer = hoverMeta?.layers.find(layer => layer.id === s.hoverLayer);
+    const hoverRect = hoverLayer && hoverLayer.id !== hoverMeta.active && bitmapLayerRect(s, hoverLayer);
+    if (hoverRect) s.overlay.append(svg('rect', { class: 'evr-rig-piece', 'data-kind': 'hover', x: hoverRect.x - 3, y: hoverRect.y - 3,
+      width: hoverRect.width + 6, height: hoverRect.height + 6, stroke: bitmapLayerColor(hoverMeta, hoverLayer) }));
     if (s.current) outline(s.current, 'current');
     const rig = s.rigs.get(s.current), color = s.current ? layerColor(s, s.current) : '#4f80ff';
     if (rig) {
@@ -5657,9 +5799,40 @@
     }
   }
   // 레이어 목록과 버튼 상태를 지금 데이터에 맞춘다.
+  // 비트맵 레이어가 여럿이면 목록은 레이어 창 레이어 모두(아래부터 — 벡터 목록과 같은 순서). 다른 레이어 줄을 누르면 그 레이어로 바꾼다.
+  function bitmapRigRows(s, meta) {
+    return meta.layers.map(layer => {
+      const active = layer.id === meta.active, rig = active ? s.rigs.get(s.current) : null, kept = active ? null : layerBonesOf(layer);
+      let count = rig ? rig.joints.length : 0;
+      if (kept) { try { count = (kept.bones ? JSON.parse(kept.bones).joints : kept.joints)?.length || 0; } catch { count = 0; } }
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'evr-rig-layer';
+      row.dataset.picked = String(active);
+      const swatch = document.createElement('span');
+      swatch.className = 'evr-rig-swatch';
+      swatch.style.background = bitmapLayerColor(meta, layer);
+      const name = document.createElement('span');
+      name.className = 'evr-rig-name';
+      name.textContent = layer.name;
+      const bones = document.createElement('span');
+      bones.className = 'evr-rig-bone-label';
+      bones.textContent = count > 1 ? `관절 ${count}` : '뼈대 없음';
+      row.append(swatch, name, bones);
+      const empty = !active && !layerContent(s.ep, meta, layer);
+      row.disabled = empty;
+      row.title = empty ? '빈 레이어라 뼈를 넣을 수 없습니다' : '이 레이어를 골라 뼈를 그리고 휩니다';
+      row.addEventListener('mouseenter', () => { s.hoverLayer = active ? null : layer.id; draw(s); });
+      row.addEventListener('mouseleave', () => { s.hoverLayer = null; draw(s); });
+      row.addEventListener('click', () => active ? selectLayer(s, s.current) : switchBitmapLayer(s, layer));
+      return row;
+    });
+  }
   function refreshRigUI(s) {
     if (!s.ui) return;
-    s.ui.layers.replaceChildren(...s.layers.map((item, index) => {
+    const meta = bitmapMode(s) && s.current ? layerMeta(s.ep) : null;
+    if (meta && meta.layers.length > 1) s.ui.layers.replaceChildren(...bitmapRigRows(s, meta));
+    else s.ui.layers.replaceChildren(...s.layers.map((item, index) => {
       const rig = s.rigs.get(item);
       const row = document.createElement('button');
       row.type = 'button';
@@ -5732,7 +5905,12 @@
           refreshRigUI(s); draw(s);
           return;
         }
-        if (setup && s.current && !rig && nearCurrent(s, p)) {
+        // 비트맵 그림 층은 작업 영역만큼 넓혀 두어 늘 지금 레이어 둘레 안이다 — 다른 레이어의 칠해진 곳이면 그 레이어로 바꾸되,
+        // 뼈대가 없는 지금 레이어 그림 근처에서 누르면 첫 뼈를 시작한다(뿌리를 그림 바로 밖에 둘 수 있게)
+        const pick = bitmapLayerAt(s, p);
+        const startHere = setup && s.current && !rig && (pick ? nearCurrentInk(s, p) : nearCurrent(s, p));
+        if (pick && !startHere) return switchBitmapLayer(s, pick);
+        if (startHere) {
           begin(event, { kind: 'create', from: -1, start: p, end: null });
           return;
         }
@@ -5745,11 +5923,15 @@
       const drag = s.dragging;
       if (!drag) {
         if (!current(s)) return;
-        const p = pointer(s, event), other = nearCurrent(s, p) ? null : layerAt(s, p);
-        const hover = other && other !== s.current ? other : null;
-        if (hover !== s.hover) {
+        const p = pointer(s, event);
+        let pick = null;
+        try { pick = bitmapLayerAt(s, p); } catch (error) { pick = null; } // 가리키기 표시가 실패해도 매 움직임 오류로 번지지 않게
+        const other = pick || nearCurrent(s, p) ? null : layerAt(s, p);
+        const hover = other && other !== s.current ? other : null, hoverLayer = pick ? pick.id : null;
+        if (hover !== s.hover || hoverLayer !== (s.hoverLayer || null)) {
           s.hover = hover;
-          s.overlay.dataset.cursor = hover ? 'pick' : '';
+          s.hoverLayer = hoverLayer;
+          s.overlay.dataset.cursor = hover || hoverLayer ? 'pick' : '';
           draw(s);
         }
         return;
@@ -5797,8 +5979,9 @@
     s.overlay.addEventListener('pointerup', stop);
     s.overlay.addEventListener('pointercancel', stop);
     s.overlay.addEventListener('pointerleave', () => {
-      if (s.dragging || !s.hover) return;
+      if (s.dragging || !(s.hover || s.hoverLayer)) return;
       s.hover = null;
+      s.hoverLayer = null;
       s.overlay.dataset.cursor = '';
       draw(s);
     });
@@ -6676,6 +6859,12 @@
   //    removeChildren·addChild) 그림 데이터(뼈대·휘기 전 그림)가 사라진다. 구울 때 들고 있다가 같은 동작 안에서(같은 실행 순간)
   //    들어오는 새 그림에 넣는다. 다음 마이크로태스크에 버려, 저장할 때 PNG를 구운 뒤 늦게 들어오는 다른 모양 그림에는 붙지 않는다.
   //    그림이 실제로 바뀌었으면 다음에 뼈대를 열 때 화소 요약이 달라 지금 그림이 새 기준이 된다(reconcileBitmapRig).
+  // 확장이 그림을 읽으려고 부르는 rasterize — 엔트리 획 굽기가 아니므로 뼈대를 옮겨 싣지 않는다(바로 뒤에 넣는 다른 레이어 그림에 붙지 않게)
+  let ownRasterizing = 0;
+  function ownRasterize(item, options) {
+    ownRasterizing++;
+    try { return item.rasterize(options); } finally { ownRasterizing--; }
+  }
   function hookPaintLayer(ep, parts) {
     const layer = parts.paint;
     if (own(layer, '__evrPaintHook')) return;
@@ -6703,7 +6892,7 @@
       return add.call(this, item, ...rest);
     };
     layer.rasterize = function (...args) {
-      const held = this.children.find(item => isRasterLayer(item) && item.data?.[BONES]);
+      const held = !ownRasterizing && this.children.find(item => isRasterLayer(item) && item.data?.[BONES]);
       if (held) {
         carry = { [BONES]: held.data[BONES] };
         if (held.data[BITMAP_REST]) carry[BITMAP_REST] = held.data[BITMAP_REST];
@@ -6775,7 +6964,7 @@
   function wrapTileCanvas(ep) {
     const parts = stageParts(ep), tile = areaTile(ep);
     if (!parts || !tile) return null;
-    const raster = parts.paint.rasterize({ resolution: 72, insert: false });
+    const raster = ownRasterize(parts.paint, { resolution: 72, insert: false });
     if (!(raster.width && raster.height)) return canvasOfSize(tile.width, tile.height);
     return collapsedTile(ep, tile, raster.canvas, raster.bounds.x, raster.bounds.y);
   }
@@ -7729,7 +7918,7 @@
     const boxes = layer.children.filter(item => item.data?.entryVectorCanvasBox === '1');
     boxes.forEach(item => { item.visible = false; });
     try {
-      const raster = layer.rasterize({ resolution: 72, insert: false });
+      const raster = ownRasterize(layer, { resolution: 72, insert: false });
       if (!raster?.width || !raster.height) return null;
       const b = raster.bounds;
       return { canvas: rasterCopy(raster), x: Math.round(b.x), y: Math.round(b.y) };
@@ -7742,12 +7931,32 @@
     if (!parts) return null;
     const id = layerUid('L');
     const meta = { v: 1, active: id, layers: [{ id, name: '레이어 1', visible: true, opacity: 1, clip: false, lock: pixelPen.alphaLock, ref: null }] };
+    // 모양 하나짜리 관절 기록(PNG로 다시 연 비트맵)은 첫 레이어(원래 그림) 것이다 — 옮겨 두지 않으면 레이어가 둘이 되면 안 보이고 저장 때 지워진다
+    const c = context(), raster = parts.layer.children.find(isRasterLayer);
+    const joints = c?.ep === ep && !raster?.data?.[BONES] ? pictureRigJoints(c) : null;
+    if (joints) {
+      const ref = layerUid('b');
+      layerBones.set(ref, { bones: null, rest: null, joints });
+      meta.layers[0].bonesRef = ref;
+    }
     parts.layer.data[LAYERS] = meta;
     return meta;
   }
+  // 레이어 뼈대: 참조 → { bones(그림 data 뼈대 글), rest(휘기 전 그림 data URL), joints(파일에서 읽은 관절, 아직 안 연 레이어) }.
+  // 레이어 정보에는 참조만 둔다(레이어 정보는 화면 갱신마다 글로 바뀌어 비교되므로 큰 글을 넣지 않는다).
+  const layerBones = new Map();
+  const layerBonesOf = layer => (layer?.bonesRef && layerBones.get(layer.bonesRef)) || null;
   // 지금 레이어 그림을 사본으로 남기고 참조를 바꾼다(레이어를 바꾸거나 저장·합치기 전에)
   function storeActive(ep, meta) {
     const shot = paintSnapshot(ep), layer = activeLayer(meta);
+    // 뼈대는 그림 data에 있고 레이어를 바꾸면 그림을 새로 만들므로(putActive) 레이어 쪽으로 옮겨 둔다 — 레이어마다 뼈대
+    const raster = paintLayer(ep)?.layer.children.find(isRasterLayer), bones = raster?.data?.[BONES] || null;
+    // 그림에 뼈대가 없다고 지우지 않는다 — 필터처럼 그림을 새로 바꾸는 기능도 data를 비운다. 뼈를 모두 지울 때만 deleteJoint가 지운다.
+    if (bones) {
+      const ref = layerUid('b');
+      layerBones.set(ref, { bones, rest: raster.data[BITMAP_REST] || null, joints: null });
+      layer.bonesRef = ref;
+    }
     if (!shot) { layer.ref = null; return; }
     const ref = layerUid('r');
     layerCache.set(ref, shot);
@@ -7765,7 +7974,9 @@
     return raster;
   }
   function putActive(ep, layer) {
-    const parts = paintLayer(ep), raster = layerRaster(ep, layer);
+    const parts = paintLayer(ep), raster = layerRaster(ep, layer), kept = layerBonesOf(layer);
+    if (kept?.bones) raster.data[BONES] = kept.bones;
+    if (kept?.bones && kept.rest) raster.data[BITMAP_REST] = kept.rest;
     parts.layer.removeChildren();
     parts.layer.addChild(raster);
   }
@@ -8586,12 +8797,32 @@
     if (!list || list.v !== 2 || list.format !== 'psd' || typeof list.psd !== 'string') throw Error('레이어 원본 형식이 다릅니다');
     list.x = clean(Number(list.x || 0) + shift.x);
     list.y = clean(Number(list.y || 0) + shift.y);
+    // 레이어 관절도 십자 기준이라 그림과 같이 옮긴다
+    if (Array.isArray(list.bones)) list.bones = list.bones.map(record => Array.isArray(record?.joints) ? { joints: record.joints.map(j =>
+      ({ ...j, x: clean(Number(j.x) + shift.x), y: clean(Number(j.y) + shift.y) })) } : null);
     const extra = `<metadata id="${LAYER_SVG}">${JSON.stringify(list)}</metadata>`;
     if (payload.svg) return { ...payload, ext: 'svg', svg: payload.svg.replace(/<svg\b[^>]*>/, open => open + extra) };
     const { width, height } = payload.size;
     return { ...payload, ext: 'svg', imageType: 'png',
       svg: `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" ` +
         `viewBox="0 0 ${width} ${height}">${extra}<image width="${width}" height="${height}" xlink:href="${payload.image}"/></svg>` };
+  }
+  // 레이어 관절 기록(십자 기준): 지금 자세 자리 — 레이어 그림도 휜 채 저장되므로 다시 열면 그 모양이 새 기준(모양 하나짜리 bitmapRigRecord와 같음)
+  function layerJointsRecord(layer, home, content) {
+    const kept = layerBonesOf(layer);
+    let rig = null;
+    try { rig = kept?.bones ? JSON.parse(kept.bones) : null; } catch { rig = null; }
+    if (rig && content) rig = rigMovedTo(rig, contentSig(content));
+    const points = rig && validRig(rig) && rig.joints.length > 1 ? jointPoints(rig) : null;
+    const joints = points ? rig.joints.map(j => ({ id: j.id, parent: j.parent, x: points[j.id].x, y: points[j.id].y })) : kept?.joints;
+    if (!Array.isArray(joints) || joints.length < 2) return null;
+    return { joints: joints.map(j => ({ id: j.id, parent: j.parent, x: clean(j.x - home.x), y: clean(j.y - home.y) })) };
+  }
+  // 파일의 레이어 관절 기록 → 편집기 좌표 관절(틀렸으면 null)
+  function layerJointsFrom(record, home) {
+    if (!Array.isArray(record?.joints) || record.joints.length < 2) return null;
+    const joints = record.joints.map(j => ({ id: j.id, parent: j.parent, x: clean(home.x + Number(j.x)), y: clean(home.y + Number(j.y)) }));
+    return validRig({ joints, pose: {}, source: [], radius: 1 }) ? joints : null;
   }
   function layerSvg(swap, png, baseSvg) {
     const size = pngSize(png), lib = window.__evrAgPsd;
@@ -8610,7 +8841,9 @@
     const psd = lib.writePsdUint8Array({ width: right - left, height: bottom - top, children },
       { noBackground: true, trimImageData: true, compress: true });
     const active = swap.meta.layers.findIndex(layer => layer.id === swap.meta.active);
-    const list = JSON.stringify({ v: 2, format: 'psd', active, x: left - swap.home.x, y: top - swap.home.y, psd: bytesToBase64(psd) });
+    const bones = swap.meta.layers.map(layer => layerJointsRecord(layer, swap.home, swap.contents.get(layer.id)));
+    const list = JSON.stringify({ v: 2, format: 'psd', active, x: left - swap.home.x, y: top - swap.home.y,
+      ...(bones.some(Boolean) ? { bones } : {}), psd: bytesToBase64(psd) });
     const extra = `<metadata id="${LAYER_SVG}">${list}</metadata>`;
     // 픽셀 아트 모양은 그 SVG(보간 없는 그림)에 덧붙인다
     if (baseSvg) return baseSvg.replace(/<svg\b[^>]*>/, open => open + extra);
@@ -8618,7 +8851,7 @@
       `viewBox="0 0 ${size.width} ${size.height}">${extra}<image width="${size.width}" height="${size.height}" xlink:href="${png}"/></svg>`;
   }
   // 레이어 SVG를 읽어 { meta, frame(엔트리에 넘길 지금 레이어 PNG — 가운데가 십자) } — 레이어 그림은 사본으로 남긴다
-  function readLayerSvg(text, ep) {
+  function readLayerSvg(text, ep, pictureRig) {
     const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
     const node = doc.getElementById(LAYER_SVG) || doc.querySelector(`metadata#${LAYER_SVG}`);
     if (!node) return null;
@@ -8633,7 +8866,7 @@
     if (!items.length) return null;
     const home = areaHome(ep), originX = home.x + Number(list.x || 0), originY = home.y + Number(list.y || 0);
     const meta = { v: 1, active: null, layers: [] };
-    for (const item of items) {
+    items.forEach((item, index) => {
       // PSD 불투명도는 1/255 단위 — 레이어 창은 1% 단위
       const layer = { id: layerUid('L'), name: String(item.name || '레이어').slice(0, 40), visible: !item.hidden,
         opacity: Math.round(Math.max(0, Math.min(1, Number(item.opacity ?? 1))) * 100) / 100, clip: !!item.clipping,
@@ -8643,9 +8876,26 @@
         layerCache.set(ref, { canvas: item.canvas, x: originX + (item.left || 0), y: originY + (item.top || 0) });
         layer.ref = ref;
       }
+      const joints = Array.isArray(list.bones) ? layerJointsFrom(list.bones[index], home) : null;
+      if (joints) {
+        const ref = layerUid('b');
+        layerBones.set(ref, { bones: null, rest: null, joints });
+        layer.bonesRef = ref;
+      }
       meta.layers.push(layer);
-    }
+    });
     meta.active = (meta.layers[list.active] || meta.layers[meta.layers.length - 1]).id;
+    // 레이어별 관절이 없는 레이어 원본(1.3.0 저장)의 모양 하나짜리 관절은 그때처럼 지금 레이어 것이다 — 옮기지 않으면 안 보이고 다음 저장에 지워진다
+    if (!Array.isArray(list.bones) && pictureRig) {
+      let joints = null;
+      try { joints = layerJointsFrom(JSON.parse(pictureRig), home); } catch { joints = null; }
+      const active = meta.layers.find(layer => layer.id === meta.active);
+      if (joints && !active.bonesRef) {
+        const ref = layerUid('b');
+        layerBones.set(ref, { bones: null, rest: null, joints });
+        active.bonesRef = ref;
+      }
+    }
     // 엔트리는 연 그림을 가운데(십자)에 놓는다: 모든 레이어를 덮는, 십자 기준 대칭 틀에 지금 레이어를 그려 넘긴다
     const all = meta.layers.map(layer => layer.ref && layerCache.get(layer.ref)).filter(Boolean);
     const halfW = Math.max(1, ...all.map(c => Math.max(home.x - c.x, c.x + c.canvas.width - home.x)));
@@ -8665,20 +8915,64 @@
   // 그래서 .ent로 내려받을 때만 레이어 원본(<metadata> 글)을 그 모양 정보(LAYER_ENT)에 담아 보내고, 불러온 작품에서 그 값을 보면
   // 레이어 SVG를 새 파일로 다시 올려 잇는다(올라가기 전에 열면 그 값에서 바로 연다). 평소 저장 작품 JSON에는 담지 않는다(크기).
   // 오브젝트 내보내기(POST /rest/object/download {content: {objects}, name})도 같은 모양 JSON이라 같이 고친다.
-  const LAYER_ENT = 'entryVectorLayersEnt';
+  const LAYER_ENT = 'entryVectorLayersEnt', ENT_FILE = 'entryVectorEntFile';
+  // .ent 불러오기는 주소에 '/bower_components/'가 있어야 남기고 그 안의 './bower_components/'만 '/lib/'로 바꾼다. 작품 저장은
+  // '/lib/../' 주소를 거절한다. 그래서 '..' 없이 서버가 무시하는 질의 글에 그 표시를 둔다.
+  const ENT_KEEP = '?keep/bower_components/';
+  // .ent에 담은 픽셀 모양 주소면 원래 /uploads/ 주소, 아니면 null. '/lib/..' 형태는 이 표시 전에 만든 .ent.
+  function entKeptPath(url) {
+    if (typeof url !== 'string') return null;
+    if (url.startsWith('/lib/../uploads/')) return url.slice('/lib/..'.length);
+    if (url.startsWith('/uploads/') && url.includes(ENT_KEEP)) return url.replace(ENT_KEEP, '');
+    return null;
+  }
+  // .ent에 담았던 픽셀 모양이면 원래 파일 이름·주소로 되돌린다(주소가 빠졌어도 파일 이름은 — 파일 이름도 주소도 없으면 작품이 안 열림)
+  function restoreEntPicture(picture) {
+    const entFile = picture?.dimension?.[ENT_FILE];
+    if (!entFile || picture.filename) return false;
+    const kept = entKeptPath(picture.fileurl);
+    if (!kept && picture.fileurl) return false;
+    picture.filename = entFile;
+    if (kept) picture.fileurl = kept;
+    delete picture.dimension[ENT_FILE];
+    return true;
+  }
+  // 엔트리 작품 열기(loadProject)를 거치지 않고 들어온 모양(확장이 늦게 붙은 첫 열기 등)도 자기 파일을 만들기 전에 되돌린다
+  function restoreEntPictures() {
+    if (entryLoading()) return;
+    for (const object of window.Entry?.container?.getAllObjects?.() || []) for (const picture of object.pictures || []) restoreEntPicture(picture);
+  }
+  // 이 사이트의 /uploads/… 주소면 경로(+ #칸)만, 아니면 null
+  function uploadsPath(url) {
+    if (typeof url !== 'string') return null;
+    if (url.startsWith('/uploads/')) return url;
+    try { const u = new URL(url, location.href); return u.origin === location.origin && u.pathname.startsWith('/uploads/') ? u.pathname + u.hash : null; } catch { return null; }
+  }
   const entLayerSvgText = meta => `<svg xmlns="${NS}"><metadata id="${LAYER_SVG}">${String(meta).replace(/&/g, '&amp;').replace(/</g, '&lt;')}</metadata></svg>`;
   // 내려받기 요청 본문(작품 JSON 글)을 고친다. 실패하면 원래 본문 그대로.
   // - 아직 자기 파일이 없는 픽셀 모양(라이브러리 그림): 서버가 지울 칸 주소 대신 원래 라이브러리 주소(서버가 남김)를 보낸다.
   //   불러오면 확장이 칸 주소를 다시 건다. ownPixelPictures가 자기 파일을 만들기 전에 내려받는 경우의 안전망.
   // - 비트맵 레이어 모양: 레이어 원본을 모양 정보(LAYER_ENT)에 담는다.
-  async function withEntLayers(body) {
-    const data = JSON.parse(body);
+  async function withEntLayers(body, url) {
+    const data = JSON.parse(body), projectFile = /\/rest\/project\/download(\?|$)/.test(String(url));
     const all = (data?.content?.objects || []).flatMap(object => object?.sprite?.pictures || []).filter(Boolean);
     let changed = false;
     for (const picture of all) {
       const base = atlasOf(picture)?.base;
       if (!picture.filename && base && picture.fileurl !== base && /\/uploads\//.test(picture.fileurl || '')) {
         picture.fileurl = base;
+        changed = true;
+        continue;
+      }
+      // 1배 픽셀 모양은 실행 화면을 각지게 그리는 주소(/uploads/… SVG)로 그린다. .ent 만들기는 파일 이름이 있으면 주소를 덮어써서,
+      // 파일 이름을 빼고 불러오기에 남는 표시(ENT_KEEP)를 붙여 담는다(확장 없이 열어도 각지고 저장됨). 원래 파일 이름은 모양 정보에 두어
+      // 확장이 불러올 때 되돌린다(repairPictures). 작품 .ent만 — 오브젝트 불러오기는 서버 주소 규칙을 확인하지 않았다. 벡터 픽셀 모양은 빼는데,
+      // 파일 이름(벡터 원본)을 빼면 확장 없는 그림판이 주소의 아틀라스 전체를 벡터로 연다.
+      const path = projectFile && pixelOf(picture) === 1 && !pixelVector(picture) && uploadsPath(picture.fileurl);
+      if (path && /\.svg(#|$)/.test(path)) {
+        if (picture.filename) picture.dimension[ENT_FILE] = picture.filename;
+        delete picture.filename;
+        picture.fileurl = path.replace(/#|$/, mark => ENT_KEEP + mark);
         changed = true;
       }
     }
@@ -8700,6 +8994,7 @@
     let fixed = 0;
     for (const object of project?.objects || []) {
       for (const picture of object?.sprite?.pictures || []) {
+        if (restoreEntPicture(picture)) { fixed++; continue; }
         if (!picture || picture.filename || picture.fileurl) continue;
         const atlas = atlasOf(picture);
         if (!atlas) continue;
@@ -8732,12 +9027,12 @@
       Object.defineProperty(proto, '__evrEntHook', { value: true });
       const open = proto.open, send = proto.send;
       proto.open = function (method, url, ...rest) {
-        this.__evrEnt = isEntDownload(method, url);
+        this.__evrEnt = isEntDownload(method, url) ? String(url) : null;
         return open.call(this, method, url, ...rest);
       };
       proto.send = function (body) {
         if (!this.__evrEnt || typeof body !== 'string') return send.call(this, body);
-        withEntLayers(body).then(next => send.call(this, next), () => send.call(this, body));
+        withEntLayers(body, this.__evrEnt).then(next => send.call(this, next), () => send.call(this, body));
         return undefined;
       };
     }
@@ -8747,7 +9042,7 @@
       const wrapped = function (input, init, ...rest) {
         const url = typeof input === 'string' ? input : input?.url;
         if (init && typeof init.body === 'string' && isEntDownload(init.method || 'GET', url))
-          return withEntLayers(init.body).catch(() => init.body).then(body => fetch0.call(this, input, { ...init, body }, ...rest));
+          return withEntLayers(init.body, url).catch(() => init.body).then(body => fetch0.call(this, input, { ...init, body }, ...rest));
         return fetch0.call(this, input, init, ...rest);
       };
       wrapped.__evrEntHook = true;
@@ -8871,14 +9166,17 @@
   function draftPayload(ep) {
     const parts = paintLayer(ep);
     if (!parts) throw Error('그림판을 찾지 못했습니다.');
-    const refs = {};
+    const refs = {}, bones = {};
     const meta = ep.mode === 'BITMAP' ? storedLayerMeta(parts.layer) : null;
     for (const layer of meta?.layers || []) {
       // 지금 레이어 그림은 그림 층 JSON에 들어 있다(참조는 낡은 사본일 수 있어 담지 않음)
       const content = layer.id !== meta.active && layer.ref && layerCache.get(layer.ref);
       if (content) refs[layer.ref] = { x: content.x, y: content.y, png: content.canvas.toDataURL('image/png') };
+      // 레이어 뼈대도 참조로만 레이어 정보에 있다(브라우저를 다시 열면 비어 있음)
+      const kept = layerBonesOf(layer);
+      if (kept) bones[layer.bonesRef] = kept;
     }
-    return { v: 1, mode: ep.mode, json: parts.layer.exportJSON({ asString: true }), refs };
+    return { v: 1, mode: ep.mode, json: parts.layer.exportJSON({ asString: true }), refs, bones };
   }
   async function draftSaveNow(painter) {
     await tempSessionCheck();
@@ -8913,6 +9211,7 @@
     for (const [ref, content] of Object.entries(payload.refs || {})) {
       if (!layerCache.has(ref)) layerCache.set(ref, { canvas: canvasOfImage(await loadImage(content.png)), x: content.x, y: content.y });
     }
+    for (const [ref, kept] of Object.entries(payload.bones || {})) if (!layerBones.has(ref)) layerBones.set(ref, kept);
     if (painter.file?.id !== picture.id || ep.mode !== payload.mode) throw Error('그 사이 모양이나 모드가 바뀌어 열지 않았습니다.');
     paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: [] });
     // 연 직전 상태를 되돌리기 기록에 남긴다 — 그림 전체 이동처럼 기록을 남기지 않는 변경도 되돌리기 한 번에 돌아오게(검토 지적)
@@ -10296,7 +10595,7 @@
     const guides = layer.getItems({ match: item => item.visible && item.data?.guideItem });
     guides.forEach(item => { item.visible = false; });
     let raster = null;
-    try { if (layer.children.length) raster = layer.rasterize({ resolution: 72 * s, insert: false }); }
+    try { if (layer.children.length) raster = ownRasterize(layer, { resolution: 72 * s, insert: false }); }
     finally { guides.forEach(item => { item.visible = true; }); }
     if (raster?.canvas && raster.bounds.width > 0 && raster.bounds.height > 0)
       ctx.drawImage(raster.canvas, (raster.bounds.left - stage.left) * s, (raster.bounds.top - stage.top) * s,
@@ -10993,6 +11292,7 @@
       Date.now() - record.at < 30000 && !settleSave(record));
     measureMissingArt(window.Entry?.playground?.object);
     adoptPixelPictures(window.Entry?.playground?.object);
+    restoreEntPictures();
     restorePixelFileurls();
     try { ownPixelPictures(); } catch (error) { console.warn('[entry-vector-rig] 모양 자기 파일', error); }
     try { hookLoadRepair(); } catch (error) { console.warn('[entry-vector-rig] 모양 주소 잇기', error); }
