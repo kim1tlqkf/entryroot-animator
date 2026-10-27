@@ -51,6 +51,20 @@ function Read-ReportFindings($path) {
   }
   return @{ ids = $ids; severity = $severity }
 }
+# 검토 보고서 맨 앞(첫 지적 줄 전)의 지문 줄 — 「검토 시작 지문」「검토 끝 지문」, 「검토 바탕 지문」(앞 회차가 끝까지 본 판). late: 첫 지적 줄 뒤에 나온 줄 종류
+function Read-ReportHead($path) {
+  $out = @{ start = @(); end = @(); base = @(); late = $null }; $beforeFirstId = $true
+  foreach ($line in Get-Content -Encoding UTF8 $path) {
+    if ($line -match '^\s*[-*]?\s*\**id\**:\s*`?[A-Za-z0-9._-]+') { $beforeFirstId = $false }
+    $kind = if ($line -match '검토 시작 지문\**\s*:') { 'start' } elseif ($line -match '검토 끝 지문\**\s*:') { 'end' } elseif ($line -match '검토 바탕 지문\**\s*:') { 'base' } else { $null }
+    if (-not $kind) { continue }
+    if (-not $beforeFirstId) { if (-not $out.late) { $out.late = $kind }; continue }
+    $vals = @{}
+    foreach ($key in 'contentHash', 'testsHash', 'harnessHash', 'promptHash') { if ($line -match "$key\W+([0-9a-f]{64})\b") { $vals[$key] = $Matches[1] } }
+    $out[$kind] += , $vals
+  }
+  return $out
+}
 function Get-FilesUnder($rel) {
   $at = Join-Path $root ($rel -replace '/', '\')
   if (-not (Test-Path $at)) { return @() }
@@ -59,24 +73,28 @@ function Get-FilesUnder($rel) {
 }
 $contentHash = Get-ListHash $files
 $testFiles = @('tests/run.js') + (Get-FilesUnder 'tests/lib') + (Get-FilesUnder 'tests/cases') + (Get-FilesUnder 'tests/fixtures')
-$hasTests = Test-Path (Join-Path $root 'tests\run.js')
-$testsHash = if ($hasTests) { Get-ListHash $testFiles } else { $null }
+# 시험 없는 사본(GitHub 사본 등)은 zip을 만들 곳이 아니다 — 실행기가 없을 때 시험 지문·점검 틀·고치기 전 판 검사를 건너뛰지 않고 막는다
+if (-not (Test-Path (Join-Path $root 'tests\run.js'))) { Stop-Release '시험 실행기(tests\run.js)가 없습니다 — 시험 없는 사본에서는 zip을 만들지 않습니다' }
+$testsHash = Get-ListHash $testFiles
+# 0) release\gate-selftest.json — 관문·도구(pack.ps1·tools/)는 과적합 검토에 묶지 않는다(관문을 고칠 때마다 제품 검토를 다시 받아 출시 회차가 끝나지 않았다).
+#    대신 관문 자기 점검(tools\release-gate-selftest.ps1)이 다 통과할 때 남긴 관문 지문(gateHash)이 지금과 같아야 한다. 범위는 tools\gate-hashes.js 한 곳.
+$gatePath = Join-Path $root 'release\gate-selftest.json'
+if (-not (Test-Path $gatePath)) { Stop-Release '관문 자기 점검 기록(release\gate-selftest.json)이 없습니다 — tools\release-gate-selftest.ps1 을 돌리세요' }
+$gateNow = ((& node (Join-Path $root 'tools\gate-hashes.js') --gate) | Out-String).Trim()
+if (-not $gateNow -or (Get-Content -Raw -Encoding UTF8 $gatePath | ConvertFrom-Json).gateHash -ne $gateNow) { Stop-Release '관문 자기 점검 뒤 관문·도구(pack.ps1·tools)가 바뀌었습니다(gateHash 다름) — tools\release-gate-selftest.ps1 을 다시 돌리세요' }
 $runPath = Join-Path $root 'release\last-full-run.json'
 if (-not (Test-Path $runPath)) { Stop-Release '전체 시험 기록이 없습니다 — node tests/run.js 를 먼저 돌리세요' }
 $run = Get-Content -Raw -Encoding UTF8 $runPath | ConvertFrom-Json
 if ($run.version -ne $manifest.version) { Stop-Release "시험 기록 버전($($run.version))이 manifest($($manifest.version))와 다릅니다" }
 if ($run.contentHash -ne $contentHash) { Stop-Release '시험을 돌린 뒤 확장 파일이 바뀌었습니다 — 전체 시험을 다시 돌리세요' }
 if (-not $run.allPassed) { Stop-Release '전체 시험에 통과 못 한 것이 있습니다' }
-# 시험 파일 지문 — 전체 시험 뒤 시험을 약하게 고치면 막는다(과적합 검토 지적). 시험 폴더가 없는 사본은 건너뜀.
-if ($hasTests -and $run.testsHash -ne $testsHash) { Stop-Release '전체 시험을 돌린 뒤 시험 파일이 바뀌었습니다(testsHash 다름) — 전체 시험을 다시 돌리세요' }
+# 시험 파일 지문 — 전체 시험 뒤 시험을 약하게 고치면 막는다(과적합 검토 지적).
+if ($run.testsHash -ne $testsHash) { Stop-Release '전체 시험을 돌린 뒤 시험 파일이 바뀌었습니다(testsHash 다름) — 전체 시험을 다시 돌리세요' }
 # 시험 폴더의 시험은 모두 이번 기록에 있어야 한다 — 시험을 새로 넣고 전체 시험을 다시 안 돌리면 새 시험이 관문을 거치지 않고 빠졌다(모양 섞임 시험을 넣으며 찾음).
-# 시험 폴더가 없는 사본(GitHub 사본)은 기록의 통과만 본다.
 $caseDir = Join-Path $root 'tests\cases'
-if (Test-Path $caseDir) {
-  if (-not $run.caseFiles) { Stop-Release '전체 시험 기록에 시험 파일 목록이 없습니다(예전 기록) — 전체 시험을 다시 돌리세요' }
-  $notRun = @(Get-ChildItem $caseDir -Filter '*.js' -File | ForEach-Object { $_.Name } | Where-Object { @($run.caseFiles) -notcontains $_ })
-  if ($notRun.Count) { Stop-Release "전체 시험 기록에 없는 시험이 있습니다($($notRun -join ', ')) — 전체 시험을 다시 돌리세요" }
-}
+if (-not $run.caseFiles) { Stop-Release '전체 시험 기록에 시험 파일 목록이 없습니다(예전 기록) — 전체 시험을 다시 돌리세요' }
+$notRun = @(Get-ChildItem $caseDir -Filter '*.js' -File | ForEach-Object { $_.Name } | Where-Object { @($run.caseFiles) -notcontains $_ })
+if ($notRun.Count) { Stop-Release "전체 시험 기록에 없는 시험이 있습니다($($notRun -join ', ')) — 전체 시험을 다시 돌리세요" }
 $reviewPath = Join-Path $root "release\review-$($manifest.version).json"
 if (-not (Test-Path $reviewPath)) { Stop-Release "이 버전의 독립 검토 기록(release\review-$($manifest.version).json)이 없습니다" }
 $review = Get-Content -Raw -Encoding UTF8 $reviewPath | ConvertFrom-Json
@@ -203,10 +221,9 @@ if ($overfit.version -ne $manifest.version) { Stop-Release '과적합 검토 기
 if (-not $overfit.reviewer) { Stop-Release '과적합 검토 기록에 검토자(reviewer)가 없습니다' }
 if ($overfit.promptHash -ne $promptHash) { Stop-Release '과적합 검토가 지금 지시문으로 한 것이 아닙니다(promptHash 다름) — 지시문을 바꿨으면 다시 검토하세요' }
 if ($overfit.contentHash -ne $contentHash) { Stop-Release '과적합 검토 뒤 확장 파일이 바뀌었습니다(contentHash 다름) — 다시 검토하세요' }
-if ($hasTests) {
-  $harnessHash = Get-ListHash ($testFiles + (Get-FilesUnder 'tests/real-server') + (Get-FilesUnder 'tests/fixture-makers') + (Get-FilesUnder 'tests/known-limits') + (Get-FilesUnder 'tools') + @('pack.ps1') + @('release/public-accept.txt', 'release/private-terms.txt' | Where-Object { Test-Path (Join-Path $root ($_ -replace '/', '\')) }))
-  if ($overfit.harnessHash -ne $harnessHash) { Stop-Release '과적합 검토 뒤 시험·도구·관문이 바뀌었습니다(harnessHash 다름) — 다시 검토하세요' }
-}
+# 범위는 tools\gate-hashes.js HARNESS_SCOPE 한 곳(여기서 목록을 따로 두면 둘이 어긋나도 모름)
+$harnessHash = ((& node (Join-Path $root 'tools\gate-hashes.js')) | Out-String | ConvertFrom-Json).harnessHash
+if (-not $harnessHash -or $overfit.harnessHash -ne $harnessHash) { Stop-Release '과적합 검토 뒤 시험·탐침이 바뀌었습니다(harnessHash 다름) — 다시 검토하세요' }
 if (-not @(Get-Items $overfit.checked).Count) { Stop-Release '과적합 검토 기록에 확인한 곳(checked)이 없습니다' }
 if (-not $overfit.report) { Stop-Release '과적합 검토 기록에 검토자 보고서 원문 파일(report)이 없습니다' }
 $reportPath = Join-Path $root ($overfit.report -replace '/', '\')
@@ -223,22 +240,14 @@ if ($source.sha -ne $overfit.reportHash) { Stop-Release '과적합 검토 보고
 # 기록의 지문은 작성자가 적는다 — 검토자가 잰 지문과 같아야 한다. 검토자는 보고서 맨 앞(첫 지적 줄 전)에 「검토 시작 지문:」「검토 끝 지문:」 두 줄을
 # 한 번씩 적고(지시문), 관문은 그 두 줄에서만 읽어 시작 = 끝 = 기록을 본다. 보고서 어디든 지문 글자만 있으면 통과시키면 검토 뒤 고치고 지문을 덧붙여도
 # 지나갔다
-$headLines = @{ start = @(); end = @() }; $beforeFirstId = $true
-foreach ($line in Get-Content -Encoding UTF8 $reportPath) {
-  if ($line -match '^\s*[-*]?\s*\**id\**:\s*`?[A-Za-z0-9._-]+') { $beforeFirstId = $false }
-  $kind = if ($line -match '검토 시작 지문\**\s*:') { 'start' } elseif ($line -match '검토 끝 지문\**\s*:') { 'end' } else { $null }
-  if (-not $kind) { continue }
-  if (-not $beforeFirstId) { Stop-Release "과적합 검토 보고서의 지문 줄($kind)이 첫 지적 줄 뒤에 있습니다 — 보고서 맨 앞 두 줄에서만 읽습니다" }
-  $vals = @{}
-  foreach ($key in 'contentHash', 'testsHash', 'harnessHash', 'promptHash') { if ($line -match "$key\W+([0-9a-f]{64})\b") { $vals[$key] = $Matches[1] } }
-  $headLines[$kind] += , $vals
-}
-if ($headLines.start.Count -ne 1 -or $headLines.end.Count -ne 1) { Stop-Release "과적합 검토 보고서 맨 앞에 「검토 시작 지문」「검토 끝 지문」 줄이 한 번씩 있어야 합니다(시작 $($headLines.start.Count)개, 끝 $($headLines.end.Count)개)" }
+$headLines = Read-ReportHead $reportPath
+if ($headLines.late) { Stop-Release "과적합 검토 보고서의 지문 줄($($headLines.late))이 첫 지적 줄 뒤에 있습니다 — 보고서 맨 앞 줄에서만 읽습니다" }
+if ($headLines.start.Count -ne 1 -or $headLines.end.Count -ne 1 -or $headLines.base.Count -gt 1) { Stop-Release "과적합 검토 보고서 맨 앞에 「검토 시작 지문」「검토 끝 지문」 줄이 한 번씩(「검토 바탕 지문」은 많아야 한 번) 있어야 합니다(시작 $($headLines.start.Count)개, 끝 $($headLines.end.Count)개, 바탕 $($headLines.base.Count)개)" }
 $head = $headLines.start[0]; $tail = $headLines.end[0]
 foreach ($key in 'contentHash', 'testsHash', 'harnessHash', 'promptHash') {
   if (-not $head[$key] -or $head[$key] -ne $tail[$key]) { Stop-Release "과적합 검토 보고서의 시작·끝 지문($key)이 없거나 다릅니다 — 검토 중에 바뀐 판입니다" }
 }
-foreach ($key in @('contentHash', 'promptHash') + @(if ($hasTests) { 'harnessHash' })) {
+foreach ($key in 'contentHash', 'promptHash', 'harnessHash') {
   if ([string]$overfit.$key -ne $head[$key]) { Stop-Release "과적합 검토 기록의 $key가 검토자가 잰 지문과 다릅니다 — 검토자가 본 판이어야 합니다(검토 뒤 고쳤으면 다시 검토)" }
 }
 $recorded = @(Get-Items $overfit.findings | ForEach-Object { $_.id })
@@ -278,49 +287,80 @@ foreach ($file in @(Get-ChildItem (Join-Path $root 'release') -Filter "overfit-r
     if ($parsed.severity[$id] -eq 'high' -and @($owners | Where-Object { $_.status -ne 'fixed' -and (-not $_.quote -or -not $_.question) }).Count) { Stop-Release "보고서($rel)의 high 지적($id)을 고침(fixed) 말고 다른 상태로 닫으려면 사용자 원문(quote)·그때 물은 글(question)이 필요합니다" }
   }
 }
+# 회차 사슬: 지시문은 앞 회차가 끝까지 본 판(바탕 판) 이후 바뀐 곳만 보게 한다(5분 검토). 그 사이 바뀐 것이 검토 없이 빠지지 않게, 마지막 회차부터 바탕 판을
+# 거슬러 올라가 직전 출시판과의 전체 차이를 본 회차(바탕 줄 없이 예전 지시문으로 한 회차, 또는 바탕 = 직전 출시판)에 닿아야 한다. 바탕 판은 묶인 다른
+# 회차 보고서의 끝 지문이어야 하고 그 회차는 시작 = 끝이어야 한다(검토 도중 바뀐 판은 끝까지 본 판이 아님)
+$heads = @{}
+foreach ($rel in @($boundReports.Keys)) { $heads[$rel] = Read-ReportHead (Join-Path $root ($rel -replace '/', '\')) }
+$sameHead = { param($h) $h -and -not $h.late -and $h.start.Count -eq 1 -and $h.end.Count -eq 1 -and $h.base.Count -le 1 -and
+  @('contentHash', 'testsHash', 'harnessHash', 'promptHash' | Where-Object { -not $h.start[0][$_] -or $h.start[0][$_] -ne $h.end[0][$_] }).Count -eq 0 }
+$at = ($overfit.report -replace '\\', '/'); $walked = @{}
+while ($true) {
+  $walked[$at] = $true
+  $h = $heads[$at]
+  if (-not $h.base.Count) {
+    if ($h.start[0].promptHash -eq $promptHash) { Stop-Release "과적합 검토 보고서($at)에 「검토 바탕 지문」 줄이 없습니다 — 지금 지시문은 바탕 판(앞 회차가 끝까지 본 판)을 적게 합니다" }
+    break
+  }
+  $base = $h.base[0]
+  if (-not $base.contentHash -or -not $base.testsHash -or -not $base.harnessHash) { Stop-Release "과적합 검토 보고서($at)의 「검토 바탕 지문」에 contentHash·testsHash·harnessHash가 다 있어야 합니다" }
+  if ($base.contentHash -eq $changes.baseContentHash) { break }
+  $prev = @($heads.Keys | Where-Object { -not $walked[$_] -and (& $sameHead $heads[$_]) } | Where-Object {
+    $end = $heads[$_].end[0]; $end.contentHash -eq $base.contentHash -and $end.testsHash -eq $base.testsHash -and $end.harnessHash -eq $base.harnessHash })
+  if (-not $prev.Count) { Stop-Release "과적합 검토 보고서($at)의 바탕 판이 묶인 앞 회차 검토가 끝까지 본 판이 아닙니다 — 그 사이 바뀐 것이 검토 없이 빠집니다(바탕 판을 앞 회차 끝 판으로 다시 검토하세요)" }
+  $at = $prev[0]
+}
+# 알고 있는 결함을 안 고친 채(wontfix) 내지 않는다 — 그 결함을 사용자가 알고 받아들인 원문(quote)·그때 물은 글(question)이 결함마다 따로 있어야 한다.
+# 정책 한 줄(검토에 시간이 든다 등)로 여러 결함을 한꺼번에 남기면 막는다
+$wontfix = @($everyFinding | Where-Object { $_.status -eq 'wontfix' })
+foreach ($finding in $wontfix) {
+  if (-not $finding.quote -or -not $finding.question) { Stop-Release "지적 $($finding.id): 알고 있는 결함을 안 고침(wontfix)으로 닫으려면 그 결함을 사용자가 알고 받아들인 원문(quote)·물은 글(question)이 있어야 합니다 — 고치세요" }
+}
+$shared = @($wontfix | Group-Object { "$($_.quote)`n$($_.question)" } | Where-Object { $_.Count -gt 1 })
+if ($shared.Count) { Stop-Release "여러 지적을 같은 사용자 답 하나로 안 고침 처리했습니다($(@($shared | ForEach-Object { @($_.Group | ForEach-Object { $_.id }) -join '·' }) -join ', ')) — 결함마다 고치거나 따로 물으세요" }
 # 6) release\base-run.json — 고치기 전 판(직전 출시판) 실행 기록. 고침(changes fix)·고쳤다는 검토 지적(fixed)의 확인 시험은 그 판에서 통과하지
 #    않아야 한다(그 고침을 확인하는 시험인지). 사람이 적은 failsBefore 글만으로는 막지 못했다(과적합 검토 3차). 기록은 실행기가 남긴다.
 #    failCheck(확인 이름)를 적은 항목은 그 확인이 고치기 전에 실패했어야 한다(시험 안 다른 확인의 실패로 지나가지 않게). 이번 판 안에서 생긴 회귀
 #    (regression)는 직전 출시판에서 통과하므로, 고치기 전 개발판 기록(release\dev-base-run.json의 devBase 지문 판)에서 failCheck가 실패했어야 한다
 #    (과적합 검토 6차 — 회귀 지적의 근거가 상관없는 확인의 1.3.1 실패였음).
-if ($hasTests) {
-  $basePath = Join-Path $root 'release\base-run.json'
-  $baseRun = if (Test-Path $basePath) { Get-Content -Raw -Encoding UTF8 $basePath | ConvertFrom-Json } else { $null }
-  $devPath = Join-Path $root 'release\dev-base-run.json'
-  $devRun = if (Test-Path $devPath) { Get-Content -Raw -Encoding UTF8 $devPath | ConvertFrom-Json } else { $null }
-  $itemOf = { param($label, $x) @{ label = $label; test = $x.test; failCheck = $x.failCheck; regression = [bool]$x.regression; devBase = $x.devBase } }
-  $mustFailBefore = @()
-  $mustFailBefore += @($changes.changes | Where-Object { $_.origin -eq 'fix' } | ForEach-Object { & $itemOf "바뀐 점 $($_.id)" $_ })
-  $mustFailBefore += @($review.findings | Where-Object { $_.status -eq 'fixed' } | ForEach-Object { & $itemOf "지적 $($_.id)" $_ })
-  $mustFailBefore += @($overfit.findings | Where-Object { $_.status -eq 'fixed' } | ForEach-Object { & $itemOf "과적합 지적 $($_.id)" $_ })
-  if ($mustFailBefore.Count) {
-    if (-not $baseRun) { Stop-Release '고치기 전 판 실행 기록이 없습니다(release\base-run.json — node tests/run.js --ext=<직전 출시판 폴더> --base-record)' }
-    if (-not $changes.baseContentHash -or $baseRun.baseContentHash -ne $changes.baseContentHash) { Stop-Release '고치기 전 판 실행 기록이 바뀐 점 기록의 기준 판(baseContentHash)과 다릅니다' }
-    foreach ($item in $mustFailBefore) {
-      if ($item.regression) {
-        if (-not $item.devBase -or -not $item.failCheck) { Stop-Release "$($item.label)`: 회귀(regression)는 고치기 전 개발판 지문(devBase)과 실패해야 할 확인(failCheck)이 필요합니다" }
-        if ($item.devBase -eq $changes.baseContentHash) { Stop-Release "$($item.label)`: 회귀의 고치기 전 판(devBase)이 직전 출시판과 같습니다" }
-        $base = if ($devRun) { $devRun.bases.PSObject.Properties[$item.devBase] } else { $null }
-        if (-not $base) { Stop-Release "$($item.label)`: 고치기 전 개발판($($item.devBase)) 실행 기록이 없습니다(node tests/run.js --ext=<그 판 폴더> --dev-base-record)" }
-        $entry = $base.Value.cases.PSObject.Properties[$item.test]
-        $where = '고치기 전 개발판'
-      } else {
-        $entry = $baseRun.cases.PSObject.Properties[$item.test]
-        $where = '고치기 전 판'
-      }
-      if (-not $entry) { Stop-Release "$($item.label)`: 확인 시험($($item.test))을 $where 실행 기록에서 찾지 못했습니다" }
-      if ($entry.Value.status -eq 'CHANGED') { Stop-Release "$($item.label)`: $where 실행 도중 시험 파일이 바뀌어 그 기록은 무효입니다 — 다시 돌리세요" }
-      if ($entry.Value.fileHash -ne (Get-ListHash @($entry.Value.file))) { Stop-Release "$($item.label)`: $where 실행 뒤 시험($($item.test)) 파일이 바뀌었습니다 — 다시 돌리세요" }
-      if ([string]$entry.Value.libHash -ne [string](Get-LibHash $entry.Value.file)) { Stop-Release "$($item.label)`: $where 실행 뒤 시험($($item.test))이 쓰는 시험 도구(tests/lib)가 바뀌었거나 기록에 도구 지문(libHash)이 없습니다 — 다시 돌리세요" }
-      if ($item.failCheck) {
-        $check = @($entry.Value.checks | Where-Object { $_.label -eq $item.failCheck })
-        if (-not $check.Count) { Stop-Release "$($item.label)`: $where 기록에 확인($($item.failCheck))이 없습니다" }
-        if (@($check | Where-Object { $_.ok }).Count) { Stop-Release "$($item.label)`: 확인($($item.failCheck))이 $where 기록에서도 통과합니다 — 그 고침을 확인하는 확인이 아닙니다" }
-      } elseif ($entry.Value.status -eq 'PASS') { Stop-Release "$($item.label)`: 확인 시험($($item.test))이 $where 기록에서도 통과합니다 — 그 고침을 확인하는 시험이 아닙니다" }
+$basePath = Join-Path $root 'release\base-run.json'
+$baseRun = if (Test-Path $basePath) { Get-Content -Raw -Encoding UTF8 $basePath | ConvertFrom-Json } else { $null }
+$devPath = Join-Path $root 'release\dev-base-run.json'
+$devRun = if (Test-Path $devPath) { Get-Content -Raw -Encoding UTF8 $devPath | ConvertFrom-Json } else { $null }
+$itemOf = { param($label, $x) @{ label = $label; test = $x.test; failCheck = $x.failCheck; regression = [bool]$x.regression; devBase = $x.devBase } }
+$mustFailBefore = @()
+$mustFailBefore += @($changes.changes | Where-Object { $_.origin -eq 'fix' } | ForEach-Object { & $itemOf "바뀐 점 $($_.id)" $_ })
+$mustFailBefore += @($review.findings | Where-Object { $_.status -eq 'fixed' } | ForEach-Object { & $itemOf "지적 $($_.id)" $_ })
+$mustFailBefore += @($overfit.findings | Where-Object { $_.status -eq 'fixed' } | ForEach-Object { & $itemOf "과적합 지적 $($_.id)" $_ })
+if ($mustFailBefore.Count) {
+  if (-not $baseRun) { Stop-Release '고치기 전 판 실행 기록이 없습니다(release\base-run.json — node tests/run.js --ext=<직전 출시판 폴더> --base-record)' }
+  if (-not $changes.baseContentHash -or $baseRun.baseContentHash -ne $changes.baseContentHash) { Stop-Release '고치기 전 판 실행 기록이 바뀐 점 기록의 기준 판(baseContentHash)과 다릅니다' }
+  foreach ($item in $mustFailBefore) {
+    if ($item.regression) {
+      if (-not $item.devBase -or -not $item.failCheck) { Stop-Release "$($item.label)`: 회귀(regression)는 고치기 전 개발판 지문(devBase)과 실패해야 할 확인(failCheck)이 필요합니다" }
+      if ($item.devBase -eq $changes.baseContentHash) { Stop-Release "$($item.label)`: 회귀의 고치기 전 판(devBase)이 직전 출시판과 같습니다" }
+      $base = if ($devRun) { $devRun.bases.PSObject.Properties[$item.devBase] } else { $null }
+      if (-not $base) { Stop-Release "$($item.label)`: 고치기 전 개발판($($item.devBase)) 실행 기록이 없습니다(node tests/run.js --ext=<그 판 폴더> --dev-base-record)" }
+      $entry = $base.Value.cases.PSObject.Properties[$item.test]
+      $where = '고치기 전 개발판'
+    } else {
+      $entry = $baseRun.cases.PSObject.Properties[$item.test]
+      $where = '고치기 전 판'
     }
+    if (-not $entry) { Stop-Release "$($item.label)`: 확인 시험($($item.test))을 $where 실행 기록에서 찾지 못했습니다" }
+    if ($entry.Value.status -eq 'CHANGED') { Stop-Release "$($item.label)`: $where 실행 도중 시험 파일이 바뀌어 그 기록은 무효입니다 — 다시 돌리세요" }
+    if ($entry.Value.fileHash -ne (Get-ListHash @($entry.Value.file))) { Stop-Release "$($item.label)`: $where 실행 뒤 시험($($item.test)) 파일이 바뀌었습니다 — 다시 돌리세요" }
+    if ([string]$entry.Value.libHash -ne [string](Get-LibHash $entry.Value.file)) { Stop-Release "$($item.label)`: $where 실행 뒤 시험($($item.test))이 쓰는 시험 도구(tests/lib)가 바뀌었거나 기록에 도구 지문(libHash)이 없습니다 — 다시 돌리세요" }
+    if ($item.failCheck) {
+      $check = @($entry.Value.checks | Where-Object { $_.label -eq $item.failCheck })
+      if (-not $check.Count) { Stop-Release "$($item.label)`: $where 기록에 확인($($item.failCheck))이 없습니다" }
+      if (@($check | Where-Object { $_.ok }).Count) { Stop-Release "$($item.label)`: 확인($($item.failCheck))이 $where 기록에서도 통과합니다 — 그 고침을 확인하는 확인이 아닙니다" }
+    } elseif ($entry.Value.status -eq 'PASS') { Stop-Release "$($item.label)`: 확인 시험($($item.test))이 $where 기록에서도 통과합니다 — 그 고침을 확인하는 시험이 아닙니다" }
   }
 }
-Write-Output "출시 관문 통과: 시험 $(@(Get-Items $run.cases).Count)종 모두 통과($($run.at)), 검토 지적 $(@(Get-Items $review.findings).Count)개 처리됨, 바뀐 점 $(@(Get-Items $changes.changes).Count)개 출처 확인, 미확인 경로 $(@(Get-Items $risks.risks).Count)개 닫힘, 과적합 지적 $(@(Get-Items $overfit.findings).Count)개 처리됨"
+# 검사 도중 시험 파일을 불러오므로(Get-LibHash) 그 사이 확장 파일이 바뀌지 않았는지 zip 직전에 다시 잰다
+if ((Get-ListHash $files) -ne $contentHash) { Stop-Release '관문 검사 도중 확장 파일이 바뀌었습니다 — 다시 돌리세요' }
+Write-Output "출시 관문 통과: 시험 $(@(Get-Items $run.cases).Count)종 모두 통과($($run.at)), 검토 지적 $(@(Get-Items $review.findings).Count)개 처리됨, 바뀐 점 $(@(Get-Items $changes.changes).Count)개 출처 확인, 미확인 경로 $(@(Get-Items $risks.risks).Count)개 닫힘, 과적합 지적 $(@(Get-Items $overfit.findings).Count)개 처리됨, 마지막 검토 $($source.minutes)분"
 
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force $dist | Out-Null

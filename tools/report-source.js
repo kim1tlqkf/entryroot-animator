@@ -28,11 +28,13 @@ const uses = messages.filter(entry => entry.type === 'assistant').flatMap(entry 
 const hashRuns = uses.filter(use => typeof use.input?.command === 'string' && /gate-hashes\.js(?!\s+--)/.test(use.input.command)).map(use => use.id);
 const results = new Map();
 for (const entry of messages) for (const block of blocks(entry)) if (block.type === 'tool_result') results.set(block.tool_use_id, textOf({ message: { content: [block] } }));
-// 고정 지시문을 읽은 기록: 도구와 상관없이(Read·셸 출력) 지시문 파일을 가리킨 호출의 결과에 지시문 첫 줄 글이 든다
+// 고정 지시문을 읽은 기록: 도구와 상관없이(Read·셸 출력) 지시문 파일을 가리킨 호출들의 결과에 지시문의 글 줄이 모두 든다(나눠 읽어도 됨 — 첫 줄만
+// 읽은 기록을 가른다)
 const promptFile = path.join(root, 'release', 'overfit-review-prompt.md');
-const promptLine = (fs.existsSync(promptFile) ? fs.readFileSync(promptFile, 'utf8') : '').split(/\r?\n/).map(line => line.trim()).find(line => line.length >= 10) || null;
+const promptLines = (fs.existsSync(promptFile) ? fs.readFileSync(promptFile, 'utf8') : '').split(/\r?\n/).map(line => line.trim()).filter(line => line.length >= 10);
 const promptReads = uses.filter(use => /overfit-review-prompt\.md/.test(JSON.stringify(use.input || {})));
-if (!promptLine || !promptReads.some(use => (results.get(use.id) || '').includes(promptLine))) fail('고정 지시문을 읽은 기록(지시문 파일을 가리킨 도구 호출 결과에 지시문 글)이 없음');
+const readText = promptReads.map(use => results.get(use.id) || '').join('\n');
+if (!promptLines.length || !promptLines.every(line => readText.includes(line))) fail('고정 지시문을 다 읽은 기록(지시문 파일을 가리킨 도구 호출 결과에 지시문 글 줄이 모두)이 없음');
 const KEYS = ['contentHash', 'testsHash', 'harnessHash', 'promptHash'];
 const valuesIn = text => { const out = {}; for (const key of KEYS) { const m = String(text).match(new RegExp(`${key}\\W+([0-9a-f]{64})`)); if (m) out[key] = m[1]; } return out; };
 const measured = hashRuns.map(runId => valuesIn(results.get(runId) || '')).filter(values => KEYS.every(key => values[key]));
@@ -40,15 +42,24 @@ if (measured.length < 1) fail('검토 중에 node tools/gate-hashes.js로 잰 �
 const lastUse = uses[uses.length - 1];
 if (!lastUse || lastUse.name !== 'SubagentHandback' || typeof lastUse.input?.message !== 'string') fail('마지막 도구 호출이 보고서를 돌려준 SubagentHandback이 아님');
 const report = typeof lastUse?.input?.message === 'string' ? lastUse.input.message : '';
-const head = { start: null, end: null };
+const head = { start: null, end: null, base: null };
 for (const line of report.split('\n')) {
   if (/^\s*[-*]?\s*\**id\**:\s*`?[A-Za-z0-9._-]+/.test(line)) break;
   if (/검토 시작 지문\**\s*:/.test(line)) head.start = valuesIn(line);
   else if (/검토 끝 지문\**\s*:/.test(line)) head.end = valuesIn(line);
+  else if (/검토 바탕 지문\**\s*:/.test(line)) head.base = valuesIn(line);
 }
-const same = (a, b) => !!a && !!b && KEYS.every(key => a[key] && a[key] === b[key]);
+const same = (a, b, keys = KEYS) => !!a && !!b && keys.every(key => a[key] && a[key] === b[key]);
 if (measured.length && !(same(head.start, measured[0]) && same(head.end, measured[measured.length - 1]))) fail('보고서 머리 지문이 검토 중 gate-hashes 실행 결과(처음·마지막)와 다름');
+// 「검토 바탕 지문」은 검토 중 node tools/gate-hashes.js --root <바탕 판 폴더>로 잰 값이어야 한다
+const BASE_KEYS = ['contentHash', 'testsHash', 'harnessHash'];
+// (지금 판 지문과 한 명령으로 이어 재면 출력에 지문 묶음이 둘 — 바탕 값 셋이 그 출력에 그대로 들어 있는지로 본다)
+const baseRuns = uses.filter(use => typeof use.input?.command === 'string' && /gate-hashes\.js\s+--root\b/.test(use.input.command)).map(use => results.get(use.id) || '');
+if (head.base && !(BASE_KEYS.every(key => head.base[key]) && baseRuns.some(out => BASE_KEYS.every(key => out.includes(head.base[key]))))) fail('보고서 「검토 바탕 지문」이 검토 중 gate-hashes --root 실행 결과와 다름');
+// 검토에 걸린 시간(분, 첫 줄~마지막 줄 시각) — 관문이 알려 줌
+const times = entries.map(entry => Date.parse(entry.timestamp)).filter(Number.isFinite);
+const minutes = times.length ? Math.round((Math.max(...times) - Math.min(...times)) / 6000) / 10 : null;
 const parent = sessionDir + '.jsonl';
 if (!fs.existsSync(parent) || !id || !fs.readFileSync(parent, 'utf8').includes(id)) fail('상위 세션 기록에 이 보조 에이전트가 없음');
 const sha = report ? crypto.createHash('sha256').update(Buffer.from(report, 'utf8')).digest('hex') : null;
-console.log(JSON.stringify({ ok: !problems.length, problems, sha }));
+console.log(JSON.stringify({ ok: !problems.length, problems, sha, minutes }));

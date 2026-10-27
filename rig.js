@@ -9,7 +9,9 @@
   let layersFolded = false;
   let pivotUI = null;
   let pendingSaves = [];
-  let lastSiteSave = null; // 엔트리 저장(fileSave)이 보낸, 아직 답이 없는 모양 저장 { at, fileId }
+  // 엔트리 저장(fileSave)이 보낸, 아직 답이 없는 모양 저장 { at, fileId, token(그때 불러오기 표식), picture, flow, name, payload, request }
+  const siteSaves = [];
+  const failedSaves = new Map(); // 다른 모양으로 간 뒤 올리기가 실패한 모양 id → 저장 순간 그림(그 모양을 다시 열면 되살림)
   let lastCross = null;
   let costumeOnionEnabled = false;
   // 기준 모양: 오브젝트 id → 고정한 모양 id. 다른 모양을 볼 때도 주황색으로 겹쳐 보인다(이 탭에서만 기억).
@@ -452,6 +454,9 @@
         const model = owner?.pictures?.find?.(picture => picture.id === file.id);
         if (model && typeof model.name === 'string' && file.name !== model.name) file.name = model.name;
       } catch (error) { console.warn('[entry-vector-rig] 모양 이름 맞추기', error); }
+      // 올리기가 실패했는데 그림판이 이미 다른 모양이면 그린 것이 사라진다(엔트리 원래 동작) — 저장 순간 그림을 임시저장과 같은 꼴로 들고 있는다
+      let restorePayload = null;
+      if (window.Entry?.stage?.selectedObject) try { restorePayload = quickPayload(this.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 저장 순간 그림 담기', error); }
       // 비트맵 레이어: 저장하는 동안만 그림 층에 합친 그림을 넣는다(아래 무한 배경·기준점 상자·PNG 처리가 모두 합친 그림으로)
       let layerSwap = null;
       try { layerSwap = beginLayerSave(this.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 레이어 저장 준비 실패', error); }
@@ -565,8 +570,14 @@
         return previousDispatch.call(this, name, payload, ...rest);
       };
       let result;
-      if (window.Entry?.stage?.selectedObject) lastSiteSave = { at: Date.now(), fileId: this.file?.id,
-        flow: this.__evrDuplicating ? 'duplicate' : this.file?.mode === 'new' ? 'new' : 'save' };
+      if (window.Entry?.stage?.selectedObject) {
+        const now = Date.now();
+        while (siteSaves.length && now - siteSaves[0].at > SITE_SAVE_WAIT) siteSaves.shift();
+        const save = { at: now, fileId: this.file?.id, token: this.__evrLoadToken, picture: currentPicture(this), name: this.file?.name || '', payload: restorePayload,
+          flow: this.__evrDuplicating ? 'duplicate' : this.file?.mode === 'new' ? 'new' : 'save' };
+        siteSaves.push(save);
+        setTimeout(() => { if (!save.request && siteSaves.includes(save)) { siteSaves.splice(siteSaves.indexOf(save), 1); siteSaveFailed(save, true); } }, SITE_SAVE_SEND_WAIT);
+      }
       try { result = original.apply(this, args); }
       finally {
         if (fullPng) {
@@ -599,17 +610,67 @@
     };
   }
   // 엔트리는 모양 저장 그림을 보내자마자 "고침" 표시를 끄고(fileSave), 올리기가 실패해도 알리지 않는다 — 다른 모양을 눌러도 묻지 않아 그린 것이
-  // 말없이 사라졌다(확장 없이도 같음, 시험 재현). 그 모양이 그림판에 그대로 열려 있으면 고침 표시를 되살리고 알린다.
+  // 말없이 사라졌다(확장 없이도 같음, 시험 재현). 그 모양이 그림판에 그대로 열려 있으면 고침 표시를 되살리고 알린다. 이미 다른 모양이면(다른 모양을
+  // 눌러 "저장할까요?" [확인]) 저장 순간 그림을 들고 있다가 그 모양을 다시 열 때 되살린다.
   const isPictureSave = url => /\/rest\/picture\/canvas(?:[?#]|$)/.test(String(url || ''));
-  function siteSaveFailed() {
-    const save = lastSiteSave, file = window.Entry?.playground?.painter?.file;
-    lastSiteSave = null;
-    if (!save || Date.now() - save.at > 120000 || !file || file.id !== save.fileId) return;
-    file.modified = true;
-    if (file.mode === 'new') file.mode = 'edit';
+  const SITE_SAVE_WAIT = 120000;
+  // 엔트리는 fileSave 직후(실측 0.1초 안) 모양 저장 요청을 보낸다. 앞 모양 저장 답을 기다리는 동안의 저장(다른 모양을 눌러 "저장할까요?" [확인])은
+  // 고침 표시만 끄고 요청을 보내지 않는다(확장 없이도 같음, 앞 저장이 성공해도 안 보냄 — 실측) — 이만큼 지나도 요청이 없으면 보내지 않은 것으로 본다
+  const SITE_SAVE_SEND_WAIT = 10000;
+  // 요청 본문에는 어느 모양인지가 없다(data·ext·notrim) — 요청을 아직 이어지지 않은 저장 중 가장 최근 것과 잇는다(보내지 않은 저장이 사이에 끼어도)
+  function claimSiteSave(request) {
+    const now = Date.now(), save = [...siteSaves].reverse().find(item => !item.request && now - item.at <= SITE_SAVE_SEND_WAIT);
+    if (save) save.request = request;
+    return save || null;
+  }
+  function siteSaveDone(save, ok) {
+    if (!save) return;
+    const at = siteSaves.indexOf(save);
+    if (at >= 0) siteSaves.splice(at, 1);
+    if (!ok) siteSaveFailed(save);
+  }
+  const AGAIN = { duplicate: '다시 [복제하기]를 누르세요([저장하기]는 지금 모양에 저장합니다)', new: '다시 [새 모양으로 저장하기]를 누르세요([저장하기]는 지금 모양에 저장합니다)' };
+  // unsent: 엔트리가 요청을 보내지 않은 저장
+  function siteSaveFailed(save, unsent = false) {
+    const painter = window.Entry?.playground?.painter, file = painter?.file;
+    if (!save || Date.now() - save.at > SITE_SAVE_WAIT || !file) return;
+    const name = save.name ? `「${save.name}」` : '';
+    const lead = unsent ? `앞 모양 저장이 끝나기 전이라 엔트리가 모양 ${name}을 서버에 보내지 않았습니다.` : `모양 ${name}을 서버에 저장하지 못했습니다(인터넷 연결을 확인하세요).`;
     // 복제·새 모양으로 저장이 실패한 뒤 [저장하기]를 누르면 지금 모양에 저장된다(원래 모양이 덮임) — 같은 동작을 다시 누르라고 안내한다
-    const again = { duplicate: '다시 [복제하기]를 누르세요([저장하기]는 지금 모양에 저장합니다)', new: '다시 [새 모양으로 저장하기]를 누르세요([저장하기]는 지금 모양에 저장합니다)' }[save.flow] || '다시 저장하세요';
-    toast(`모양을 서버에 저장하지 못했습니다(인터넷 연결을 확인하세요). 그린 것은 그대로 있으니 ${again}.`, 10000);
+    const again = AGAIN[save.flow] || '다시 저장하세요';
+    // 보낸 뒤 그 모양을 다시 불러오지 않았으면(불러오기 표식 그대로) 그린 것이 그림판에 그대로다 — 다른 모양에 갔다 돌아왔으면 서버 그림이다
+    if (file.id === save.fileId && painter.__evrLoadToken === save.token) {
+      file.modified = true;
+      if (file.mode === 'new') file.mode = 'edit';
+      toast(`${unsent ? lead : '모양을 서버에 저장하지 못했습니다(인터넷 연결을 확인하세요).'} 그린 것은 그대로 있으니 ${again}.`, 10000);
+      return;
+    }
+    if (!save.payload) { toast(`${lead} 그 모양을 다시 열어 그려 주세요.`, 10000); return; }
+    const held = failedSaves.get(save.fileId);
+    if (!held || held.at <= save.at) failedSaves.set(save.fileId, save); // 늦게 온 옛 저장의 실패가 더 새 그림을 덮지 않게
+    toast(`${lead} 그 모양을 다시 열면 그린 것을 되살립니다.`, 10000);
+    if (file.id === save.fileId && !painter.__evrLoading) restoreFailedSave(painter); // 이미 다시 열려 있음(서버 그림)
+  }
+  // 저장하지 못한 그림을 들고 있는 모양이 그림판에 다 열렸으면 그 그림을 넣고 고침 표시를 켠다(임시저장 열기와 같은 길 — 되돌리기 한 번에 서버 그림)
+  async function restoreFailedSave(painter) {
+    const picture = currentPicture(painter), save = picture && failedSaves.get(picture.id);
+    if (!save || painter.file?.id !== picture.id) return;
+    failedSaves.delete(picture.id);
+    // 다시 연 뒤 새로 그렸으면 덮지 않고 이 모양의 임시저장 목록에 넣는다
+    if (painter.file.modified) {
+      try {
+        await draftStore(picture, fullPayload(save.payload));
+        toast('저장하지 못한 그림을 이 모양의 임시저장 목록에 넣었습니다 — 지금 그린 것은 그대로이고, [저장하기] 메뉴의 임시저장에서 열 수 있습니다.', 10000);
+      } catch (error) { toast(`저장하지 못한 그림을 임시저장에 넣지 못했습니다: ${error.message || error}`, 10000); }
+      return;
+    }
+    try {
+      await putPaintPayload(painter, picture, fullPayload(save.payload));
+      if (painter.file.mode === 'new') painter.file.mode = 'edit';
+      toast(`저장하지 못한 그림을 되살렸습니다 — ${AGAIN[save.flow] || '다시 저장하세요'}.`, 10000);
+    } catch (error) {
+      toast(`저장하지 못한 그림을 되살리지 못했습니다: ${error.message || error}`, 10000);
+    }
   }
   // 엔트리는 업로드가 끝난 뒤 모양 주소와 크기를 바꾼다. 확인창 저장이면 그때 편집기는 이미 다음
   // 모양을 열고 있으므로, 저장 순간에 잰 크기를 모양 id로 찾아 넣는다.
@@ -999,7 +1060,7 @@
     const painter = window.Entry.playground.painter;
     // 그 모양에서 보낸 저장이 아직 오가면 다시 불러오지 않는다 — 새 모양으로 저장(복제)은 원래 모양도 맞추는데, 올리기가 실패하면 그린 것이
     // 원래 모양 저장본으로 덮였다(시험 재현)
-    if (painter?.file?.id === fresh.id && !painter.file.modified && lastSiteSave?.fileId !== fresh.id) painter.afterModified(fresh);
+    if (painter?.file?.id === fresh.id && !painter.file.modified && !siteSaves.some(save => save.fileId === fresh.id)) painter.afterModified(fresh);
     // 엔트리 저장 처리는 여기서 그림을 미리 불러 두지만, 여러 개를 맞출 때 서버 요청이 몰려
     // 연결이 끊기는 데 보태므로 하지 않는다. 엔트리는 그림이 필요할 때 직접 불러온다.
   }
@@ -1481,6 +1542,7 @@
       clearTimeout(painter.__evrLoadingTimer);
       clearTimeout(painter.__evrLoadingSlowTimer);
       showLoadingCover(painter, false);
+      if (failedSaves.size) setTimeout(() => restoreFailedSave(painter), 0); // 엔트리 기록 알림 처리 밖에서
     };
     painter.entryPaint?.once?.('SNAPSHOT_SAVED', finish);
     setTimeout(finish, 5000);
@@ -4893,6 +4955,7 @@
     wide.setImage(canvas);
     wide.position = new c.ep.paper.Point(left + width / 2, top + height / 2);
     Object.assign(wide.data, raster.data);
+    delete wide.data[CUT_RECORD];
     // 뼈대 맞추기는 넓히기 전 그림으로 판단한다(옮기기만 한 그림을 넓히면 크기가 달라져 "고친 그림"으로 보였다). 휘기 전 그림도 넘긴다.
     if (raster.data?.[BONES]) wide.__evrSigBefore = rasterSig(raster);
     const rest = restCanvases.get(raster);
@@ -7354,6 +7417,7 @@
         const items = c.layer.children.filter(item => item.data?.entryVectorCanvasBox !== '1');
         items.forEach(item => item.translate(dx, dy));
         try { contentMoved(c, items, { x: dx, y: dy }); } catch (error) { console.warn('[entry-vector-rig] 캔버스 기준점 관절', error); }
+        if (bitmapMode(c)) try { commitLayerShift(ep, { x: dx, y: dy }); } catch (error) { console.warn('[entry-vector-rig] 캔버스 기준점 레이어', error); }
         if (items.length) saveEntryHistory(ep);
       }
       close();
@@ -8323,7 +8387,17 @@
     const layer = paintLayer(ep)?.layer;
     if (!layer || own(layer, '__evrLayerHook')) return;
     Object.defineProperty(layer, '__evrLayerHook', { value: true });
-    const rasterize = layer.rasterize, importJSON = layer.importJSON, addChild = layer.addChild, removeChildren = layer.removeChildren;
+    const rasterize = layer.rasterize, importJSON = layer.importJSON, addChild = layer.addChild, removeChildren = layer.removeChildren, addChildren = layer.addChildren;
+    // 엔트리 [자르기]→[붙여넣기]는 잘라 둔 조각을 같은 자리에 복제해 넣는다(붙여넣기 수 0 — entry-paint 261024). 다시 연 그림의 미리 골라 둔 조각이면 붙인
+    // 조각도 그렇게 본다(그냥 끌 때처럼 관절이 따라감). [복사하기]→[붙여넣기](옆으로 비켜 놓은 복사본)는 그대로
+    layer.addChildren = function (items, ...rest) {
+      try {
+        const clip = paintStore()?.getState?.()?.paint?.clipboardInfo;
+        if (clip && clip.copyCount === 0 && Array.isArray(items) && Array.isArray(clip.items) && items.length === clip.items.length)
+          items.forEach((item, i) => { if (openedPieces.has(clip.items[i])) openedPieces.add(item); });
+      } catch (error) { console.warn('[entry-vector-rig] 자르고 붙인 조각', error); }
+      return addChildren.call(this, items, ...rest);
+    };
     layer.removeChildren = function (...args) {
       const convert = layerUi.convert;
       const removed = removeChildren.apply(this, args);
@@ -8362,6 +8436,7 @@
       const carried = typeof json === 'string' ? json.includes(`"${LAYERS}"`) : json?.[1]?.data?.[LAYERS] !== undefined;
       const result = importJSON.apply(this, args);
       if (!carried && this.data && LAYERS in this.data) delete this.data[LAYERS];
+      try { restoreCut(this); } catch (error) { console.warn('[entry-vector-rig] 떼어 낸 사각 되살리기', error); }
       layerUi.signature = null;
       try { refreshLayers(ep); } catch (error) { console.warn('[entry-vector-rig] 레이어 되돌리기', error); }
       return result;
@@ -9294,6 +9369,65 @@
       return original.call(this, id, ...rest);
     };
   }
+  // 엔트리 오브젝트 [복제하기]와 [복사하기]→[붙여넣기]는 모두 addCloneObject = 모델의 마지막 저장본 복사라 그리던 그림(저장 안 함)이 복제본에 안
+  // 들어갔다(확장 없이도 같음). 원래 오브젝트는 건드리지 않고(고침 표시 그대로 — 엔트리 "저장할까요?"가 그린 것을 지킴) 지금 그림을 담아 두었다가, 그림판이
+  // 복제본의 그 모양을 다 열면 넣고 고침 표시를 켠다. 저장은 사용자가 한다(앞 모양 저장이 오가는 동안 엔트리는 다른 저장을 보내지 않음). 넣지 못하면
+  // (그 모양이 다른 모드로 열림·그 사이 그 모양에 그림·그림판이 복제본으로 오지 않음) 복제본 그 모양의 임시저장 목록에 넣고 알린다.
+  const objectCloneHooked = new WeakSet();
+  let cloneCarry = null; // { objectId, picture(복제본 모양), payload, at, picked }
+  const CLONE_CARRY_WAIT = 60000;
+  function hookObjectClone() {
+    const container = window.Entry?.container;
+    if (!container || typeof container.addCloneObject !== 'function' || objectCloneHooked.has(container)) return;
+    objectCloneHooked.add(container);
+    const original = container.addCloneObject;
+    container.addCloneObject = function (object, ...rest) {
+      const painter = window.Entry?.playground?.painter, file = painter?.file;
+      let held = null;
+      try {
+        if (object && file?.modified && file.objectId === object.id && painter.entryPaint && !painter.__evrLoading && !session) {
+          const index = (object.pictures || []).findIndex(picture => picture.id === file.id);
+          if (index >= 0) held = { index, payload: quickPayload(painter.entryPaint) };
+        }
+      } catch (error) { console.warn('[entry-vector-rig] 그리던 그림 담기', error); held = null; }
+      const clone = original.call(this, object, ...rest);
+      try {
+        const target = held && clone?.pictures?.[held.index];
+        if (target) {
+          if (cloneCarry) keepCloneCarry(cloneCarry, '복제를 한 번 더 해');
+          cloneCarry = { objectId: clone.id, picture: target, payload: held.payload, at: Date.now(), picked: false };
+        }
+      } catch (error) { console.warn('[entry-vector-rig] 복제본 모양 찾기', error); }
+      return clone;
+    };
+  }
+  // 갱신마다: 그림판이 복제본의 그 모양을 다 불러왔으면 담은 그림을 넣는다(복제본의 다른 모양이 열렸으면 한 번 그 모양으로 바꾼다)
+  function applyCloneCarry() {
+    const carry = cloneCarry, painter = window.Entry?.playground?.painter, file = painter?.file, ep = painter?.entryPaint;
+    if (!carry || !file || !ep || painter.__evrLoading) return;
+    if (file.objectId === carry.objectId && file.id !== carry.picture.id && !carry.picked) {
+      carry.picked = true;
+      if (window.Entry.playground.object?.pictures?.includes(carry.picture)) { window.Entry.playground.selectPicture(carry.picture); return; }
+    }
+    const ready = file.objectId === carry.objectId && file.id === carry.picture.id;
+    if (ready && ep.mode === carry.payload.mode && !file.modified) {
+      cloneCarry = null;
+      Promise.resolve().then(() => putPaintPayload(painter, carry.picture, fullPayload(carry.payload)))
+        .then(() => toast('복제한 오브젝트에도 그리던 그림을 넣었습니다 — 남기려면 [저장하기]를 누르세요.', 6000))
+        .catch(error => { console.warn('[entry-vector-rig] 복제본에 그림 넣기', error); keepCloneCarry(carry, '그림을 넣다 오류가 나'); });
+      return;
+    }
+    if (ready || Date.now() - carry.at > CLONE_CARRY_WAIT) {
+      cloneCarry = null;
+      keepCloneCarry(carry, !ready ? '그림판이 복제본 모양으로 오지 않아' : ep.mode !== carry.payload.mode ? `복제본 모양이 ${ep.mode === 'BITMAP' ? '비트맵' : '벡터'}으로 열려` : '복제본 모양에 그 사이 그린 것이 있어');
+    }
+  }
+  function keepCloneCarry(carry, why) {
+    // PNG로 바꾸다 나는 예외(오염된 캔버스 등)도 약속 안에서 — 부른 쪽(다음 복제 담기)으로 새지 않게
+    Promise.resolve().then(() => draftStore(carry.picture, fullPayload(carry.payload)))
+      .then(() => toast(`${why} 복제한 오브젝트에 그리던 그림을 바로 넣지 못했습니다 — 그 모양의 [저장하기] 메뉴 임시저장에 넣었습니다.`, 9000))
+      .catch(error => toast(`복제한 오브젝트에 그리던 그림을 넣지 못했습니다: ${error.message || error}`, 9000));
+  }
   // 엔트리 웹사이트는 내려받기를 axios(XMLHttpRequest)로 보낸다. 그 요청만 본문을 바꾸고 나머지는 그대로 보낸다. 모양 저장 올리기는 결과만 본다
   // (siteSaveFailed).
   function hookEntDownload() {
@@ -9307,7 +9441,10 @@
         return open.call(this, method, url, ...rest);
       };
       proto.send = function (body) {
-        if (this.__evrPictureSave) this.addEventListener('loadend', () => { if (this.status >= 200 && this.status < 300) lastSiteSave = null; else siteSaveFailed(); });
+        if (this.__evrPictureSave) {
+          const save = claimSiteSave(this);
+          this.addEventListener('loadend', () => siteSaveDone(save, this.status >= 200 && this.status < 300));
+        }
         if (!this.__evrEnt || typeof body !== 'string') return send.call(this, body);
         withEntLayers(body, this.__evrEnt).then(next => send.call(this, next), () => send.call(this, body));
         return undefined;
@@ -9320,10 +9457,13 @@
         const url = typeof input === 'string' ? input : input?.url;
         if (init && typeof init.body === 'string' && isEntDownload(init.method || 'GET', url))
           return withEntLayers(init.body, url).catch(() => init.body).then(body => fetch0.call(this, input, { ...init, body }, ...rest));
-        if (isPictureSave(url) && !init?.__evrOwn) return fetch0.call(this, input, init, ...rest).then(response => {
-          if (response.ok) lastSiteSave = null; else siteSaveFailed();
-          return response;
-        }, error => { siteSaveFailed(); throw error; });
+        if (isPictureSave(url) && !init?.__evrOwn) {
+          const save = claimSiteSave(input);
+          return fetch0.call(this, input, init, ...rest).then(response => {
+            siteSaveDone(save, response.ok);
+            return response;
+          }, error => { siteSaveDone(save, false); throw error; });
+        }
         return fetch0.call(this, input, init, ...rest);
       };
       wrapped.__evrEntHook = true;
@@ -9460,15 +9600,55 @@
     const picture = currentPicture(window.Entry?.playground?.painter);
     return { v: 1, mode: ep.mode, json: parts.layer.exportJSON({ asString: true }), refs, bones, file: picture ? pictureFile(picture) || null : null };
   }
+  // 저장·복제 순간 그림(실패하면 되살림): draftPayload와 같은 내용이되 PNG로 굽지 않는다 — 큰 그림은 굽는 데 수 초(4096² 잡음 그림 7초 실측)라
+  // 저장을 누를 때마다 멈췄다. 그림 층 글의 그림 칸에는 표시 글을 넣고 캔버스 사본만 들고 있다가 되살릴 때(fullPayload) 굽는다
+  function quickPayload(ep) {
+    const parts = paintLayer(ep);
+    if (!parts) throw Error('그림판을 찾지 못했습니다.');
+    const refs = {}, bones = {}, canvases = {};
+    const meta = ep.mode === 'BITMAP' ? storedLayerMeta(parts.layer) : null;
+    for (const layer of meta?.layers || []) {
+      const content = layer.id !== meta.active && layer.ref && layerCache.get(layer.ref);
+      if (content) refs[layer.ref] = { x: content.x, y: content.y, canvas: content.canvas }; // 레이어 사본은 한 번 만들면 바뀌지 않는다
+      const kept = layerBonesOf(layer);
+      if (kept) bones[layer.bonesRef] = kept;
+    }
+    // paper는 그림을 글로 바꿀 때 source(불러온 그림의 주소, 없으면 toDataURL)를 읽는다 — 그 순간만 표시 글을 돌려주게 한다. 서버 주소로 연 그림은
+    // 주소 그대로(짧음), data 주소 그림·캔버스 그림은 사본(data 주소도 큰 그림이면 수십 MB 글)
+    const rasters = parts.layer.getItems({ class: ep.paper.Raster });
+    let n = 0;
+    for (const raster of rasters) Object.defineProperty(raster, 'source', { configurable: true, get() {
+      const src = this._image?.src;
+      if (src && !String(src).startsWith('data:')) return src;
+      if (!this.width || !this.height) return src || null;
+      const key = `evr-snapshot:${n++}`;
+      canvases[key] = src || rasterCopy(this); // data 주소 글은 바뀌지 않아 그대로 든다
+      return key;
+    } });
+    let json;
+    try { json = parts.layer.exportJSON({ asString: true }); } finally { for (const raster of rasters) delete raster.source; }
+    const picture = currentPicture(window.Entry?.playground?.painter);
+    return { quick: true, mode: ep.mode, json, canvases, refs, bones, file: picture ? pictureFile(picture) || null : null };
+  }
+  function fullPayload(payload) {
+    if (!payload?.quick) return payload;
+    let json = payload.json;
+    for (const [key, held] of Object.entries(payload.canvases)) json = json.split(JSON.stringify(key)).join(JSON.stringify(typeof held === 'string' ? held : held.toDataURL('image/png')));
+    const refs = {};
+    for (const [ref, content] of Object.entries(payload.refs)) refs[ref] = { x: content.x, y: content.y, png: content.canvas.toDataURL('image/png') };
+    return { v: 1, mode: payload.mode, json, refs, bones: payload.bones, file: payload.file };
+  }
   async function draftSaveNow(painter) {
-    await tempSessionCheck();
-    await moveNewProjectDrafts();
     const ep = painter?.entryPaint, picture = currentPicture(painter);
     if (!ep || !picture) throw Error('그림판에 연 모양이 없습니다.');
     if (painter.__evrLoading) throw Error('모양 그림을 불러오는 중입니다. 그림이 보인 뒤 다시 하세요.');
-    const payload = draftPayload(ep);
+    return draftStore(picture, draftPayload(ep));
+  }
+  async function draftStore(picture, payload) {
+    await tempSessionCheck();
+    await moveNewProjectDrafts();
     const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, kind: 'picture', project: tempProjectKey(), picture: picture.id,
-      name: String(picture.name || ''), mode: ep.mode, savedAt: Date.now() };
+      name: String(picture.name || ''), mode: payload.mode, savedAt: Date.now() };
     await tempTx('readwrite', async (store, data) => {
       store.put(item);
       data.put({ id: item.id, data: JSON.stringify(payload) });
@@ -9537,7 +9717,8 @@
     merged.setImage(canvas);
     merged.position = new ep.paper.Point(left + canvas.width / 2, top + canvas.height / 2);
     Object.assign(merged.data, rasters[0].data);
-    delete merged.data.selected; delete merged.data.guideItem;
+    delete merged.data.selected; delete merged.data.guideItem; delete merged.data[CUT_RECORD];
+    if (rasters.includes(selectionCut?.base)) selectionCut = null;
     if (rasters.some(r => !plainRaster(r))) merged.data[SERVER_SHIFT] = 'unknown'; // 돌리거나 늘린 것을 구움 — 서버 그림과 평행 이동이 아님
     rasters[0].replaceWith(merged);
     rasters.slice(1).forEach(r => r.remove());
@@ -10438,7 +10619,7 @@
   // 원래 사각(src) 안의 점 → 끈 네 점 사각형 안의 점
   function perspectiveMap(src, quad) {
     const m = squareToQuad(quad), inv = invert3(m);
-    return {
+    return { m, inv, src,
       forward: p => applyHomography(m, (p.x - src.x) / src.width, (p.y - src.y) / src.height),
       inverse: p => { const u = applyHomography(inv, p.x, p.y); return { u: u.x, v: u.y }; },
     };
@@ -10453,12 +10634,16 @@
     return true;
   }
   // 원본 캔버스를 사상해 그린 캔버스와 그 자리. map.inverse(그림 좌표) = 원본 안 비율 {u, v}, quad = 원본 네 모서리가 간 자리. nearest면 가장 가까운 화소.
+  // 원본 캔버스 화소(원본은 끄는 동안 바뀌지 않음 — 매 프레임 다시 읽지 않게)
+  const warpSourcePixels = new WeakMap();
   function warpCanvas(source, map, quad, nearest) {
     const left = Math.floor(Math.min(...quad.map(p => p.x))), top = Math.floor(Math.min(...quad.map(p => p.y)));
     const width = Math.max(1, Math.ceil(Math.max(...quad.map(p => p.x))) - left), height = Math.max(1, Math.ceil(Math.max(...quad.map(p => p.y))) - top);
     const out = canvasOfSize(width, height), sw = source.width, sh = source.height;
-    const from = source.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, sw, sh).data;
+    let from = warpSourcePixels.get(source);
+    if (!from) { from = source.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, sw, sh).data; warpSourcePixels.set(source, from); }
     const image = out.getContext('2d').createImageData(width, height), to = image.data;
+    if (map.fast) { warpPixelsFast(map.fast, from, sw, sh, to, left, top, width, height, nearest); out.getContext('2d').putImageData(image, 0, 0); return { canvas: out, x: left, y: top }; }
     for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
       const { u, v } = map.inverse({ x: left + x + .5, y: top + y + .5 });
       if (!(u >= 0 && u <= 1 && v >= 0 && v <= 1)) continue;
@@ -10480,6 +10665,32 @@
     }
     out.getContext('2d').putImageData(image, 0, 0);
     return { canvas: out, x: left, y: top };
+  }
+  // warpCanvas의 화소 고리와 같은 계산(같은 식·같은 순서 — 결과가 같다)을 화소마다 객체·배열을 만들지 않고 한다. f: placeWarped의 역사상
+  // (to 역행렬 → from 행렬 → 조각 비율)
+  function warpPixelsFast(f, from, sw, sh, to, left, top, width, height, nearest) {
+    const a = f.inv, m = f.m, ax = f.at.x, ay = f.at.y, pw = f.w, ph = f.h;
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      const X = left + x + .5, Y = top + y + .5;
+      const w1 = a[6] * X + a[7] * Y + a[8], ux = (a[0] * X + a[1] * Y + a[2]) / w1, uy = (a[3] * X + a[4] * Y + a[5]) / w1;
+      const w2 = m[6] * ux + m[7] * uy + m[8], qx = (m[0] * ux + m[1] * uy + m[2]) / w2, qy = (m[3] * ux + m[4] * uy + m[5]) / w2;
+      const u = (qx - ax) / pw, v = (qy - ay) / ph;
+      if (!(u >= 0 && u <= 1 && v >= 0 && v <= 1)) continue;
+      const fx = u * sw - .5, fy = v * sh - .5, k = (y * width + x) * 4;
+      if (nearest) {
+        const sx = Math.min(sw - 1, Math.max(0, Math.round(fx))), sy = Math.min(sh - 1, Math.max(0, Math.round(fy))), s = (sy * sw + sx) * 4;
+        to[k] = from[s]; to[k + 1] = from[s + 1]; to[k + 2] = from[s + 2]; to[k + 3] = from[s + 3];
+        continue;
+      }
+      const x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+      let r = 0, g = 0, b = 0, al = 0;
+      const w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+      if (x0 >= 0 && y0 >= 0 && x0 < sw && y0 < sh && w00) { const s = (y0 * sw + x0) * 4, q = from[s + 3] * w00; r += from[s] * q; g += from[s + 1] * q; b += from[s + 2] * q; al += q; }
+      if (x0 + 1 >= 0 && y0 >= 0 && x0 + 1 < sw && y0 < sh && w10) { const s = (y0 * sw + x0 + 1) * 4, q = from[s + 3] * w10; r += from[s] * q; g += from[s + 1] * q; b += from[s + 2] * q; al += q; }
+      if (x0 >= 0 && y0 + 1 >= 0 && x0 < sw && y0 + 1 < sh && w01) { const s = ((y0 + 1) * sw + x0) * 4, q = from[s + 3] * w01; r += from[s] * q; g += from[s + 1] * q; b += from[s + 2] * q; al += q; }
+      if (x0 + 1 >= 0 && y0 + 1 >= 0 && x0 + 1 < sw && y0 + 1 < sh && w11) { const s = ((y0 + 1) * sw + x0 + 1) * 4, q = from[s + 3] * w11; r += from[s] * q; g += from[s + 1] * q; b += from[s + 2] * q; al += q; }
+      if (al > 0) { to[k] = r / al; to[k + 1] = g / al; to[k + 2] = b / al; to[k + 3] = al; }
+    }
   }
   // 그라데이션 덮개(evrCover)는 이미 바꾼 결과라 다시 바꾸지 않는다
   const shapesIn = item => (item.className === 'Shape' ? [item] : item.getItems?.({ className: 'Shape' }) || []).filter(shape => !shape.data?.evrCover);
@@ -10839,6 +11050,7 @@
   window.addEventListener('pointermove', event => {
     const d = perspectiveDrag;
     if (!d || event.pointerId !== d.id) return;
+    if (!(event.buttons & 1)) { endPerspectiveDrag(event); return; }
     event.preventDefault(); event.stopImmediatePropagation();
     const now = pointer(d.c, event), dx = now.x - d.start.x, dy = now.y - d.start.y, i = d.corner;
     const quad = d.quad.map(p => ({ ...p }));
@@ -10916,6 +11128,7 @@
   }
   window.addEventListener('pointerup', event => endPerspectiveDrag(event), true);
   window.addEventListener('pointercancel', event => endPerspectiveDrag(event, true), true);
+  window.addEventListener('lostpointercapture', event => endPerspectiveDrag(event), true);
   window.addEventListener('keydown', event => {
     if (!perspectiveDrag) return;
     // 끄는 동안 엔트리 단축키(지우기·되돌리기 등)가 휘는 중인 그림을 바꾸지 않게 — Esc는 끌기 취소
@@ -11025,7 +11238,9 @@
   // 그림 한 장을 원본 사각(from) → 지금 사각(to) 사상으로 다시 그려 그 그림에 넣는다(돌림·크기는 비움). 결과 범위는 그림 네 모서리가 간 자리(못 구하면 quad)
   function placeWarped(P, piece, from, to, quad, nearest) {
     const w = piece.canvas.width, h = piece.canvas.height, at = piece.at;
-    const own = { inverse: p => { const { u, v } = to.inverse(p), q = from.forward({ x: u, y: v }); return { u: (q.x - at.x) / w, v: (q.y - at.y) / h }; } };
+    const own = { inverse: p => { const { u, v } = to.inverse(p), q = from.forward({ x: u, y: v }); return { u: (q.x - at.x) / w, v: (q.y - at.y) / h }; },
+      // from이 단위 사각이면 from.forward의 (u - 0) / 1 = u 그대로라 빠른 길이 같은 식이다
+      fast: from.src.x === 0 && from.src.y === 0 && from.src.width === 1 && from.src.height === 1 ? { inv: to.inv, m: from.m, at, w, h } : null };
     const mapped = piece.corners.map(p => { const { u, v } = from.inverse(p); return to.forward({ x: u, y: v }); });
     const corners = mapped.every(p => Number.isFinite(p.x) && Number.isFinite(p.y)) ? mapped : quad;
     const warped = warpCanvas(piece.canvas, own, corners, nearest), raster = piece.raster;
@@ -11070,9 +11285,17 @@
     for (const entry of source.leaves) {
       for (const part of entry.parts) {
         const gi = part.path.globalMatrix.inverted(), g0 = part.g;
-        const fn = ([x, y]) => { const q = forward(g0.transform(new P.Point(x, y))), r = gi.transform(new P.Point(q.x, q.y)); return [r.x, r.y]; };
-        const warp = new Warp(sourceSvg([part.d]));
-        warp.interpolate(4);
+        // forward(g0·점)을 gi로 되돌리는 것과 같은 식·같은 순서(paper Matrix._transformPoint, applyHomography, 단위 사각이라 (u - 0) / 1 = u) — 점마다 객체 없이
+        const [ga, gb, gc, gd, gx, gy] = [g0.a, g0.b, g0.c, g0.d, g0.tx, g0.ty], [ia, ib, ic, id, ix, iy] = [gi.a, gi.b, gi.c, gi.d, gi.tx, gi.ty], fi = from.inv, tm = to.m;
+        const fn = ([x, y]) => {
+          const px = x * ga + y * gc + gx, py = x * gb + y * gd + gy;
+          const w1 = fi[6] * px + fi[7] * py + fi[8], u = (fi[0] * px + fi[1] * py + fi[2]) / w1, v = (fi[3] * px + fi[4] * py + fi[5]) / w1;
+          const w2 = tm[6] * u + tm[7] * v + tm[8], qx = (tm[0] * u + tm[1] * v + tm[2]) / w2, qy = (tm[3] * u + tm[4] * v + tm[5]) / w2;
+          return [qx * ia + qy * ic + ix, qx * ib + qy * id + iy];
+        };
+        part.warp ||= (() => { const made = new Warp(sourceSvg([part.d])); made.interpolate(4); return { warp: made, base: made.paths.map(path => path.pathData) }; })();
+        const { warp, base } = part.warp;
+        warp.paths.forEach((path, i) => { path.pathData = structuredClone(base[i]); });
         warp.transform(fn);
         part.path.pathData = warp.paths.map(path => path.pathElement.getAttribute('d')).join(' ');
         syncOutline(P, part.path);
@@ -11171,6 +11394,7 @@
     if (!cut || cut.base !== first || !source.pieces.some(piece => piece.raster !== first)) return;
     cut.warped = true;
     cut.quad = quad;
+    writeCut(cut);
   }
   // [원근] 단추: 켜 두면 엔트리 선택 도구 모서리가 Ctrl 없이도 원근이다. 켜면 선택 도구로 바꾸고, 선택 도구가 아닌 도구가 되면 꺼진다
   function setPerspectiveOn(on) {
@@ -11189,7 +11413,28 @@
   // 엔트리 선택 도구로 그림 전체를 골라 옮기면 엔트리는 합칠 때 같은 크기·같은 자리 그림으로 다시 구워, 관절이 "고친 그림"의 옛 자리에 남았다.
   // 떼어 낸 사각을 적어 두고, 합칠 때(그림 층 rasterize) 같은 크기 조각이 돌거나 늘지 않고 옮겨졌으면 그만큼을 돌려준다(selectionMove).
   // 엔트리는 떼어 낸 조각을 새 조각으로 바꿔 넣으므로 조각이 아니라 사각을 적는다.
+  // 엔트리 되돌리기·다시 하기는 그림 층 글로 그림을 새로 만들어(importJSON) 변수의 바탕 그림을 잃는다 — 같은 사각을 바탕 그림 data에도 실어
+  // 기록 칸마다 그때 사각이 들어가게 하고, 되살린 뒤 그 칸 것으로 다시 잡는다
   let selectionCut = null;
+  const CUT_RECORD = 'evrCut';
+  function writeCut(cut) {
+    if (!cut?.base?.data) return;
+    const seen = cut.seen ? { x: cut.seen.x, y: cut.seen.y, plain: cut.seen.plain } : null;
+    cut.base.data[CUT_RECORD] = JSON.stringify({ x: cut.x, y: cut.y, width: cut.width, height: cut.height, fromBase: !!cut.fromBase, ink: cut.ink,
+      clean: !!cut.clean, warped: !!cut.warped, quad: cut.quad || null, seen });
+  }
+  function restoreCut(layer) {
+    selectionCut = null;
+    const base = layer?.children?.find(item => isRasterLayer(item) && item.data?.[CUT_RECORD]);
+    if (!base) return;
+    let saved = null;
+    try { saved = JSON.parse(base.data[CUT_RECORD]); } catch { saved = null; }
+    if (!saved || ![saved.x, saved.y, saved.width, saved.height].every(Number.isFinite)) { delete base.data[CUT_RECORD]; return; }
+    selectionCut = { ...saved, base, seen: saved.seen || undefined, quad: saved.quad || undefined };
+    // 기록 칸은 놓기 처리(아래) 전에 찍혀 그 칸의 마지막 자리가 빠질 수 있다 — 되살린 조각 자리로 다시 적는다
+    const at = selectionPieceAt(layer, selectionCut);
+    if (at) selectionCut.seen = at;
+  }
   const selectionPieceAt = (layer, cut) => {
     const piece = layer.children.find(item => item !== cut.base && isRasterLayer(item) && item.width === cut.width && item.height === cut.height);
     const m = piece?.matrix;
@@ -11201,6 +11446,7 @@
     const at = layer && selectionPieceAt(layer, cut);
     if (at) cut.seen = at;
     if (cut?.warped && quadGuide?.isInserted()) cut.quad = guideQuad(quadGuide);
+    if (cut?.base?.parent) writeCut(cut);
   }, 0));
   const alphaSum = raster => {
     let data = null;
@@ -11216,6 +11462,7 @@
     try { rig = base.data?.[BITMAP_REST] ? JSON.parse(base.data[BONES] || 'null') : null; } catch { rig = null; }
     selectionCut = { base, x: piece.bounds.x, y: piece.bounds.y, width: piece.width, height: piece.height, fromBase,
       ink: alphaSum(piece) || 0, clean: !!rig?.sig && rasterSig(base).abs === rig.sig.abs };
+    writeCut(selectionCut);
   }
   // 옮긴 것을 따라가는 때는 둘뿐이다: 남은 칠이 하나도 없음(그림 전체를 골랐음 — 뼈 끝처럼 칠 밖 관절도 따라감), 또는 관절이 모두 떼어 낸 사각
   // 안. 그 밖(그림 일부를 옮겼고 관절이 사각 밖에도 있음)은 어느 부분의 관절인지 칠로 가를 수 없어(가는·흐린·반투명 부분 — 과적합 검토 5~8차)
@@ -11224,7 +11471,7 @@
   function selectionMove(layer, base, peek = false) {
     const cut = selectionCut;
     if (!cut || cut.base !== base) return null;
-    if (!peek) selectionCut = null;
+    if (!peek) { selectionCut = null; delete base.data?.[CUT_RECORD]; }
     if (cut.warped) return pieceWarpMove(base, cut, peek);
     const found = selectionPieceAt(layer, cut), at = found || cut.seen;
     if (!at?.plain || !cut.ink) return null;
@@ -11248,6 +11495,10 @@
         return null;
       }
     } else if (left > 0) return { unknown: true };
+    // 휜 그림을 옮겼는데 사각 밖에 칠이 남으면(옅은 가장자리 포함) 휘기 전 그림을 같이 옮길 수 없어 지금 자세가 새 기준이 된다 — 남은 칠이 옅은 가장자리인지
+    // 따로 둔 그림인지 가를 수 없어(같은 레이어의 다른 그림까지 휘기 전 그림과 같이 옮기면 자세를 바꿀 때 튐) 굳히되 알린다
+    if (!peek && cut.fromBase && left > 0 && base.data?.[BITMAP_REST])
+      toast('고른 사각 밖에 칠이 남아(옅은 가장자리 포함) 휘기 전 그림을 같이 옮기지 못했습니다 — 지금 자세가 새 기준이 됩니다. 휘기 전 그림을 지키려면 Ctrl+Z로 되돌린 뒤 그림 전체를 넉넉히 골라 옮기세요.', 9000);
     return { x: dx, y: dy, whole: !!found && left === 0 && cut.clean };
   }
   // 휜 조각을 합칠 때: 관절은 옮기기와 같은 규칙(남은 칠이 없거나 관절이 모두 떼어 낸 사각 안)일 때만 떼어 낸 사각 → 마지막 둘레 사각 사상으로 옮긴다
@@ -11553,11 +11804,12 @@
   }
   function ensurePerspectiveTool() {
     const buttons = entryToolButtons(), last = buttons[buttons.length - 1];
-    let mine = document.querySelector('#entryPainter .evr-persp-tool');
+    let mine = document.querySelector('#entryPainter [data-evr-tool="persp"]');
     if (!last || !toolLook.off) { mine?.remove(); return; }
     if (!mine) {
       mine = document.createElement('span');
-      mine.className = `${toolLook.off} evr-persp-tool`;
+      mine.className = toolLook.off;
+      mine.dataset.evrTool = 'persp';
       mine.setAttribute('role', 'button');
       mine.title = '확장: 켜 두면 선택 도구로 고른 것의 모서리를 끌어 원근으로 기울이기(꺼 두어도 Ctrl을 누른 채 모서리를 끌면 원근) · ' +
         'Shift = 맞은편 모서리도 같이(대칭) · 끌 때마다 되돌리기 한 칸';
@@ -11569,10 +11821,11 @@
     syncPerspectiveTool();
   }
   function syncPerspectiveTool() {
-    const mine = document.querySelector('#entryPainter .evr-persp-tool');
+    const mine = document.querySelector('#entryPainter [data-evr-tool="persp"]');
     if (!mine || !toolLook.off) return;
     const on = perspectiveOn && paintStore()?.getState()?.tool?.toolMode === 'SELECT';
-    const cls = `${on && toolLook.on ? toolLook.on : toolLook.off} evr-persp-tool`;
+    // class는 엔트리 단추와 똑같이(우리 표시는 data-evr-tool) — class 개수로 고른 도구를 가리는 다른 확장이 우리 단추를 따로 세지 않게
+    const cls = on && toolLook.on ? toolLook.on : toolLook.off;
     if (mine.className !== cls) mine.className = cls;
     setToolIcon(mine.querySelector('img'), on, perspectiveIcon);
     mine.setAttribute('aria-pressed', String(on));
@@ -11598,7 +11851,7 @@
   const entryToolButtons = () => [...document.querySelectorAll('#entryPainter .ToolButtonWrapper')].filter(reactOwned);
   function ensureGradientTool() {
     const buttons = entryToolButtons(), fill = buttons.find(button => button.innerText.trim() === '채우기');
-    let mine = document.querySelector('#entryPainter .evr-grad-tool');
+    let mine = document.querySelector('#entryPainter [data-evr-tool="grad"]');
     if (!fill) { mine?.remove(); return; }
     // 엔트리 단추 클래스: 많은 쪽 = 안 고름, 하나뿐인 쪽 = 고름
     const counts = new Map();
@@ -11610,7 +11863,8 @@
     } else if (counts.size === 1 && !toolLook.off) toolLook.off = [...counts.keys()][0];
     if (!mine) {
       mine = document.createElement('span');
-      mine.className = `${toolLook.off || 'ToolButtonWrapper'} evr-grad-tool`; // 표시는 syncGradientTool이 맞춤(찾는 표시 evr-grad-tool은 처음부터)
+      mine.className = toolLook.off || 'ToolButtonWrapper'; // 켬끔 모양은 syncGradientTool이 맞춤
+      mine.dataset.evrTool = 'grad';
       mine.setAttribute('role', 'button');
       mine.title = '확장: 누른 채 끌면 그 방향으로 그라데이션(Shift = 15° 단위) — 비트맵은 지금 레이어 전체, 벡터는 누른 도형(빈 곳은 칠하지 않음). 시작 색은 엔트리 채우기 색, 끝 색·종류·단계는 그라데이션 창';
       const img = Object.assign(document.createElement('img'), { alt: '그라데이션', draggable: false });
@@ -11636,7 +11890,7 @@
       // 엔트리 도구 단추를 누르면(채우기 포함) 그라데이션 도구를 끈다
       document.addEventListener('click', event => {
         const button = event.target.closest?.('#entryPainter .ToolButtonWrapper');
-        if (!button || button.classList.contains('evr-grad-tool') || button.classList.contains('evr-persp-tool') || !gradientFill.on) return;
+        if (!button || button.dataset.evrTool || !gradientFill.on) return;
         gradientFill.on = false;
         cancelGradientDrag();
         setTimeout(() => {
@@ -11648,12 +11902,12 @@
     syncGradientTool();
   }
   function syncGradientTool() {
-    const mine = document.querySelector('#entryPainter .evr-grad-tool');
+    const mine = document.querySelector('#entryPainter [data-evr-tool="grad"]');
     const fill = entryToolButtons().find(button => button.innerText.trim() === '채우기');
     if (!mine || !fill || !toolLook.off) return;
     const isFill = window.Entry?.playground?.painter?.entryPaint?.paper?.tool?.MY_MODE?.toolMode === 'FILL';
     const on = gradientFill.on && isFill;
-    const cls = `${on && toolLook.on ? toolLook.on : toolLook.off} evr-grad-tool`;
+    const cls = on && toolLook.on ? toolLook.on : toolLook.off;
     if (mine.className !== cls) mine.className = cls;
     setToolIcon(mine.querySelector('img'), on, gradientIcon);
     mine.setAttribute('aria-pressed', String(on));
@@ -12591,6 +12845,7 @@
     try { ownPixelPictures(); } catch (error) { console.warn('[entry-vector-rig] 모양 자기 파일', error); }
     try { hookLoadRepair(); } catch (error) { console.warn('[entry-vector-rig] 모양 주소 잇기', error); }
     try { hookPictureClone(); } catch (error) { console.warn('[entry-vector-rig] 모양 복제', error); }
+    try { hookObjectClone(); applyCloneCarry(); } catch (error) { console.warn('[entry-vector-rig] 오브젝트 복제', error); }
     try { hookDraftMenu(); } catch (error) { console.warn('[entry-vector-rig] 그림 임시저장 메뉴', error); }
     try { checkEntryPicker(); } catch (error) { console.warn('[entry-vector-rig] 엔트리 색 고르기 창', error); }
     // 모양을 바꾸는 틈(context()가 비어 있음)에는 십자·뼈대 버튼·도구 막대를 지우지 않고 그대로 둔다 — 지웠다 다시 만들면 켜 둔

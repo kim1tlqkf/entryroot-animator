@@ -1,13 +1,18 @@
 // 출시 관문 지문(pack.ps1이 같은 방법으로 다시 잰다): 파일 목록을 경로 이름순(서수)으로 "경로:파일SHA256\n" 이어 붙인 글의 SHA256(소문자 16진수).
 //   contentHash  zip에 들어갈 확장 파일(manifest.json·rig.js·rig.css·LICENSE·vendor/*·icons/*.png)
 //   testsHash    시험(tests/run.js·tests/lib/**·tests/cases/**·tests/fixtures/**) — 전체 시험 뒤 시험·고정 자료를 약하게 고치는 것을 막음
-//   harnessHash  시험 + tests/real-server/** + tests/fixture-makers/** + tests/known-limits/** + tools/** + pack.ps1 — 과적합 검토 뒤 시험·탐침·검사·관문을 고치는 것을 막음
+//   harnessHash  시험 + tests/real-server/** + tests/fixture-makers/** + tests/known-limits/** + tools/gate-hashes.js — 과적합 검토 뒤 시험·탐침·지문 범위를 고치는 것을 막음
+//                (이 파일은 실행기가 기록 지문을 내는 데 쓰고 아래 범위를 정하므로 관문이면서 점검 틀로 남김)
 //   promptHash   release/overfit-review-prompt.md
+//   gateHash     tools/** + pack.ps1 — 관문 자기 점검 기록(release/gate-selftest.json)에 묶음. 과적합 검토에는 안 묶음(관문을 고쳐도 제품 검토를 다시 받지 않게)
 //   node tools/gate-hashes.js   지금 저장소의 네 지문을 JSON으로
+//   node tools/gate-hashes.js --gate   관문 지문(gateHash)
 //   node tools/gate-hashes.js --files <경로…>   그 파일 목록의 지문(미확인 경로 탐침 기록의 probeHash)
 //   node tools/gate-hashes.js --scope   harnessHash 범위 목록(JSON)
 //   node tools/gate-hashes.js --lib <시험 파일>   그 시험이 쓰는 tests/lib 파일 지문(없으면 빈 줄, lib 글자가 있는데 못 찾으면 오류)
 //   node tools/gate-hashes.js --self-test   lib 찾기 자기 점검
+//   node tools/gate-hashes.js --snapshot <빈 폴더>   지금 판을 검토 바탕 판 사본으로 복사하고 그 지문
+//   node tools/gate-hashes.js --root <사본 폴더>   그 사본의 네 지문(검토자가 「검토 바탕 지문」 줄에 적음)
 const fs = require('fs'), path = require('path'), crypto = require('crypto'), { execFileSync } = require('child_process');
 const sha = data => crypto.createHash('sha256').update(data).digest('hex');
 const filesUnder = (root, rel) => {
@@ -26,9 +31,10 @@ const contentFiles = root => ['manifest.json', 'rig.js', 'rig.css', 'LICENSE',
 const testFiles = root => ['tests/run.js', ...filesUnder(root, 'tests/lib'), ...filesUnder(root, 'tests/cases'), ...filesUnder(root, 'tests/fixtures')];
 // harnessHash 범위는 여기 한 곳(끝이 /면 그 아래 모든 파일, release/의 두 파일은 있을 때만) — release/README.md 6절의 지문 범위 줄과 자기 점검이 대조한다
 const HARNESS_SCOPE = ['tests/run.js', 'tests/lib/', 'tests/cases/', 'tests/fixtures/', 'tests/real-server/', 'tests/fixture-makers/', 'tests/known-limits/',
-  'tools/', 'pack.ps1', 'release/public-accept.txt', 'release/private-terms.txt'];
+  'tools/gate-hashes.js', 'release/public-accept.txt', 'release/private-terms.txt'];
 const harnessFiles = root => HARNESS_SCOPE.flatMap(entry => entry.endsWith('/') ? filesUnder(root, entry.slice(0, -1))
   : entry.startsWith('release/') && !fs.existsSync(path.join(root, entry)) ? [] : [entry]);
+const gateFiles = root => [...filesUnder(root, 'tools'), 'pack.ps1'];
 const hashes = root => ({
   contentHash: listHash(root, contentFiles(root)),
   testsHash: listHash(root, testFiles(root)),
@@ -54,7 +60,22 @@ function testLibs(root, file) {
     }
   }
   if (!seen.size && /['"]lib['"]|\.\.\/lib\/|tests\/lib\//.test(fs.readFileSync(path.join(root, file), 'utf8'))) throw Error(`${file}: tests/lib을 쓰는 것 같은데 찾지 못했습니다`);
+  for (const f of runnerFiles(root)) seen.add(f);
   return [...seen].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+// 실행기(tests/run.js)와 실행기가 부르는 tests/lib(harness.js와 그것이 ./로 부르는 것) — 확인 결과를 판정해 적는 쪽이라 기록 뒤 고치면 기록의 판정도 낡는다
+function runnerFiles(root) {
+  if (!fs.existsSync(path.join(root, 'tests', 'run.js'))) return [];
+  const out = new Set(['tests/run.js']), queue = [];
+  if (fs.existsSync(path.join(root, 'tests', 'lib', 'harness.js'))) { out.add('tests/lib/harness.js'); queue.push('tests/lib/harness.js'); }
+  while (queue.length) {
+    const text = fs.readFileSync(path.join(root, queue.shift()), 'utf8');
+    for (const m of text.matchAll(/require\(\s*['"]\.\/([\w.-]+?)(?:\.js)?['"]\s*\)/g)) {
+      const at = `tests/lib/${m[1]}.js`;
+      if (!out.has(at) && fs.existsSync(path.join(root, at))) { out.add(at); queue.push(at); }
+    }
+  }
+  return [...out];
 }
 const libHash = (root, file) => { const libs = testLibs(root, file); return libs.length ? listHash(root, libs) : null; };
 module.exports = { hashes, listHash, testLibs, libHash, contentHash: root => listHash(root, contentFiles(root)), testsHash: root => listHash(root, testFiles(root)) };
@@ -82,15 +103,36 @@ function selfTest() {
     console.log(`${none.length ? 'FAIL' : 'PASS'}  none.js: ${JSON.stringify(none)}`); if (none.length) bad++;
     let threw = false; try { testLibs(root, 'tests/cases/missing.js'); } catch { threw = true; }
     console.log(`${threw ? 'PASS' : 'FAIL'}  missing.js: lib 글자가 있는데 못 찾으면 막음`); if (!threw) bad++;
+    // 실행기가 있으면 lib을 안 쓰는 시험도 실행기·실행기가 부르는 lib(./로 이어진 것까지)이 묶인다
+    fs.writeFileSync(path.join(root, 'tests', 'run.js'), "const { launch } = require('./lib/harness');\n");
+    fs.writeFileSync(path.join(root, 'tests', 'lib', 'harness.js'), "const x = require('./cdp');\n");
+    fs.writeFileSync(path.join(root, 'tests', 'lib', 'cdp.js'), "module.exports = 1;\n");
+    const runner = testLibs(root, 'tests/cases/none.js'), want = ['tests/lib/cdp.js', 'tests/lib/harness.js', 'tests/run.js'];
+    const runnerOk = JSON.stringify(runner) === JSON.stringify(want);
+    console.log(`${runnerOk ? 'PASS' : 'FAIL'}  실행기 묶음: ${JSON.stringify(runner)}`); if (!runnerOk) bad++;
     if (bad) process.exitCode = 1;
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
+// 검토 바탕 판 사본: 지문 범위 파일(확장·시험·도구·관문·지시문)을 빈 폴더에 그대로 복사한다 — 다음 회차 검토가 이 판 이후 바뀐 곳만 본다
+// (관문·도구는 검토 묶음 밖이지만 공개 사본에 들어가는 글이라 차이를 볼 수 있게 같이 복사)
+function snapshot(root, out) {
+  if (fs.existsSync(out) && fs.readdirSync(out).length) throw Error(`${out}: 빈 폴더가 아닙니다`);
+  for (const f of new Set([...contentFiles(root), ...harnessFiles(root), ...gateFiles(root), 'release/overfit-review-prompt.md'])) {
+    fs.mkdirSync(path.dirname(path.join(out, f)), { recursive: true });
+    fs.copyFileSync(path.join(root, f), path.join(out, f));
+  }
+  return hashes(out);
+}
 if (require.main === module) {
-  const root = path.resolve(__dirname, '..'), at = process.argv.indexOf('--files');
+  const option = name => { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : null; };
+  // --root <폴더>: 그 사본(검토 바탕 판)의 지문
+  const root = option('--root') ? path.resolve(option('--root')) : path.resolve(__dirname, '..'), at = process.argv.indexOf('--files');
   const lib = process.argv.indexOf('--lib');
   if (lib >= 0) console.log(libHash(root, process.argv[lib + 1]) || '');
   else if (process.argv.includes('--self-test')) selfTest();
+  else if (option('--snapshot')) console.log(JSON.stringify(snapshot(root, path.resolve(option('--snapshot'))), null, 2));
   else if (at >= 0) console.log(listHash(root, process.argv.slice(at + 1)));
+  else if (process.argv.includes('--gate')) console.log(listHash(root, gateFiles(root)));
   else if (process.argv.includes('--scope')) console.log(JSON.stringify(HARNESS_SCOPE));
   else console.log(JSON.stringify(hashes(root), null, 2));
 }

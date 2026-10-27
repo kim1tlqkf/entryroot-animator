@@ -80,8 +80,9 @@ const rules = privateTerms => [
   } },
   { name: '내 컴퓨터 경로', find: line => /[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s"'`]+|(?<![\w.])\/[a-z]\/Users\/[^/\s"'`]+|AppData[\\/]|~[\\/]\.claude|\.claude[\\/]projects|[A-Za-z]--Users-/i.exec(line) },
   { name: '이메일', find: line => /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z.]{2,}/.exec(line) },
-  // 글에 섞인 제어 문자(탭·줄바꿈 빼고) — 스크립트로 글을 넣다 \a 같은 이스케이프가 제어 문자로 바뀐 것이 공개 문서에 남았다
-  { name: '제어 문자', find: line => /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.exec(line) },
+  // 글에 섞인 제어 문자 — 스크립트로 글을 넣다 \a 같은 이스케이프가 제어 문자로 바뀐 것이 공개 문서에 남았다. 같은 길로 \release는 줄 가운데 CR,
+  // \tools·\tests는 줄 가운데 탭이 된다(줄 앞 들여쓰기 탭·줄 끝 CRLF는 보통 글). 깨진 글자 U+FFFD도
+  { name: '제어 문자', find: line => /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f�]|\r|(?<=\S)\t/.exec(line) },
   { name: '개인 식별 낱말', find: line => {
     for (const term of privateTerms) { const at = line.toLowerCase().indexOf(term.toLowerCase()); if (at >= 0) return Object.assign([line.slice(at, at + term.length)], { index: at }); }
     return null;
@@ -142,6 +143,9 @@ function selfTest() {
     ['내 컴퓨터 경로', 'p8.md', '기록: ~/.claude/projects/C--Users-someone-x/abc.jsonl'],
     ['이메일', 'store/vendor/note.md', '연락: someone@example.com'],
     ['제어 문자', 'p10.md', '기록 \\subagents' + String.fromCharCode(7) + 'gent-x.jsonl'],
+    ['제어 문자', 'p11.md', '기록 C:/x' + String.fromCharCode(13) + 'elease/a.json'],
+    ['제어 문자', 'p12.md', '경로 C:/x' + String.fromCharCode(9) + 'ools/a.js'],
+    ['제어 문자', 'p13.md', '깨진 글 ' + String.fromCharCode(0xfffd) + ' 남음'],
     ['개인 식별 낱말', 'p9.md', '만든 사람 someoneuser123 님'],
     ['욕설', 'k1.md', `이거 ${kb} 뭐야`],
     ['욕설', 'k2.md', kb.toUpperCase()],
@@ -179,7 +183,8 @@ function selfTest() {
     'a-b-c d.e.f g_h_i j/k/l m+n o,p q(r)s t=u v w x"y z', 'https://example.com/path?query=1&x=2#frag', 'if (a && b || !c) return [x, y, z];',
     'const { width: w, height: h } = canvas; ctx.drawImage(img, 0, 0, w, h);', '그림 A와 그림 B를 비교하고 모양2를 고른다', 'Fill the shape with RGBA(0,0,0,0.5) then stroke.',
     'Sprite sheets: walk_01.png walk_02.png walk_03.png (rows x cols).', '비트맵 사각 펜·사각 지우개(1.2 새 기능): 펜 끝을 네모로', 'const corners = [[-w, -h], [w, -h], [w, h], [-w, h]];', 'Tools: brush, eraser, fill, select, text, line, rect, circle.',
-    'data:image/png;base64,' + 'Ab9+'.repeat(20) + 'h7tLq+p9+w' + 'tf+xYz' + 'Q0/='.repeat(20), '■ 캔버스 크기 · 무한 배경 (1.2 새 기능)', '불이 꺼져 있으면 [켜기]를 누르세요', '그림 A와 그림 B, 모양 X와 Y', '시작(1.2 발표) 뒤', '시간 X 배율'];
+    'data:image/png;base64,' + 'Ab9+'.repeat(20) + 'h7tLq+p9+w' + 'tf+xYz' + 'Q0/='.repeat(20), '■ 캔버스 크기 · 무한 배경 (1.2 새 기능)', '불이 꺼져 있으면 [켜기]를 누르세요', '그림 A와 그림 B, 모양 X와 Y', '시작(1.2 발표) 뒤', '시간 X 배율',
+    String.fromCharCode(9) + '들여쓰기 탭으로 시작하는 줄'];
   fs.writeFileSync(path.join(dir, 'clean.md'), clean.join('\n'));
   fs.mkdirSync(path.join(dir, 'vendor')); fs.writeFileSync(path.join(dir, 'vendor', 'lib.js'), '// author@example.com');
   const privateFile = path.join(dir, 'private-terms.txt'); fs.writeFileSync(privateFile, '# 공개하지 않는 낱말\nsomeoneuser123\n');

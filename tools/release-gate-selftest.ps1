@@ -1,8 +1,10 @@
 ﻿# 출시 관문(pack.ps1) 자기 점검: 임시 폴더에 확장·기록을 복사해 경우마다 기록을 망가뜨려 보고, 관문이 막아야 할 때 막는지(zip을 안 만드는지),
-# 맞을 때만 zip을 만드는지 실제로 돌려 본다. 저장소 파일은 건드리지 않는다.
+# 맞을 때만 zip을 만드는지 실제로 돌려 본다. 저장소에는 다 통과했을 때 관문 지문 기록(release\gate-selftest.json)만 쓴다 — pack.ps1이 그 지문과 지금 관문을 견준다.
 # 쓰는 법: powershell -ExecutionPolicy Bypass -File tools\release-gate-selftest.ps1   (먼저 node tests/run.js 로 전체 시험 기록이 있어야 함)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+# 점검하는 동안 관문이 바뀌면 그 관문을 점검했다고 적지 않는다
+$gateAtStart = ((& node (Join-Path $repo 'tools\gate-hashes.js') --gate) | Out-String).Trim()
 $manifest = Get-Content -Raw -Encoding UTF8 (Join-Path $repo 'manifest.json') | ConvertFrom-Json
 $version = $manifest.version
 $failures = 0
@@ -16,6 +18,8 @@ function New-Copy {
   New-Item -ItemType Directory (Join-Path $dir 'tests') | Out-Null
   Copy-Item (Join-Path $repo 'tests\run.js') (Join-Path $dir 'tests')
   foreach ($name in 'lib', 'cases', 'real-server', 'fixtures', 'fixture-makers', 'known-limits') { Copy-Item -Recurse (Join-Path $repo "tests\$name") (Join-Path $dir "tests\$name") }
+  # 사본 관문은 점검받은 관문으로 둔다 — 다른 경우들이 관문 지문 검사가 아닌 각자의 이유로 막히는지 보려고(관문 지문 경우는 아래에서 다시 망가뜨림)
+  & $gateRecord $dir
   # 복사본의 미확인 경로는 닫아 둔다 — 다른 경우들이 각자의 이유로 막히는지 보려고(미확인 경로 경우는 아래에서 다시 연다)
   Edit-Json (Join-Path $dir 'release\open-risks.json') { param($j) foreach ($r in @($j.risks)) { $r.status = 'accepted'; $r | Add-Member -Force quote '자기 점검'; $r | Add-Member -Force consequence '자기 점검' } }
   # 과적합 기록의 원문 출처(검토 보조 에이전트 기록)는 관문이 집 폴더의 Claude 세션 기록 자리(그 아래 <저장소 이름표>\<세션>\subagents)를 본다 — 사본 안 가짜 집에
@@ -41,6 +45,9 @@ $sourcePlace = { param($dir, $session)
   New-Item -ItemType Directory -Force $place | Out-Null
   $parent = Join-Path $base "$session.jsonl"
   return $place }
+$gateRecord = { param($dir)
+  $gate = ((& node (Join-Path $dir 'tools\gate-hashes.js') --gate) | Out-String).Trim()
+  [pscustomobject]@{ gateHash = $gate; at = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $dir 'release\gate-selftest.json') }
 $noteParent = { param($place, $id) Add-Content -Encoding UTF8 ((Split-Path -Parent $place) + '.jsonl') ('{"type":"assistant","toolUseResult":{"agentId":"' + $id + '"}}') }
 function Edit-Json($path, [scriptblock]$change) {
   $data = Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json
@@ -82,10 +89,16 @@ else { Write-Output 'PASS  release\README.md 지문 범위 줄 = HARNESS_SCOPE' 
 $libLines = @(& node (Join-Path $repo 'tools\gate-hashes.js') --self-test)
 if ($LASTEXITCODE -ne 0 -or -not $libLines.Count -or @($libLines | Where-Object { $_ -notmatch '^PASS' }).Count) { Write-Output "FAIL  시험 도구 찾기 자기 점검: $($libLines -join ' / ')"; $failures++ }
 else { Write-Output "PASS  시험 도구 찾기 자기 점검($($libLines.Count)가지)" }
+# 공개 사본 검사도 관문 지문 안 도구다 — 과적합 검토에 안 묶이므로 여기서 그 자기 점검을 돌린다
+$publicLines = @(& node (Join-Path $repo 'tools\public-copy-check.js') --self-test)
+if ($LASTEXITCODE -ne 0) { Write-Output "FAIL  공개 사본 검사 자기 점검: $(@($publicLines | Select-Object -Last 3) -join ' / ')"; $failures++ }
+else { Write-Output "PASS  공개 사본 검사 자기 점검" }
 
 Test-Case '기록 모두 맞음' $true { param($d) }
 Test-Case '독립 검토 기록 없음(1.2.0 때처럼)' $false { param($d) Remove-Item (Join-Path $d "release\review-$version.json") -Confirm:$false }
 Test-Case '전체 시험 기록 없음' $false { param($d) Remove-Item (Join-Path $d 'release\last-full-run.json') -Confirm:$false }
+# 실행기 하나만 지우면 시험 지문·점검 틀·고치기 전 판 검사가 함께 꺼지던 길
+Test-Case '시험 실행기(tests/run.js)를 지움' $false { param($d) Remove-Item (Join-Path $d 'tests\run.js') -Confirm:$false } '시험 실행기'
 Test-Case '시험 뒤 rig.js가 바뀜' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d 'rig.js') '// 시험 뒤에 고친 줄' }
 Test-Case '시험에 실패한 것이 있음' $false { param($d) Edit-Json (Join-Path $d 'release\last-full-run.json') { param($j) $j.allPassed = $false } }
 Test-Case '처리 안 된 지적(open)이 있음' $false { param($d) Edit-Json (Join-Path $d "release\review-$version.json") { param($j) $j.findings[0].status = 'open' } }
@@ -134,10 +147,17 @@ Test-Case '뺀 것인데 이유가 없음' $false { param($d) Edit-Json (Join-Pa
 # 시험 폴더와 기록의 시험 파일 목록: 시험을 새로 넣고 전체 시험을 다시 안 돌린 경우를 막는지(사본에는 저장소 시험이 그대로 있음)
 Test-Case '기록에 없는 새 시험 파일이 있음(넣고 다시 안 돌림)' $false { param($d) Set-Content -Encoding UTF8 (Join-Path $d 'tests\cases\new-switch-test.js') '// 자기 점검용 빈 시험' }
 Test-Case '기록에 시험 파일 목록이 없음(예전 기록)' $false { param($d) Edit-Json (Join-Path $d 'release\last-full-run.json') { param($j) $j.PSObject.Properties.Remove('caseFiles') } }
-# 시험·도구 지문(과적합 검토 지적): 전체 시험 뒤 시험을 약하게 고치거나, 과적합 검토 뒤 도구·관문을 고친 것을 막는지
+# 시험·점검 틀 지문(과적합 검토 지적): 전체 시험 뒤 시험을 약하게 고치거나, 과적합 검토 뒤 탐침·한계 시험·지문 범위 도구를 고친 것을 막는지
 $someCase = (Get-ChildItem (Join-Path $repo 'tests\cases') -Filter '*.js' -File | Select-Object -First 1).Name
 Test-Case '전체 시험 뒤 시험 파일을 고침(testsHash 다름)' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d "tests\cases\$someCase") '// 시험 뒤에 약하게 고친 줄' }
-Test-Case '과적합 검토 뒤 도구를 고침(harnessHash 다름)' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d 'tools\public-copy-check.js') '// 검토 뒤에 고친 줄' }
+Test-Case '과적합 검토 뒤 탐침·한계 시험 쪽을 고침(harnessHash 다름)' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d 'tests\known-limits\README.md') '검토 뒤에 고친 줄' } 'harnessHash 다름'
+# 관문·도구는 과적합 검토가 아니라 관문 자기 점검 기록(gateHash)에 묶인다: 기록 없음·점검 뒤 고침은 막고, 고친 뒤 점검을 다시 했으면 검토를 다시 받지 않아도 지나간다
+Test-Case '관문 자기 점검 기록 없음' $false { param($d) Remove-Item (Join-Path $d 'release\gate-selftest.json') -Confirm:$false } '자기 점검 기록'
+Test-Case '자기 점검 뒤 관문 도구를 고침(gateHash 다름)' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d 'tools\public-copy-check.js') '// 점검 뒤에 고친 줄' } 'gateHash 다름'
+Test-Case '자기 점검 뒤 pack.ps1을 고침(gateHash 다름)' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d 'pack.ps1') '# 점검 뒤에 고친 줄' } 'gateHash 다름'
+Test-Case '관문 도구를 고치고 자기 점검을 다시 함(과적합 검토는 그대로)' $true { param($d) Add-Content -Encoding UTF8 (Join-Path $d 'tools\public-copy-check.js') '// 점검 뒤에 고친 줄'; & $gateRecord $d }
+# 지문 범위를 정하는 도구(gate-hashes.js)는 실행기도 쓰므로 관문이면서 점검 틀이다 — 점검을 다시 해도 과적합 검토를 다시 받아야 지나간다
+Test-Case '지문 범위 도구(gate-hashes.js)를 고치고 자기 점검만 다시 함' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d 'tools\gate-hashes.js') '// 점검 뒤에 고친 줄'; & $gateRecord $d } 'harnessHash 다름'
 
 # 미확인 경로 목록: 시험이 닿지 않는 사용자 경로가 남았는데 출시하는 것을 막는지
 $risksFile = 'release\open-risks.json'
@@ -159,10 +179,12 @@ Test-Case 'probed인데 탐침 파일이 저장소에 없음' $false { param($d)
 $probeFile = 'tests/real-server/probe-real-save-size.js'
 $nowContent = ((& node (Join-Path $repo 'tools\gate-hashes.js')) | Out-String | ConvertFrom-Json).contentHash
 $nowProbe = ((& node (Join-Path $repo 'tools\gate-hashes.js') --files $probeFile) | Out-String).Trim()
+# 실행기가 있으면 모든 탐침 기록에 도구 지문(libHash)이 붙는다 — 빠지면 경우마다 그 검사에 먼저 막혀 보려던 검사에 닿지 않는다
+$nowProbeLib = ((& node (Join-Path $repo 'tools\gate-hashes.js') --lib $probeFile) | Out-String).Trim()
 $probedRisk = { param($r) $r.status = 'probed'; $r | Add-Member -Force evidence '증거'; $r | Add-Member -Force probe @($probeFile) }
 $probeRun = { param($d, $status, $content)
   $runs = [pscustomobject]@{}
-  $runs | Add-Member -NotePropertyName $probeFile -NotePropertyValue ([pscustomobject]@{ contentHash = $content; fileHash = $nowProbe; status = $status; passed = 1; total = 1 })
+  $runs | Add-Member -NotePropertyName $probeFile -NotePropertyValue ([pscustomobject]@{ contentHash = $content; fileHash = $nowProbe; libHash = $nowProbeLib; status = $status; passed = 1; total = 1 })
   [pscustomobject]@{ runs = $runs } | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $d 'release\probe-runs.json') }
 Test-Case 'probed + 지금 판 PASS 실행 기록' $true { param($d) Edit-Json (Join-Path $d $risksFile) { param($j) & $probedRisk $j.risks[0] }; & $probeRun $d 'PASS' $nowContent }
 Test-Case 'probed인데 탐침 실행 기록 없음(지문만 손으로 적음)' $false { param($d) Edit-Json (Join-Path $d $risksFile) { param($j) & $probedRisk $j.risks[0]; $j.risks[0] | Add-Member -Force contentHash $nowContent }; Remove-Item -ErrorAction SilentlyContinue (Join-Path $d 'release\probe-runs.json') -Confirm:$false }
@@ -171,11 +193,14 @@ Test-Case 'probed인데 옛 판 실행 기록' $false { param($d) Edit-Json (Joi
 Test-Case 'probed 뒤 탐침 파일을 고침' $false { param($d) Edit-Json (Join-Path $d $risksFile) { param($j) & $probedRisk $j.risks[0] }; & $probeRun $d 'PASS' $nowContent; Add-Content -Encoding UTF8 (Join-Path $d ($probeFile -replace '/', '\')) '// 탐침 뒤에 고친 줄' }
 Test-Case 'verified + 탐침인데 옛 판 실행 기록' $false { param($d) Edit-Json (Join-Path $d $risksFile) { param($j) $r = $j.risks[0]; & $probedRisk $r; $r.status = 'verified'; $r | Add-Member -Force quote '확인함'; $r | Add-Member -Force question '이 결과로 닫을까요?' }; & $probeRun $d 'PASS' ('0' * 64) }
 # 새 검토를 받은 것처럼: 실제 검토 보조 에이전트 기록의 꼴(첫 지시 글이 고정 지시문을 가리킴, 지시문 Read, gate-hashes 실행 결과 = 보고서 머리 시작·끝
-# 지문, 마지막에 SubagentHandback으로 사본 보고서 글)을 사본 가짜 집에 새로 두고 reportSource를 그것으로. noPrompt면 첫 글에 지시문이 없다
-$newReview = { param($d, [switch]$noPrompt, [switch]$shell, [switch]$unread)
+# 지문, 마지막에 SubagentHandback으로 사본 보고서 글)을 사본 가짜 집에 새로 두고 reportSource를 그것으로. noPrompt면 첫 글에 지시문이 없다.
+# 잰 지문은 보고서의 첫 시작·끝 줄(뒤에 덧붙인 줄은 잰 것이 아님), measuredStart·measuredEnd를 주면 그 줄(보고서 머리를 고친 뒤에도 실제로 잰 값)
+$newReview = { param($d, [switch]$noPrompt, [switch]$shell, [switch]$unread, [switch]$partial, [string]$measuredStart = '', [string]$measuredEnd = '')
   $record = Get-Content -Raw -Encoding UTF8 (Join-Path $d "release\overfit-review-$version.json") | ConvertFrom-Json
   $text = [System.IO.File]::ReadAllText((Join-Path $d (([string]$record.report) -replace '/', '\')), (New-Object System.Text.UTF8Encoding $false))
-  $head = @($text -split "`n" | Where-Object { $_ -match '검토 (시작|끝) 지문' })
+  $startLine = if ($measuredStart) { $measuredStart } else { @($text -split "`n" | Where-Object { $_ -match '검토 시작 지문' }) | Select-Object -First 1 }
+  $endLine = if ($measuredEnd) { $measuredEnd } else { @($text -split "`n" | Where-Object { $_ -match '검토 끝 지문' }) | Select-Object -First 1 }
+  $baseLine = @($text -split "`n" | Where-Object { $_ -match '검토 바탕 지문' }) | Select-Object -First 1
   $id = 'aselftest' + [guid]::NewGuid().ToString('N').Substring(0, 8); $session = [guid]::NewGuid().ToString()
   $place = & $sourcePlace $d $session
   $line = { param($type, $content) [pscustomobject]@{ type = $type; isSidechain = $true; agentId = $id; message = [pscustomobject]@{ role = $type; content = $content } } | ConvertTo-Json -Depth 10 -Compress }
@@ -185,14 +210,17 @@ $newReview = { param($d, [switch]$noPrompt, [switch]$shell, [switch]$unread)
   # 지시문 읽기·지문 재기: 기본은 Read·Bash, shell이면 PowerShell(Get-Content·node), unread면 지시문 파일을 가리켰지만 결과에 지시문 글이 없음
   $promptFile = Join-Path $d 'release\overfit-review-prompt.md'
   $promptText = if ($unread) { '(읽지 못함)' } else { [System.IO.File]::ReadAllText($promptFile, (New-Object System.Text.UTF8Encoding $false)) }
+  # partial: 지시문 앞 세 줄만 읽음(head 꼴)
+  if ($partial) { $promptText = (@($promptText -split "`n") | Select-Object -First 3) -join "`n" }
   $tool = if ($shell) { 'PowerShell' } else { 'Bash' }
   $readUse = if ($shell) { & $use 't1' 'PowerShell' ([pscustomobject]@{ command = "Get-Content -Raw -Encoding UTF8 '$promptFile'" }) } else { & $use 't1' 'Read' ([pscustomobject]@{ file_path = $promptFile }) }
   $rows = @(
     (& $line 'user' $first),
     $readUse, (& $result 't1' $promptText),
-    (& $use 't2' $tool ([pscustomobject]@{ command = 'node tools/gate-hashes.js' })), (& $result 't2' ([string]$head[0])),
-    (& $use 't3' $tool ([pscustomobject]@{ command = 'node tools/gate-hashes.js' })), (& $result 't3' ([string]$head[-1])),
-    (& $use 't4' 'SubagentHandback' ([pscustomobject]@{ message = $text })))
+    (& $use 't2' $tool ([pscustomobject]@{ command = 'node tools/gate-hashes.js' })), (& $result 't2' ([string]$startLine)),
+    (& $use 't3' $tool ([pscustomobject]@{ command = 'node tools/gate-hashes.js' })), (& $result 't3' ([string]$endLine)))
+  if ($baseLine) { $rows += @((& $use 't5' $tool ([pscustomobject]@{ command = 'node tools/gate-hashes.js --root base' })), (& $result 't5' ([string]$baseLine))) }
+  $rows += @(& $use 't4' 'SubagentHandback' ([pscustomobject]@{ message = $text }))
   [System.IO.File]::WriteAllText((Join-Path $place "agent-$id.jsonl"), ($rows -join "`n") + "`n", (New-Object System.Text.UTF8Encoding $false))
   & $noteParent $place $id
   Edit-Json (Join-Path $d "release\overfit-review-$version.json") { param($j) $j | Add-Member -Force reportSource (Join-Path $place "agent-$id.jsonl") } }
@@ -248,27 +276,35 @@ $reportRel = ((Get-Content -Raw -Encoding UTF8 (Join-Path $repo $overfitFile) | 
 Test-Case '과적합 검토 보고서 원문 없음' $false { param($d) Remove-Item (Join-Path $d $reportRel) -Confirm:$false }
 Test-Case '과적합 검토 보고서 원문을 기록 뒤 고침(reportHash 다름)' $false { param($d) Add-Content -Encoding UTF8 (Join-Path $d $reportRel) '덧붙인 줄' }
 # 기록의 지문이 검토자가 보고서 맨 앞 두 줄(검토 시작·끝 지문)에 적은 지문과 같은지: 검토 뒤 점검 틀을 고치고 기록 지문만 고침 / 보고서 끝에 새 지문을
-# 덧붙임 / 머리 지문이 비어 있음 / 시작·끝이 다름
+# 덧붙임 / 머리 지문이 비어 있음 / 시작·끝이 다름. 보고서를 고친 경우는 원문 출처도 그 글로 다시 두어(꼴은 맞게) 보려는 검사에 닿게 한다
 $reportEdit = { param($d, [scriptblock]$change)
   $path = Join-Path $d $reportRel
   [System.IO.File]::WriteAllText($path, (& $change (Get-Content -Raw -Encoding UTF8 $path)), (New-Object System.Text.UTF8Encoding $false))
   $hash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
   Edit-Json (Join-Path $d $overfitFile) { param($j) $j.reportHash = $hash } }
 $newHarness = { param($d)
-  Add-Content -Encoding UTF8 (Join-Path $d 'tools\public-copy-check.js') '// 검토 뒤에 고친 줄'
+  Add-Content -Encoding UTF8 (Join-Path $d 'tests\known-limits\README.md') '검토 뒤에 고친 줄'
   ((& node (Join-Path $d 'tools\gate-hashes.js')) | Out-String | ConvertFrom-Json).harnessHash }
 Test-Case '검토 뒤 점검 틀을 고치고 기록 지문만 지금 값으로 고침' $false { param($d)
   $harness = & $newHarness $d
   Edit-Json (Join-Path $d $overfitFile) { param($j) $j.harnessHash = $harness } }
 Test-Case '검토 뒤 점검 틀을 고치고 보고서 끝에 새 지문 줄을 덧붙임' $false { param($d)
   $harness = & $newHarness $d
-  & $reportEdit $d { param($text) $text + "`n검토 끝 지문: harnessHash $harness`n" }
-  Edit-Json (Join-Path $d $overfitFile) { param($j) $j.harnessHash = $harness } }
+  # 지적 줄 뒤에 덧붙인다 — 지적이 없는 보고서여도 「첫 지적 줄 뒤」 검사에 닿게
+  & $reportEdit $d { param($text) $text + "`nid: selftest-late`n검토 끝 지문: harnessHash $harness`n" }
+  Edit-Json (Join-Path $d $overfitFile) { param($j) $j.harnessHash = $harness }
+  & $newReview $d } '첫 지적 줄 뒤'
+# 머리 지문을 비우면 원문 출처 검사(report-source.js)가 검토 중 잰 값과 달라 먼저 막는다 — 관문 머리 검사는 그 뒤라 여기서는 출처 쪽 막힘을 본다
 Test-Case '과적합 검토 보고서 머리 지문이 비어 있음' $false { param($d)
   $record = Get-Content -Raw -Encoding UTF8 (Join-Path $d $overfitFile) | ConvertFrom-Json
-  & $reportEdit $d { param($text) $text.Replace([string]$record.contentHash, '').Replace([string]$record.harnessHash, '').Replace([string]$record.promptHash, '') } }
+  $before = [System.IO.File]::ReadAllText((Join-Path $d $reportRel), (New-Object System.Text.UTF8Encoding $false)) -split "`n"
+  $start = @($before | Where-Object { $_ -match '검토 시작 지문' }) | Select-Object -First 1
+  $end = @($before | Where-Object { $_ -match '검토 끝 지문' }) | Select-Object -First 1
+  & $reportEdit $d { param($text) $text.Replace([string]$record.contentHash, '').Replace([string]$record.harnessHash, '').Replace([string]$record.promptHash, '') }
+  & $newReview $d -measuredStart $start -measuredEnd $end } '머리 지문'
 Test-Case '과적합 검토 보고서의 시작·끝 지문이 다름' $false { param($d)
-  & $reportEdit $d { param($text) ([regex]'(검토 끝 지문[^\n]*?testsHash\W+)([0-9a-f]{64})').Replace($text, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $m.Groups[1].Value + ('0' * 64) }, 1) } }
+  & $reportEdit $d { param($text) ([regex]'(검토 끝 지문[^\n]*?testsHash\W+)([0-9a-f]{64})').Replace($text, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $m.Groups[1].Value + ('0' * 64) }, 1) }
+  & $newReview $d } '시작·끝 지문\(testsHash\)'
 # 보고서 원문의 저장소 밖 출처(검토 보조 에이전트 기록): 머리 지문을 바꿔 쓰고 기록도 맞추면 출처와 달라 막힘, 출처 없음도 막힘
 Test-Case '검토 뒤 점검 틀을 고치고 보고서 머리 지문·기록 지문·reportHash를 함께 고쳐 씀(출처와 다름)' $false { param($d)
   $harness = & $newHarness $d
@@ -294,6 +330,7 @@ Test-Case '검토 뒤 점검 틀을 고치고 실제 기록 사본의 돌려준 
   Edit-Json (Join-Path $d $overfitFile) { param($j) $j.harnessHash = $harness } } '꼴'
 Test-Case '원문 출처 기록의 첫 글에 고정 지시문이 없음' $false { param($d) & $newReview $d -noPrompt } '꼴'
 Test-Case '원문 출처 기록이 지시문 파일을 가리켰지만 읽은 결과에 지시문 글이 없음' $false { param($d) & $newReview $d -unread } '꼴'
+Test-Case '원문 출처 기록이 지시문 앞 몇 줄만 읽음' $false { param($d) & $newReview $d -partial } '꼴'
 # 검토자가 고른 도구(PowerShell로 지문 재기·Get-Content로 지시문 읽기)로는 막지 않는다
 Test-Case '원문 출처 기록이 PowerShell로 지문을 재고 지시문을 읽음' $true { param($d) & $newReview $d -shell }
 Test-Case '과적합 검토 기록에 보고서 원문 출처(reportSource)가 없음' $false { param($d) Edit-Json (Join-Path $d $overfitFile) { param($j) $j.PSObject.Properties.Remove('reportSource') } } 'reportSource'
@@ -302,7 +339,8 @@ Test-Case '고치기 전 개발판 기록 뒤 시험 도구(tests/lib)를 고침
 Test-Case '과적합 검토 보고서의 지적을 기록에서 뺌' $false { param($d)
   Add-Content -Encoding UTF8 (Join-Path $d $reportRel) "`nid: selftest-dropped`n"
   $hash = (Get-FileHash -Algorithm SHA256 (Join-Path $d $reportRel)).Hash.ToLower()
-  Edit-Json (Join-Path $d $overfitFile) { param($j) $j.reportHash = $hash } }
+  Edit-Json (Join-Path $d $overfitFile) { param($j) $j.reportHash = $hash }
+  & $newReview $d } 'selftest-dropped'
 # high 지적을 사용자 결정 없이 안 고침으로 닫는 것을 막는지(과적합 검토 3차) — 보고서 원문의 심각도 줄로 high를 안다
 $highId = $null; $cur = $null
 foreach ($line in Get-Content -Encoding UTF8 (Join-Path $repo $reportRel)) {
@@ -355,6 +393,55 @@ else {
   Test-Case '중간 회차 high 지적 wontfix + 사용자 원문·질문 글' $true { param($d) & $midHighAs $d 'wontfix' $true }
 }
 Test-Case '처리 기록에 묶이지 않은 회차 보고서가 있음' $false { param($d) Set-Content -Encoding UTF8 (Join-Path $d "release\overfit-report-$version-selftest.md") "id: selftest-unbound`n- 심각도: low" }
+# 알고 있는 결함을 안 고침(wontfix)으로 닫으려면 결함마다 따로 받은 사용자 답이 있어야 한다 — 정책 한 줄로 여러 결함을 남기는 것을 막는지
+$addWontfix = { param($d, $items) Edit-Json (Join-Path $d $reviewFile) { param($j) $j.findings = @($j.findings) + @($items | ForEach-Object { [pscustomobject]$_ }) } }
+Test-Case '안 고침(wontfix) 지적에 사용자 원문·질문 글이 없음' $false { param($d) & $addWontfix $d @(@{ id = 'selftest-wf'; summary = '자기 점검'; status = 'wontfix'; reason = '시간이 든다' }) } '알고 있는 결함을'
+Test-Case '두 지적을 같은 사용자 답 하나로 안 고침' $false { param($d) & $addWontfix $d @(
+  @{ id = 'selftest-wf1'; summary = '자기 점검'; status = 'wontfix'; reason = '정책'; quote = '오래 걸리니 low는 기록만'; question = '지적을 어떻게 처리할까요?' },
+  @{ id = 'selftest-wf2'; summary = '자기 점검'; status = 'wontfix'; reason = '정책'; quote = '오래 걸리니 low는 기록만'; question = '지적을 어떻게 처리할까요?' }) } '같은 사용자 답 하나'
+Test-Case '두 지적을 결함마다 따로 받은 답으로 안 고침' $true { param($d) & $addWontfix $d @(
+  @{ id = 'selftest-wf1'; summary = '자기 점검'; status = 'wontfix'; reason = '사용자가 받아들임'; quote = '이건 그대로 둬'; question = 'A 결함을 고치지 않고 낼까요?' },
+  @{ id = 'selftest-wf2'; summary = '자기 점검'; status = 'wontfix'; reason = '사용자가 받아들임'; quote = '그것도 둬'; question = 'B 결함을 고치지 않고 낼까요?' }) }
+# 회차 사슬(앞 회차가 끝까지 본 판 이후만 보는 5분 검토): 바탕 판이 앞 회차 끝 판이 아님 / 지금 지시문 회차에 바탕 줄 없음 / 바탕 판을 본 앞 회차가 검토 도중 바뀐 판
+$utf8 = New-Object System.Text.UTF8Encoding $false
+$finalText = [System.IO.File]::ReadAllText((Join-Path $repo $reportRel), $utf8)
+$baseHash = ([regex]'검토 바탕 지문[^\n]*?contentHash\W+([0-9a-f]{64})').Match($finalText).Groups[1].Value
+$releaseBase = (Get-Content -Raw -Encoding UTF8 (Join-Path $repo $changesFile) | ConvertFrom-Json).baseContentHash
+if ($baseHash) {
+  Test-Case '마지막 회차의 바탕 판이 앞 회차가 끝까지 본 판이 아님' $false { param($d)
+    & $reportEdit $d { param($text) ([regex]'(검토 바탕 지문[^\n]*?contentHash\W+)([0-9a-f]{64})').Replace($text, [System.Text.RegularExpressions.MatchEvaluator] { param($m) $m.Groups[1].Value + ('1' * 64) }, 1) }
+    & $newReview $d } '바탕 판이 묶인 앞 회차'
+  Test-Case '지금 지시문으로 한 마지막 회차에 바탕 지문 줄이 없음' $false { param($d)
+    & $reportEdit $d { param($text) @($text -split "`n" | Where-Object { $_ -notmatch '검토 바탕 지문' }) -join "`n" }
+    & $newReview $d } '바탕 지문」 줄이 없습니다'
+  $prevRel = $null
+  foreach ($r in $midReports) {
+    $t = [System.IO.File]::ReadAllText((Join-Path $repo ($r.report -replace '/', '\')), $utf8)
+    if (([regex]'검토 끝 지문[^\n]*?contentHash\W+([0-9a-f]{64})').Match($t).Groups[1].Value -eq $baseHash) { $prevRel = $r.report -replace '/', '\' }
+  }
+  # 바탕이 직전 출시판이면 사슬이 첫 단계에서 끝나 앞 회차가 없다 — 마지막 회차 바탕을 묶인 앞 회차(시작 = 끝인 것) 하나의 끝 지문으로 바꿔 이 경우를 만든다
+  $rebase = $null
+  if (-not $prevRel -and $baseHash -eq $releaseBase) {
+    foreach ($r in $midReports) {
+      $t = [System.IO.File]::ReadAllText((Join-Path $repo ($r.report -replace '/', '\')), $utf8)
+      $start = ([regex]'(?m)^검토 시작 지문:[^\n]*').Match($t).Value; $end = ([regex]'(?m)^검토 끝 지문:[^\n]*').Match($t).Value
+      $vals = @('contentHash', 'testsHash', 'harnessHash', 'promptHash' | ForEach-Object { ([regex]"$_\W+([0-9a-f]{64})").Match($end).Groups[1].Value })
+      if ($start -and $end -and @($vals | Where-Object { $_ }).Count -eq 4 -and $start.Substring($start.IndexOf(':')) -eq $end.Substring($end.IndexOf(':'))) {
+        $prevRel = $r.report -replace '/', '\'; $rebase = "contentHash $($vals[0]) testsHash $($vals[1]) harnessHash $($vals[2])" }
+    }
+  }
+  if ($prevRel) {
+    Test-Case '바탕 판을 본 앞 회차가 검토 도중 바뀐 판(시작 ≠ 끝)' $false { param($d)
+      if ($rebase) {
+        & $reportEdit $d { param($text) ([regex]'검토 바탕 지문:[^\n]*').Replace($text, "검토 바탕 지문: $rebase", 1) }
+        & $newReview $d }
+      $p = Join-Path $d $prevRel
+      $t = ([regex]'(검토 시작 지문[^\n]*?testsHash\W+)([0-9a-f]{64})').Replace([System.IO.File]::ReadAllText($p, $utf8), [System.Text.RegularExpressions.MatchEvaluator] { param($m) $m.Groups[1].Value + ('0' * 64) }, 1)
+      [System.IO.File]::WriteAllText($p, $t, $utf8)
+      $hash = (Get-FileHash -Algorithm SHA256 $p).Hash.ToLower()
+      Edit-Json (Join-Path $d $reviewFile) { param($j) ($j.reports | Where-Object { ($_.report -replace '/', '\') -eq $prevRel }).reportHash = $hash } } '바탕 판이 묶인 앞 회차'
+  } else { Write-Output 'FAIL  마지막 회차의 바탕 판을 끝 판으로 본 앞 회차 보고서가 묶음에 없어 사슬 경우를 시험하지 못함'; $failures++ }
+} else { Write-Output 'FAIL  마지막 회차 보고서에 「검토 바탕 지문」이 없어 회차 사슬 경우를 시험하지 못함'; $failures++ }
 
 # 고치기 전 판에서 실패한 시험이어야 고침의 근거(과적합 검토 3차): 실행기 기록(base-run.json) 없음·고치기 전에도 통과·기준 판 다름·기록 뒤 시험 파일 바뀜을 막는지
 $baseFile = 'release\base-run.json'
@@ -384,4 +471,7 @@ if ($regression -and (Test-Path $devFile)) {
 } else { Write-Output 'FAIL  회귀 지적 기록(regression·devBase·failCheck)이나 release\dev-base-run.json이 없어 회귀 경우를 시험하지 못함'; $failures++ }
 
 if ($failures) { Write-Output "자기 점검 실패 $failures 건"; exit 1 }
-Write-Output '자기 점검 통과: 관문이 막아야 할 때 막고, 기록이 맞을 때만 zip을 만든다.'
+$gateAtEnd = ((& node (Join-Path $repo 'tools\gate-hashes.js') --gate) | Out-String).Trim()
+if (-not $gateAtStart -or $gateAtStart -ne $gateAtEnd) { Write-Output '자기 점검 도중 관문·도구가 바뀌어 기록을 남기지 않음 — 다시 돌리세요'; exit 1 }
+& $gateRecord $repo
+Write-Output "자기 점검 통과: 관문이 막아야 할 때 막고, 기록이 맞을 때만 zip을 만든다. 관문 지문 $gateAtEnd 기록(release\gate-selftest.json)"
