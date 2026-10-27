@@ -1,0 +1,297 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>엔트리루트 애니메이터 1.3</title>
+<style>
+html, body { margin: 0; background: #f4efe6; overflow: hidden; }
+svg { display: block; }
+text { font-family: 'Malgun Gothic', 'Noto Sans KR', sans-serif; }
+</style></head>
+<body>
+<svg id="v" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+<defs>
+<!--DEFS-->
+  <pattern id="ruled" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M0 39.5 H40" stroke="#c9d6ee" stroke-width="1"/></pattern>
+  <filter id="paperShadow" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#5a4a30" flood-opacity=".22"/></filter>
+  <filter id="sheetShadow" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#5a4a30" flood-opacity=".16"/></filter>
+  <!-- 장면 1: 그라데이션(끈 방향 그대로 — userSpaceOnUse, 점은 그리면서 바꿈) -->
+  <linearGradient id="gA" gradientUnits="userSpaceOnUse"></linearGradient>
+  <radialGradient id="gB" gradientUnits="userSpaceOnUse"></radialGradient>
+  <!-- 장면 2: 필터(엔트리루트 필터와 같은 종류) -->
+  <filter id="fBlur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="5"/></filter>
+  <filter id="fOutline" x="-20%" y="-20%" width="140%" height="140%">
+    <feMorphology in="SourceAlpha" operator="dilate" radius="5" result="fat"/>
+    <feFlood flood-color="#ff5a36"/><feComposite in2="fat" operator="in" result="ring"/>
+    <feMerge><feMergeNode in="ring"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="fGray"><feColorMatrix type="saturate" values="0"/></filter>
+  <filter id="fInvert"><feComponentTransfer><feFuncR type="table" tableValues="1 0"/><feFuncG type="table" tableValues="1 0"/><feFuncB type="table" tableValues="1 0"/></feComponentTransfer></filter>
+</defs>
+<rect width="1280" height="720" fill="#f4efe6"/>
+<g id="root"></g>
+</svg>
+<script>
+const NS = 'http://www.w3.org/2000/svg';
+const $ = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
+const set = (e, attrs) => { for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const lerp = (a, b, k) => a + (b - a) * k;
+const eio = k => k < .5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+const eo = k => 1 - Math.pow(1 - k, 3);
+const ei = k => k * k * k;
+const back = k => { const c1 = 1.70158, c3 = c1 + 1; return k <= 0 ? 0 : 1 + c3 * Math.pow(k - 1, 3) + c1 * Math.pow(k - 1, 2); };
+const rad = d => d * Math.PI / 180;
+const INK = '#1f2233', BONE = '#ff5a36', SUB = '#7a7466', FAINT = '#9aa0b5', PAPER = '#fffdf8', TAB = '#ebe4d6', BLUE = '#3b6cff', ORANGE = '#ffa424', LINE = '#e3dbc9';
+const root = document.getElementById('root');
+const txt = (parent, x, y, size, fill, anchor, s, weight = 700, extra = {}) => { const e = $('text', { x, y, 'font-size': size, 'font-weight': weight, fill, 'text-anchor': anchor, 'letter-spacing': size > 60 ? -2 : -0.8, ...extra }, parent); e.textContent = s; return e; };
+const swap = (t, a) => { const o = seg(t, a, a + .16), i = seg(t, a + .16, a + .32); return { o: 1 - o, i, oy: -12 * o, iy: 12 * (1 - i) }; };
+const swapSet = (sw, h1, h2, c1, c2) => { set(h1, { opacity: sw.o, transform: `translate(0 ${sw.oy})` }); set(h2, { opacity: sw.i, transform: `translate(0 ${sw.iy})` }); set(c1, { opacity: sw.o }); set(c2, { opacity: sw.i }); };
+const show = (g, on) => g.setAttribute('display', on ? 'inline' : 'none');
+// 핀 구멍 종이(1.0·1.2 영상과 같은 종이)
+function card(parent, w, h, { ruled = true } = {}) {
+  const g = $('g', {}, parent);
+  const paper = $('rect', { rx: 6, fill: PAPER, filter: 'url(#paperShadow)' }, g);
+  const lines = ruled ? $('rect', { fill: 'url(#ruled)', opacity: .6 }, g) : null;
+  const tabs = $('g', {}, g);
+  const t1 = $('rect', { width: 26, height: 7, rx: 3.5, fill: TAB }, tabs), t2 = $('circle', { r: 5, fill: TAB }, tabs), t3 = $('rect', { width: 26, height: 7, rx: 3.5, fill: TAB }, tabs);
+  const api = { g, size(w2, h2) { set(paper, { x: -w2 / 2, y: -h2 / 2, width: w2, height: h2 }); if (lines) set(lines, { x: -w2 / 2, y: -h2 / 2, width: w2, height: h2 }); set(t1, { x: -46, y: -h2 / 2 + 12 }); set(t2, { cx: 0, cy: -h2 / 2 + 15.5 }); set(t3, { x: 20, y: -h2 / 2 + 12 }); } };
+  api.size(w, h);
+  return api;
+}
+const joint = (parent, rootRing = false) => $('circle', { r: rootRing ? 10 : 8, fill: rootRing ? PAPER : '#fff', stroke: BONE, 'stroke-width': rootRing ? 5 : 4.5 }, parent);
+const cursor = $('path', { d: 'M0,0 L0,27 L7,21 L12,32 L17.5,29.6 L12.6,19 L21,19 Z', fill: '#fff', stroke: INK, 'stroke-width': 2.2, 'stroke-linejoin': 'round' });
+// 알약 모양 선택지(창 안 단추)
+function pill(parent, x, y, w, label) {
+  const g = $('g', { transform: `translate(${x} ${y})` }, parent);
+  const box = $('rect', { x: 0, y: 0, width: w, height: 44, rx: 22, fill: '#fff', stroke: LINE, 'stroke-width': 2 }, g);
+  const t = txt(g, w / 2, 29, 20, INK, 'middle', label, 700);
+  return { g, on(k) { set(box, { fill: k > .5 ? BLUE : '#fff', stroke: k > .5 ? BLUE : LINE }); set(t, { fill: k > .5 ? '#fff' : INK }); } };
+}
+
+// ---------- 0. 제목 ----------
+const S0 = $('g', {}, root);
+const s0text = $('g', {}, S0);
+const s0name = txt(s0text, 640, 252, 30, SUB, 'middle', '엔트리루트 애니메이터', 700);
+const s0big = $('g', {}, s0text);
+const s0n = txt(s0big, 600, 392, 168, INK, 'end', '1.3', 700);
+const s0u = txt(s0big, 626, 392, 76, INK, 'start', '업데이트', 700);
+const s0bone = $('polyline', { fill: 'none', stroke: BONE, 'stroke-width': 7, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, S0);
+const s0j = [joint(S0, true), joint(S0), joint(S0), joint(S0)];
+const s0cur = cursor.cloneNode(); S0.appendChild(s0cur);
+function scene0(t) {
+  show(S0, t < 1.8); if (t >= 1.8) return;
+  const draw = eo(seg(t, 0.05, 0.6)), bend = eio(seg(t, 1.12, 1.6));
+  const idle = Math.sin((t - 0.6) * 7) * 3 * seg(t, 0.6, 0.8) * (1 - seg(t, 1.0, 1.12));
+  const a1 = rad(idle - 24 * bend), a2 = rad(idle * .6 - 34 * bend);
+  const p0 = [358, 432], L = 188;
+  const p1 = [p0[0] + L, p0[1]], p2 = [p1[0] + L * Math.cos(a1), p1[1] + L * Math.sin(a1)], p3 = [p2[0] + L * Math.cos(a1 + a2), p2[1] + L * Math.sin(a1 + a2)];
+  const pts = [p0, p1, p2, p3];
+  set(s0bone, { points: pts.map(p => p.join(',')).join(' '), 'stroke-dasharray': 600, 'stroke-dashoffset': 600 * (1 - draw) });
+  pts.forEach((p, i) => { const k = back(seg(t, 0.08 + i * 0.15, 0.3 + i * 0.15)); set(s0j[i], { cx: p[0], cy: p[1], transform: `translate(${p[0]} ${p[1]}) scale(${k}) translate(${-p[0]} ${-p[1]})` }); });
+  const up = back(seg(t, 0.22, 0.7)), up2 = back(seg(t, 0.32, 0.8));
+  set(s0n, { opacity: seg(t, 0.22, 0.4), transform: `translate(0 ${40 * (1 - up)})` });
+  set(s0u, { opacity: seg(t, 0.32, 0.5), transform: `translate(0 ${40 * (1 - up2)})` });
+  set(s0name, { opacity: seg(t, 0.1, 0.45) });
+  set(s0text, { opacity: 1 - seg(t, 1.25, 1.6), transform: `translate(0 ${-50 * ei(seg(t, 1.2, 1.65))})` });
+  const ca = eo(seg(t, 0.75, 1.05));
+  const cx = lerp(1060, p3[0], ca), cy = lerp(560, p3[1], ca);
+  set(s0cur, { transform: `translate(${cx + 4} ${cy + 2}) scale(${t > 1.08 && t < 1.62 ? .92 : 1})`, opacity: seg(t, 0.75, 0.85) * (1 - seg(t, 1.6, 1.75)) });
+  set(S0, { opacity: 1 - seg(t, 1.6, 1.78), transform: `translate(${-60 * ei(seg(t, 1.45, 1.78))} 0)` });
+}
+
+// ---------- 1. 그라데이션 도구 ----------
+// 실제 도구처럼: 누른 도형(기본 엔트리봇의 옷)의 칠만 그라데이션이 된다 — 얼굴·팔·다리는 그대로. 누른 곳 = 시작, 놓은 곳 = 끝, 끄는 동안 방향선만 보이고 놓으면 칠해진다.
+const S1 = $('g', {}, root);
+const c1 = card(S1, 440, 430);
+const gA = document.getElementById('gA'), gB = document.getElementById('gB');
+const K1 = 1.3, BX1 = -94, BY1 = -150; // 엔트리봇 자리: 카드 좌표 = (BX1, BY1) + K1 × 그림 좌표
+const s1bot = $('use', { href: '#bot1Grad', transform: `translate(${BX1} ${BY1}) scale(${K1})` }, c1.g);
+const toC1 = p => [BX1 + K1 * p[0], BY1 + K1 * p[1]];
+const dirLine = $('line', { stroke: INK, 'stroke-width': 3, 'stroke-dasharray': '2 8', 'stroke-linecap': 'round' }, c1.g);
+const dirA = $('circle', { r: 7, fill: '#fff', stroke: INK, 'stroke-width': 3 }, c1.g), dirB = $('circle', { r: 7, fill: INK }, c1.g);
+const s1cur = cursor.cloneNode(); c1.g.appendChild(s1cur);
+const s1head = $('g', {}, S1), s1h1 = txt(s1head, 0, 0, 44, INK, 'start', '끌어서 그라데이션'), s1h2 = txt(s1head, 0, 0, 44, INK, 'start', '원형으로, 단계로도');
+const s1cap = $('g', {}, S1), s1c1 = txt(s1cap, 0, 0, 21, SUB, 'start', '도구 막대 [그라데이션] · 벡터는 누른 도형만', 600), s1c2 = txt(s1cap, 0, 0, 21, SUB, 'start', '끝 투명 · 단계 2~8칸(픽셀 아트용)', 600);
+const opts = $('g', {}, S1);
+const pLin = pill(opts, 0, 0, 96, '직선'), pRad = pill(opts, 108, 0, 96, '원형'), pStep = pill(opts, 216, 0, 120, '단계 4');
+const stopsOf = (colors, steps) => {
+  if (!steps) return colors.map((c, i) => [i / (colors.length - 1), c]);
+  const out = []; // 단계: 칸마다 같은 자리에 정지점 두 개
+  const mix = (a, b, k) => { const p = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return '#' + x.map((v, i) => Math.round(v + (y[i] - v) * k).toString(16).padStart(2, '0')).join(''); };
+  for (let i = 0; i < steps; i++) { const c = mix(colors[0], colors[1], i / (steps - 1)); out.push([i / steps, c], [(i + 1) / steps, c]); }
+  return out;
+};
+const setStops = (g, stops) => { while (g.firstChild) g.firstChild.remove(); for (const [o, c] of stops) $('stop', { offset: o, 'stop-color': c }, g); };
+// 끌기 점(그림 좌표 — 옷 칠도 그림 좌표로 칠함): 직선은 머리 위 왼쪽 → 배 오른쪽 아래, 원형은 배 가운데 → 반지름
+const A0 = [22, 40], A1 = [116, 182], B0 = [70, 150], B1 = [116, 186];
+function scene1(t) {
+  show(S1, t > 1.5 && t < 5.85); if (!(t > 1.5 && t < 5.85)) return;
+  const enter = eo(seg(t, 1.55, 2.05)), exit = ei(seg(t, 5.3, 5.8));
+  const cx = lerp(1560, 400, enter) - 1150 * exit, cy = 384 + Math.sin(t * 2.2) * 3;
+  set(c1.g, { transform: `translate(${cx} ${cy})` });
+  // 끌기 1: 옷에 직선(2.55 누름 → 3.25 놓음), 끌기 2: 옷에 원형(3.85 → 4.35), 끌기 3: 옷에 단계 4(4.65 → 5.05)
+  const drags = [[2.55, 3.25, A0, A1], [3.85, 4.35, B0, B1], [4.65, 5.05, A0, A1]];
+  const arrive = [[2.25, 2.55, [250, 250], toC1(A0)], [3.45, 3.85, toC1(A1), toC1(B0)], [4.4, 4.65, toC1(B1), toC1(A0)]];
+  let cur = null, pressed = false, live = null;
+  for (const [a, b, from, to] of arrive) if (t >= a && t < b) { const k = eio(seg(t, a, b)); cur = [lerp(from[0], to[0], k), lerp(from[1], to[1], k)]; }
+  for (const [a, b, p0, p1] of drags) if (t >= a && t < b) { const k = eio(seg(t, a, b)), q0 = toC1(p0), q1 = toC1(p1); live = [q0, [lerp(q0[0], q1[0], k), lerp(q0[1], q1[1], k)]]; cur = live[1]; pressed = true; }
+  if (t >= 3.25 && t < 3.45) cur = toC1(A1);
+  if (t >= 4.35 && t < 4.4) cur = toC1(B1);
+  if (t >= 5.05 && t < 5.3) { const k = eio(seg(t, 5.05, 5.3)), q = toC1(A1); cur = [lerp(q[0], 250, k), lerp(q[1], 240, k)]; }
+  if (live) { set(dirLine, { x1: live[0][0], y1: live[0][1], x2: live[1][0], y2: live[1][1], opacity: 1 }); set(dirA, { cx: live[0][0], cy: live[0][1], opacity: 1 }); set(dirB, { cx: live[1][0], cy: live[1][1], opacity: 1 }); }
+  else [dirLine, dirA, dirB].forEach(e => set(e, { opacity: 0 }));
+  set(s1cur, cur ? { transform: `translate(${cur[0] + 3} ${cur[1] + 2}) scale(${pressed ? .9 : 1})`, opacity: seg(t, 2.25, 2.35) * (1 - seg(t, 5.2, 5.3)) } : { opacity: 0 });
+  // 칠: 놓는 순간 옷 칠만 바뀜
+  set(gA, { x1: A0[0], y1: A0[1], x2: A1[0], y2: A1[1] });
+  setStops(gA, stopsOf(['#3b6cff', '#ffd98a'], t >= 5.05 ? 4 : 0));
+  set(gB, { cx: B0[0], cy: B0[1], r: Math.hypot(B1[0] - B0[0], B1[1] - B0[1]) });
+  setStops(gB, [[0, '#ffd98a'], [1, '#ff5a36']]);
+  s1bot.style.setProperty('--suit', t >= 5.05 ? 'url(#gA)' : t >= 4.35 ? 'url(#gB)' : t >= 3.25 ? 'url(#gA)' : '#009ff9');
+  // 오른쪽 글·선택지
+  const tx = 724 + 260 * exit, sw = swap(t, 3.5);
+  set(s1head, { transform: `translate(${tx + 40 * (1 - eo(seg(t, 2.0, 2.4)))} 220)`, opacity: seg(t, 2.0, 2.3) * (1 - exit) });
+  swapSet(sw, s1h1, s1h2, s1c1, s1c2);
+  set(s1cap, { transform: `translate(${tx} 268)`, opacity: seg(t, 2.3, 2.6) * (1 - exit) });
+  const ok = eo(seg(t, 2.35, 2.75));
+  set(opts, { transform: `translate(${tx + 60 * (1 - ok)} 340)`, opacity: ok * (1 - exit) });
+  pLin.on(t < 3.6 ? 1 : 0); pRad.on(t >= 3.6 && t < 4.5 ? 1 : 0); pStep.on(t >= 4.5 ? 1 : 0);
+}
+
+// ---------- 2. 레이어 필터 ----------
+const S2 = $('g', {}, root);
+const c2 = card(S2, 420, 430, { ruled: false });
+const s2botWrap = $('g', {}, c2.g);
+const s2bot = $('use', { href: '#bot1', transform: 'translate(-86 -170) scale(1.2)' }, s2botWrap);
+const s2botB = $('use', { href: '#bot1', transform: 'translate(-86 -170) scale(1.2)' }, s2botWrap); // 앞 필터 → 다음 필터로 바뀌는 동안 겹쳐 보이기
+const s2head = $('g', {}, S2), s2h1 = txt(s2head, 0, 0, 44, INK, 'start', '레이어에 필터'), s2h2 = txt(s2head, 0, 0, 44, INK, 'start', '색만 바꾸면 벡터 그대로');
+const s2cap = $('g', {}, S2), s2c1 = txt(s2cap, 0, 0, 21, SUB, 'start', '흐림 · 외곽선 · 모자이크 · 그림자', 600), s2c2 = txt(s2cap, 0, 0, 21, SUB, 'start', '밝기 · 대비 · 흑백 · 세피아 · 색 반전', 600);
+const fpanel = $('g', {}, S2);
+const FILTERS = [['흐림', 'url(#fBlur)', 6.45], ['외곽선', 'url(#fOutline)', 7.05], ['흑백', 'url(#fGray)', 7.85], ['색 반전', 'url(#fInvert)', 8.45]];
+const fpills = FILTERS.map(([name], i) => pill(fpanel, (i % 2) * 132, (i / 2 | 0) * 56, 120, name));
+const s2cur = cursor.cloneNode(); S2.appendChild(s2cur);
+function scene2(t) {
+  show(S2, t > 5.4 && t < 9.6); if (!(t > 5.4 && t < 9.6)) return;
+  const enter = eo(seg(t, 5.45, 5.95)), exit = ei(seg(t, 9.05, 9.55));
+  const cx = lerp(1600, 866, enter), cy = 380 + 760 * exit + Math.sin(t * 2.2) * 3;
+  set(c2.g, { transform: `translate(${cx} ${cy}) rotate(${6 * exit})` });
+  // 지금 걸린 필터(누른 뒤 0.2초에 걸림 — 미리보기)
+  let now = -1; FILTERS.forEach(([, , at], i) => { if (t >= at + 0.12) now = i; });
+  const prev = now - 1, fadeK = now >= 0 ? seg(t, FILTERS[now][2] + 0.12, FILTERS[now][2] + 0.32) : 1;
+  set(s2bot, { filter: prev >= 0 ? FILTERS[prev][1] : '', opacity: now >= 0 ? 1 - fadeK : 1 }); // 필터는 한 번에 하나 — 앞 필터 그림은 바뀌는 동안 사라짐
+  set(s2botB, { filter: now >= 0 ? FILTERS[now][1] : '', opacity: now >= 0 ? fadeK : 0 });
+  fpills.forEach((p, i) => p.on(i === now ? 1 : 0));
+  // 왼쪽 글·필터 단추
+  const sw = swap(t, 7.55), tx = 118 - 120 * exit;
+  set(s2head, { transform: `translate(${tx - 40 * (1 - eo(seg(t, 5.8, 6.2)))} 236)`, opacity: seg(t, 5.8, 6.1) * (1 - exit) });
+  swapSet(sw, s2h1, s2h2, s2c1, s2c2);
+  set(s2cap, { transform: `translate(${tx} 284)`, opacity: seg(t, 6.1, 6.4) * (1 - exit) });
+  const pk = eo(seg(t, 6.0, 6.35));
+  set(fpanel, { transform: `translate(${tx - 40 * (1 - pk)} 340)`, opacity: pk * (1 - exit) });
+  // 커서: 필터 단추를 차례로 누름
+  let pos = null, press = false;
+  FILTERS.forEach(([, , at], i) => { const bx = tx + (i % 2) * 132 + 70, by = 340 + (i / 2 | 0) * 56 + 26; const fromPos = i ? [tx + ((i - 1) % 2) * 132 + 70, 340 + ((i - 1) / 2 | 0) * 56 + 26] : [520, 640];
+    if (t >= at - 0.3 && t < at + 0.25) { const k = eio(seg(t, at - 0.3, at)); pos = [lerp(fromPos[0], bx, k), lerp(fromPos[1], by, k)]; press = t >= at && t < at + 0.12; } });
+  if (!pos && t >= 6.15 && t < 9.0) { let last = null; FILTERS.forEach(([, , at], i) => { if (t >= at + 0.25) last = [tx + (i % 2) * 132 + 70, 340 + (i / 2 | 0) * 56 + 26]; }); pos = last || [520, 640]; }
+  set(s2cur, pos ? { transform: `translate(${pos[0] + 3} ${pos[1] + 2}) scale(${press ? .88 : 1})`, opacity: seg(t, 6.15, 6.3) * (1 - seg(t, 8.75, 8.95)) } : { opacity: 0 });
+}
+
+// ---------- 3. 레이어 끌기 · 묶음 뼈대 ----------
+// 기본 엔트리봇 그대로(조각만 나눔): 팔 = 흰 칠·소매·윤곽선 세 조각을 엔트리 [그룹화]로 묶은 레이어. 처음엔 몸 레이어 아래라 몸에 가려 안 보이고,
+// 레이어 창 줄 오른쪽 ≡ 손잡이로 위로 끌면 앞에 나온다. 묶음은 뼈대 레이어 하나 — 뼈 하나로 세 조각이 같이 돈다.
+const S3 = $('g', {}, root);
+const s3head = $('g', {}, S3), s3h1 = txt(s3head, 640, 0, 44, INK, 'middle', '손잡이로 끌어 순서를'), s3h2 = txt(s3head, 640, 0, 44, INK, 'middle', '묶음은 뼈대 하나로 같이');
+const s3cap = $('g', {}, S3), s3c1 = txt(s3cap, 640, 0, 21, SUB, 'middle', '레이어 ≡ 끌기', 600), s3c2 = txt(s3cap, 640, 0, 21, SUB, 'middle', '엔트리 [그룹화] = 뼈대 레이어 하나', 600);
+const c3wrap = $('g', {}, S3);
+const c3 = card(c3wrap, 420, 380);
+const K3 = 1.3, BX3 = -94, BY3 = -160; // 카드 좌표 = (BX3, BY3) + K3 × 그림 좌표
+const toC3 = p => [BX3 + K3 * p[0], BY3 + K3 * p[1]];
+const figure = $('g', { transform: `translate(${BX3} ${BY3}) scale(${K3})` }, c3.g);
+const armBack = $('g', {}, figure); $('use', { href: '#bot1NoArm' }, figure); const armFront = $('g', {}, figure);
+const armG = $('g', {}, armBack); $('use', { href: '#bot1Arm' }, armG);
+const SH = [36, 115], HD = [67, 158]; // 어깨·손(그림 좌표)
+const ARM_BOX = [[27, 110], [78, 110], [78, 172], [27, 172]]; // 팔 묶음 범위(그림 좌표)
+const groupBox = $('rect', { fill: 'none', stroke: BLUE, 'stroke-width': 2.5, 'stroke-dasharray': '7 6', rx: 8 }, c3.g);
+const groupTag = $('g', {}, c3.g); $('rect', { x: 0, y: 0, width: 64, height: 26, rx: 13, fill: BLUE }, groupTag); txt(groupTag, 32, 19, 15, '#fff', 'middle', '묶음', 700);
+const s3bone = $('line', { stroke: BONE, 'stroke-width': 6, 'stroke-linecap': 'round' }, c3.g);
+const s3j = [joint(c3.g, true), joint(c3.g)];
+// 레이어 창(≡ 손잡이), 썸네일은 그 레이어 그림
+const lpanel = $('g', {}, S3);
+const LROWS = [['엔트리봇', '#bot1NoArm', 'translate(20.8 10.9) scale(.155)'], ['팔 (묶음)', '#bot1Arm', 'translate(3.2 -47.5) scale(.55)']].map(([name, ref, tf]) => {
+  const g = $('g', {}, lpanel);
+  $('rect', { x: 0, y: 0, width: 300, height: 60, rx: 13, fill: '#fff', stroke: LINE, 'stroke-width': 2 }, g);
+  $('rect', { x: 12, y: 10, width: 40, height: 40, rx: 7, fill: '#f6f3ec', stroke: LINE }, g);
+  $('use', { href: ref, transform: tf }, g);
+  txt(g, 66, 39, 24, INK, 'start', name, 700);
+  const grip = $('g', {}, g); [0, 9, 18].forEach(dy => $('rect', { x: 256, y: 21 + dy, width: 24, height: 3.5, rx: 1.75, fill: '#9aa0b5' }, grip));
+  return g;
+});
+const s3cur = cursor.cloneNode(); S3.appendChild(s3cur);
+function scene3(t) {
+  show(S3, t > 9.25 && t < 12.95); if (!(t > 9.25 && t < 12.95)) return;
+  const drop = back(seg(t, 9.3, 9.85)), out = eio(seg(t, 12.45, 12.9));
+  const CX = 820, CY = 430;
+  set(c3wrap, { transform: `translate(${CX} ${lerp(-260, CY, drop)}) scale(${1 - 0.12 * out})`, opacity: 1 - out });
+  // 레이어 창: 처음엔 팔이 몸 아래(몸에 가려 안 보임). 10.2~10.85 팔 줄을 위로 끔
+  const PX = 150, PY = 330, drag = eio(seg(t, 10.2, 10.85));
+  const pk = eo(seg(t, 9.65, 10.0));
+  set(lpanel, { transform: `translate(${PX - 60 * (1 - pk)} ${PY})`, opacity: pk * (1 - out) });
+  set(LROWS[0], { transform: `translate(0 ${lerp(0, 74, drag)})` });
+  set(LROWS[1], { transform: `translate(${8 * Math.sin(drag * Math.PI)} ${lerp(74, 0, drag)})` });
+  (drag > 0.5 ? armFront : armBack).appendChild(armG);
+  // 묶음 뼈대: 11.3~ 뼈 그리기, 11.75~12.35 손 관절을 끌어 팔 묶음(세 조각)이 어깨를 축으로 같이 돎 — 뒤로 갔다 앞으로
+  const turn = 50 * eio(seg(t, 11.75, 12.05)) - 80 * eio(seg(t, 12.05, 12.35));
+  set(armG, { transform: `rotate(${turn} ${SH[0]} ${SH[1]})` });
+  const rot = p => { const a = rad(turn), dx = p[0] - SH[0], dy = p[1] - SH[1]; return [SH[0] + dx * Math.cos(a) - dy * Math.sin(a), SH[1] + dx * Math.sin(a) + dy * Math.cos(a)]; };
+  const p0 = toC3(SH), p1 = toC3(rot(HD));
+  const boneK = eo(seg(t, 11.3, 11.6));
+  set(s3bone, { x1: p0[0], y1: p0[1], x2: lerp(p0[0], p1[0], boneK), y2: lerp(p0[1], p1[1], boneK), opacity: boneK > 0 ? 1 : 0 });
+  [p0, p1].forEach((p, i) => { const k = back(seg(t, 11.3 + i * .12, 11.5 + i * .12)); set(s3j[i], { cx: p[0], cy: p[1], transform: `translate(${p[0]} ${p[1]}) scale(${k}) translate(${-p[0]} ${-p[1]})` }); });
+  // 묶음 표시(점선 상자 + 왼쪽 이름표)
+  const gb = seg(t, 11.0, 11.2) * (1 - seg(t, 12.35, 12.45));
+  const corners = ARM_BOX.map(p => toC3(rot(p))), xs = corners.map(p => p[0]), ys = corners.map(p => p[1]);
+  const bx = Math.min(...xs) - 10, by = Math.min(...ys) - 10;
+  set(groupBox, { x: bx, y: by, width: Math.max(...xs) - bx + 10, height: Math.max(...ys) - by + 10, opacity: gb });
+  set(groupTag, { transform: `translate(${bx - 74} ${by})`, opacity: gb });
+  // 커서: 팔 줄 ≡ → 위로 끔, 그다음 손 관절을 끔
+  let pos = null, press = false;
+  const gripAt = k => [PX + 268, PY + lerp(74, 0, k) + 32];
+  if (t >= 9.9 && t < 10.2) { const k = eio(seg(t, 9.9, 10.2)), g = gripAt(0); pos = [lerp(600, g[0], k), lerp(660, g[1], k)]; }
+  else if (t >= 10.2 && t < 10.95) { pos = gripAt(drag); press = t < 10.85; }
+  else if (t >= 10.95 && t < 11.75) { const k = eio(seg(t, 11.45, 11.75)), g = gripAt(1); pos = [lerp(g[0], CX + p1[0], k), lerp(g[1], CY + p1[1], k)]; }
+  else if (t >= 11.75 && t < 12.45) { pos = [CX + p1[0], CY + p1[1]]; press = t < 12.35; }
+  set(s3cur, pos ? { transform: `translate(${pos[0] + 3} ${pos[1] + 2}) scale(${press ? .9 : 1})`, opacity: seg(t, 9.9, 10.0) * (1 - seg(t, 12.35, 12.45)) } : { opacity: 0 });
+  const sw = swap(t, 10.95);
+  const ty = 112 + (1 - eo(seg(t, 9.55, 9.95))) * -30;
+  set(s3head, { transform: `translate(0 ${ty})`, opacity: seg(t, 9.55, 9.85) * (1 - out) });
+  swapSet(sw, s3h1, s3h2, s3c1, s3c2);
+  set(s3cap, { transform: `translate(0 ${ty + 44})`, opacity: seg(t, 9.75, 10.05) * (1 - out) });
+}
+
+// ---------- 4. 끝 카드 ----------
+const S4 = $('g', {}, root);
+const logo = $('g', {}, S4);
+$('rect', { x: 16, y: 16, width: 96, height: 96, rx: 24, fill: BLUE }, logo);
+const arm = [['#1b2140', 27], [ORANGE, 18], ['#fff', 3.5]].map(([c, w]) => $('path', { fill: 'none', stroke: c, 'stroke-width': w, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, logo));
+const lj0 = $('circle', { cx: 40, cy: 89, r: 6.5, fill: '#fff', stroke: '#1b2140', 'stroke-width': 3 }, logo), lj1 = $('circle', { r: 5.5, fill: '#fff' }, logo), lj2 = $('circle', { cx: 91, cy: 43, r: 5.5, fill: '#fff' }, logo);
+const s4t = txt(S4, 640, 468, 56, INK, 'middle', '', 700);
+const s4a = $('tspan', {}, s4t); s4a.textContent = '엔트리루트 애니메이터 ';
+const s4b = $('tspan', { fill: BONE }, s4t); s4b.textContent = '1.3';
+const s4s = txt(S4, 640, 522, 27, SUB, 'middle', '크롬 웹스토어 · 무료', 700);
+const s4f = txt(S4, 640, 650, 19, FAINT, 'middle', '엔트리용 비공식 확장 · 엔트리봇 © NAVER Connect Foundation', 600);
+function scene4(t) {
+  show(S4, t > 12.7); if (!(t > 12.7)) return;
+  const pop = back(seg(t, 12.75, 13.2)), fade = 1 - seg(t, 14.72, 15);
+  set(logo, { transform: `translate(640 262) scale(${1.45 * pop}) translate(-64 -64)`, opacity: fade });
+  const b = eio(seg(t, 13.15, 13.55)) - 0.35 * eio(seg(t, 13.55, 13.8)) + 0.35 * eio(seg(t, 13.8, 14.05));
+  const mx = lerp(65.5, 55, b), my = lerp(66, 55, b);
+  arm.forEach(p => set(p, { d: `M40,89 L${mx},${my} L91,43` })); set(lj1, { cx: mx, cy: my });
+  const k1 = eo(seg(t, 13.0, 13.4)), k2 = eo(seg(t, 13.2, 13.6)), k3 = seg(t, 13.5, 13.8);
+  set(s4t, { opacity: k1 * fade, transform: `translate(0 ${22 * (1 - k1)})` });
+  set(s4s, { opacity: k2 * fade, transform: `translate(0 ${18 * (1 - k2)})` });
+  set(s4f, { opacity: k3 * fade });
+}
+
+window.renderAt = t => { scene0(t); scene1(t); scene2(t); scene3(t); scene4(t); };
+window.__ready = Promise.resolve();
+window.renderAt(0);
+</script>
+</body></html>

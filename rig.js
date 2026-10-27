@@ -9,6 +9,7 @@
   let layersFolded = false;
   let pivotUI = null;
   let pendingSaves = [];
+  let lastSiteSave = null; // 엔트리 저장(fileSave)이 보낸, 아직 답이 없는 모양 저장 { at, fileId }
   let lastCross = null;
   let costumeOnionEnabled = false;
   // 기준 모양: 오브젝트 id → 고정한 모양 id. 다른 모양을 볼 때도 주황색으로 겹쳐 보인다(이 탭에서만 기억).
@@ -120,7 +121,7 @@
         !['VECTOR', 'BITMAP'].includes(ep.mode)) return null;
     // 모양을 바꾸는 동안은 선택 모양이 먼저 바뀌고 편집기 그림은 아직 앞 모양 것이다(비동기 불러오기, 저장 확인창이 떠 있는 동안 —
     // 확인창 동안 file.id는 앞 모양). 그 사이 0.5초 갱신이 새 모양 정보에 앞 모양 그림 기준 값(기준점·상자 표시)을 쓰지 않게
-    // 비워 둔다(검토로 찾음 2026-10-16 — 무한 배경 접기에서 같은 틈이 실제로 재현됨).
+    // 비워 둔다(검토로 찾음 — 무한 배경 접기에서 같은 틈이 실제로 재현됨).
     if (pictureSwitching()) return null;
     const found = paintLayer(ep);
     if (!found) return null;
@@ -443,8 +444,8 @@
       }
       // 그림판 파일 이름은 그 파일 id의 모양 이름으로 맞춘다. 엔트리 모양 목록의 이름 칸은 칸을 떠날 때(blur) 열린 모양이 아니어도 그림판 파일
       // 이름을 그 칸 모양 이름으로 바꾼다(entry.min.js 이름 칸: painter.file.name = 칸 글, id 확인 없음). 그린 뒤 다음 모양의 이름 칸을 눌러
-      // "저장할까요?" [확인]을 누르면 그 순간 이름 칸을 떠나, 저장한 앞 모양이 다음 모양 이름이 됐다(10-19 사용자 제보 "ID로 관리돼지 않아서
-      // 섞이는게 발생" 조사 중 확장 없이도 재현 — 이름이 둘 다 같아짐). 모양 이름을 직접 고치면 엔트리가 모양 정보 이름도 같이 바꾸므로 그대로다.
+      // "저장할까요?" [확인]을 누르면 그 순간 이름 칸을 떠나, 저장한 앞 모양이 다음 모양 이름이 됐다(확장 없이도 재현 — 이름이 둘 다
+      // 같아짐). 모양 이름을 직접 고치면 엔트리가 모양 정보 이름도 같이 바꾸므로 그대로다.
       try {
         const file = this.file, E = window.Entry;
         const owner = (file?.objectId && E?.container?.getObject?.(file.objectId)) || E?.playground?.object;
@@ -473,7 +474,7 @@
       } catch (error) { console.warn('[entry-vector-rig] 무한 배경 저장 준비 실패', error); }
       // 비트맵 뼈대: PNG에는 그림 데이터가 남지 않으므로 관절을 모양 정보에 남긴다(저장한 모양 = 지금 자세가 새 기준).
       // 새 모양으로 저장하면 원래 모양은 그대로 남으니 원래 모양에는 휘기 전 관절을 남긴다(다음에 열어 다른 자세를 잡게).
-      let bitmapRig;
+      let bitmapRig, keptRig = null;
       try {
         const sc = this.entryPaint?.mode === 'BITMAP' && window.Entry?.stage?.selectedObject ? saveContext(this) : null;
         if (sc) {
@@ -483,9 +484,21 @@
           let rig = null;
           try { rig = raster && JSON.parse(raster.data[BONES]); } catch { rig = null; }
           if (rig) rig = rigMovedTo(rig, rasterSig(raster));
+          // 선택 도구로 옮긴 조각이 아직 떠 있으면(엔트리는 이 뒤 저장하며 합친다) 기록에도 그 이동을 넣는다
+          const pending = rig && selectionMove(sc.layer, raster, true);
+          if (pending?.warp) rig = { ...rig, joints: pending.warp };
+          else if (pending && !pending.unknown) { try { rig = JSON.parse(shiftedBones(JSON.stringify(rig), pending, false)); } catch { /* 그대로 */ } }
           bitmapRig = !raster ? undefined : rig && validRig(rig) && rig.joints.length > 1 ? bitmapRigRecord(sc, rig, false) : null;
-          if (rig && bitmapRig && this.file?.mode === 'new' && sc.picture.dimension)
-            sc.picture.dimension[BITMAP_RIG] = bitmapRigRecord(sc, rig, true);
+          // 새 모양으로 저장해도 원래 모양(서버의 마지막 저장본)은 그대로다 — 기록이 있으면 두고, 없을 때만 휘기 전 관절을 마지막으로 불러오거나
+          // 저장한 뒤 옮긴 만큼 되돌려 남긴다(편집기 관절은 옮긴 그림을 따라가 있다)
+          // 그리던 모양 복제(hookPictureClone)는 원래 모양을 마지막 저장본 그대로 둔다(사용자 결정) — 모양 정보도 건드리지 않는다.
+          // 옮긴 양을 모르면(다른 서버 그림 때 담은 임시저장을 엶 등) 틀린 자리보다 기록 없음이 낫다.
+          if (rig && bitmapRig && this.file?.mode === 'new' && !this.__evrDuplicating && sc.picture.dimension && !sc.picture.dimension[BITMAP_RIG]) {
+            const moved = serverShift(raster, sc.picture);
+            let rest = null;
+            try { rest = moved && JSON.parse(moved.x || moved.y ? shiftedBones(raster.data[BONES], { x: -moved.x, y: -moved.y }, false) : raster.data[BONES]); } catch { rest = null; }
+            if (validRig(rest)) sc.picture.dimension[BITMAP_RIG] = bitmapRigRecord(sc, rest, true);
+          }
           // 레이어 모양의 관절은 레이어마다 레이어 원본에 담는다(layerSvg). 모양 하나짜리 기록은 지운다 — 남기면 다시 열 때 지금 레이어에 붙는다.
           // k배 픽셀 모양은 다시 열 때 레이어를 읽지 않고 합친 그림으로 여므로 기록을 그대로 둔다.
           // 레이어를 한 장으로 줄여 저장하면 그 레이어 뼈대(파일에서 읽고 아직 안 연 관절, 필터 등으로 그림 data가 비어 레이어 쪽에만 남은 뼈대)를
@@ -496,6 +509,9 @@
             const record = layerJointsRecord(activeLayer(meta), crossPoint(sc));
             if (record) bitmapRig = JSON.stringify(record);
           }
+          // 뼈대 데이터 없이 저장하면(PNG로 다시 연 그림을 그대로 저장 등) 지금 기록을 들고 가 저장 뒤 다시 쓴다 — 엔트리가 저장을 마치면 모양 정보를
+          // 서버 응답으로 바꿔 확장 표시가 빠진다.
+          if (bitmapRig === undefined) keptRig = sc.picture.dimension?.[BITMAP_RIG] || null;
         }
       } catch (error) { console.warn('[entry-vector-rig] 비트맵 뼈대 기록 실패', error); }
       if (!tile) {
@@ -549,6 +565,8 @@
         return previousDispatch.call(this, name, payload, ...rest);
       };
       let result;
+      if (window.Entry?.stage?.selectedObject) lastSiteSave = { at: Date.now(), fileId: this.file?.id,
+        flow: this.__evrDuplicating ? 'duplicate' : this.file?.mode === 'new' ? 'new' : 'save' };
       try { result = original.apply(this, args); }
       finally {
         if (fullPng) {
@@ -563,14 +581,14 @@
       }
       const layerCount = layerSwap ? layerSwap.meta.layers.length : 0;
       if (tile) pendingSaves.push({ object: tile.c.object, pictureId: tile.c.picture.id, mode: tile.mode,
-        before: tile.before, size: pngSize(tile.png), tile: true, pixel: tile.pixel, pixelSvg: !!tile.svg, bitmapRig, layers: layerCount, at: Date.now() });
+        before: tile.before, size: pngSize(tile.png), tile: true, pixel: tile.pixel, pixelSvg: !!tile.svg, bitmapRig, keptRig, layers: layerCount, at: Date.now() });
       try {
         const size = prepared && (pngSize(fullPng) || (layerSwap && pngSize(sentImage)) || savedSize(prepared.c, this.file?.svg));
         if (size) pendingSaves.push({ object: prepared.c.object,
           pictureId: prepared.c.picture.id, mode: prepared.mode,
           before: prepared.before, size, art: prepared.art, pixel: prepared.pixel, tile: vectorTile,
           pixelVector: pixelVector(prepared.c.picture) && !bitmapMode(prepared.c), pixelArt,
-          pixelSvg: !!pixelSvg, bitmapRig, layers: layerCount, at: Date.now() });
+          pixelSvg: !!pixelSvg, bitmapRig, keptRig, layers: layerCount, at: Date.now() });
       } catch (error) { console.warn('[entry-vector-rig] 저장 크기 확인 실패', error); }
       // 엔트리 저장과 동시에 다른 모양도 공통 크기로 맞춘다.
       try {
@@ -579,6 +597,19 @@
       } catch (error) { console.warn('[entry-vector-rig] 공통 상자 맞추기 실패', error); }
       return result;
     };
+  }
+  // 엔트리는 모양 저장 그림을 보내자마자 "고침" 표시를 끄고(fileSave), 올리기가 실패해도 알리지 않는다 — 다른 모양을 눌러도 묻지 않아 그린 것이
+  // 말없이 사라졌다(확장 없이도 같음, 시험 재현). 그 모양이 그림판에 그대로 열려 있으면 고침 표시를 되살리고 알린다.
+  const isPictureSave = url => /\/rest\/picture\/canvas(?:[?#]|$)/.test(String(url || ''));
+  function siteSaveFailed() {
+    const save = lastSiteSave, file = window.Entry?.playground?.painter?.file;
+    lastSiteSave = null;
+    if (!save || Date.now() - save.at > 120000 || !file || file.id !== save.fileId) return;
+    file.modified = true;
+    if (file.mode === 'new') file.mode = 'edit';
+    // 복제·새 모양으로 저장이 실패한 뒤 [저장하기]를 누르면 지금 모양에 저장된다(원래 모양이 덮임) — 같은 동작을 다시 누르라고 안내한다
+    const again = { duplicate: '다시 [복제하기]를 누르세요([저장하기]는 지금 모양에 저장합니다)', new: '다시 [새 모양으로 저장하기]를 누르세요([저장하기]는 지금 모양에 저장합니다)' }[save.flow] || '다시 저장하세요';
+    toast(`모양을 서버에 저장하지 못했습니다(인터넷 연결을 확인하세요). 그린 것은 그대로 있으니 ${again}.`, 10000);
   }
   // 엔트리는 업로드가 끝난 뒤 모양 주소와 크기를 바꾼다. 확인창 저장이면 그때 편집기는 이미 다음
   // 모양을 열고 있으므로, 저장 순간에 잰 크기를 모양 id로 찾아 넣는다.
@@ -592,9 +623,15 @@
     picture.dimension.width = record.size.width;
     picture.dimension.height = record.size.height;
     // 비트맵 뼈대 관절(십자 기준). 그림에 뼈대가 있었는데 다 지웠으면(null) 예전 기록을 지우고, 뼈대 데이터가 없던
-    // 저장(undefined)은 그대로 둔다. 벡터는 SVG에 뼈대가 남아 건드리지 않는다.
+    // 저장(undefined)은 저장 순간의 기록을 다시 쓴다(엔트리가 모양 정보를 바꿔 빠지므로). 벡터는 SVG에 뼈대가 남아 건드리지 않는다.
     if (record.bitmapRig) picture.dimension[BITMAP_RIG] = record.bitmapRig;
     else if (record.bitmapRig === null) delete picture.dimension[BITMAP_RIG];
+    else if (record.keptRig) picture.dimension[BITMAP_RIG] = record.keptRig;
+    // 저장한 모양이 편집기에 그대로 열려 있으면 서버 그림 = 지금 그림이다(엔트리 되돌리기 기록도 비워짐)
+    try {
+      const painter = window.Entry?.playground?.painter, parts = painter?.file?.id === picture.id && painter.entryPaint && paintLayer(painter.entryPaint);
+      for (const item of parts?.layer?.children || []) if (isRasterLayer(item)) delete item.data[SERVER_SHIFT];
+    } catch (error) { console.warn('[entry-vector-rig] 옮긴 양 비우기', error); }
     // 비트맵 레이어: 같은 파일 이름으로 합친 PNG와 레이어 원본 SVG가 올라갔다(서버는 SVG로 받으면 둘 다 둔다). 모양은 비트맵(png)으로
     // 둬서 실행 화면·확장 없는 편집기·다른 비트맵 기능은 합친 PNG를 그대로 쓰고, 확장은 표시를 보고 SVG에서 레이어를 꺼낸다.
     // (.ent에는 PNG만 묶이므로 내려받을 때 레이어 원본을 모양 정보에 담는다 — withEntLayers.) 레이어 없이 다시 저장하면 표시를 지운다.
@@ -679,7 +716,7 @@
     const source = pixelVector(picture) && (picture.filename ? svgFile(picture.filename) : atlasOf(picture)?.base);
     const response = await fetch(source || window.Entry.playground.painter.getImageSrc(picture));
     if (!response.ok) throw Error(`SVG를 읽을 수 없습니다 (${response.status})`);
-    const root = new DOMParser().parseFromString(await response.text(), 'image/svg+xml')
+    const root = new DOMParser().parseFromString(xlinkPrefix(await response.text()), 'image/svg+xml')
       .documentElement;
     const view = root.getAttribute('viewBox')?.split(/[\s,]+/).map(Number);
     if (root.nodeName !== 'svg' || view?.length !== 4 || !view.every(Number.isFinite) ||
@@ -862,7 +899,7 @@
     try {
       let response;
       try {
-        response = await fetch('/rest/picture/canvas', { method: 'POST', credentials: 'same-origin',
+        response = await fetch('/rest/picture/canvas', { method: 'POST', credentials: 'same-origin', __evrOwn: true,
           signal: controller.signal,
           headers: { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/json' },
           body: JSON.stringify({ data: payload.image, svg: payload.svg, ext: payload.ext, notrim: true }) });
@@ -892,7 +929,7 @@
     return withRetries(() => uploadOnce(payload));
   }
   // 엔트리 "파일 올리기"가 쓰는 여러 장 업로드. 폼에 type=user, uploadFile0, uploadFile1…을 담는다.
-  // 시험(2026-10-07, 로그인 안 한 빈 작품): 서버는 한 요청에 10장까지만 처리하고 나머지는 말없이
+  // 시험(로그인 안 한 빈 작품): 서버는 한 요청에 10장까지만 처리하고 나머지는 말없이
   // 버렸다(20장 → 10장 응답). 같은 PNG 조각 10장을 번갈아 재니 묶음 1.4초, 낱장(동시 2개) 6.6초.
   // 5배 PNG 10장도 0.36초(같은 때 일반 PNG 0.67초)로 빨랐다. SVG도 받지만 서버가 PNG로 바꾸느라
   // 10장 20초(낱장 7초)라 SVG는 묶음으로 보내지 않는다(uploadArts 설명).
@@ -960,7 +997,9 @@
       window.Entry.stage.updateObject();
     }
     const painter = window.Entry.playground.painter;
-    if (painter?.file?.id === fresh.id && !painter.file.modified) painter.afterModified(fresh);
+    // 그 모양에서 보낸 저장이 아직 오가면 다시 불러오지 않는다 — 새 모양으로 저장(복제)은 원래 모양도 맞추는데, 올리기가 실패하면 그린 것이
+    // 원래 모양 저장본으로 덮였다(시험 재현)
+    if (painter?.file?.id === fresh.id && !painter.file.modified && lastSiteSave?.fileId !== fresh.id) painter.afterModified(fresh);
     // 엔트리 저장 처리는 여기서 그림을 미리 불러 두지만, 여러 개를 맞출 때 서버 요청이 몰려
     // 연결이 끊기는 데 보태므로 하지 않는다. 엔트리는 그림이 필요할 때 직접 불러온다.
   }
@@ -1030,7 +1069,7 @@
         }
         let payload = picture.imageType === 'svg' ?
           await resizedSvg(picture, size) : await resizedPng(picture, size);
-        // 비트맵 레이어 모양은 합친 PNG만 올리면 새 파일에 레이어 원본(SVG)이 없어 레이어가 사라졌다(검토로 찾음 2026-10-16) — 같이 올린다
+        // 비트맵 레이어 모양은 합친 PNG만 올리면 새 파일에 레이어 원본(SVG)이 없어 레이어가 사라졌다(검토로 찾음) — 같이 올린다
         if (layered && picture.imageType === 'png') {
           let gone = false;
           try { payload = await withLayerOriginal(picture, payload, payload.shift); }
@@ -1042,7 +1081,7 @@
         if (!isCurrent()) return;
         if (pixelVector(picture)) {
           await uploadPicture(object, picture, payload, isCurrent, { entryVectorPixel: 1, [PIXEL_VECTOR]: 'svg' });
-          await repixelVector(object, picture.id, entryBitmapSvgArt(payload.svg));
+          await repixelVector(object, picture.id, await entryBitmapSvgArt(payload.svg));
         } else await uploadPicture(object, picture, payload, isCurrent);
       } catch (error) {
         console.warn('[entry-vector-rig] 공통 상자 맞추기 실패', picture.name, error);
@@ -1105,7 +1144,7 @@
     const original = proto.addPicture;
     Object.defineProperty(proto, '__entryVectorLoadHook', { value: true });
     // 엔트리는 번호(id) 없는 모양이면(오브젝트가 하나도 없을 때 — injectPicture가 빈 pictureSelected를 냄) addPicture를 거치지 않고 그림판만
-    // 비운다(entry.min.js afterModified). 그 사이 확장이 받던 앞 모양 그림이 그 뒤에 와서 빈 그림판에 들어갔다(10-19 시험: 오브젝트를 모두 지우면
+    // 비운다(entry.min.js afterModified). 그 사이 확장이 받던 앞 모양 그림이 그 뒤에 와서 빈 그림판에 들어갔다(시험: 오브젝트를 모두 지우면
     // 지운 오브젝트 그림이 남음 — 엔트리만으로도 같음). 받던 표식을 새로 바꿔 늦게 온 그림을 버리고 불러오는 중 상태를 푼다.
     if (typeof proto.afterModified === 'function') {
       const afterModified = proto.afterModified;
@@ -1182,12 +1221,12 @@
     if (!response.ok) throw Object.assign(Error(`SVG를 받을 수 없습니다 (${response.status})`), { status: response.status });
     const text = (await response.text()).replace(/^\s+/, '');
     if (!/^[^\n]*</.test(text)) throw Error('SVG 글이 아닙니다.');
-    return text;
+    return xlinkPrefix(text);
   }
   // ---- 벡터 SVG 정의 이름 겹침(1.3) ----
   // 엔트리 저장(entry-paint exportSVG)은 그림 층 도형마다 따로 만든 SVG를 이어 붙여서, 그라데이션·클리핑 틀 같은 정의 이름이 도형마다
   // 처음부터 다시 매겨진다(color-1, clip-1…). 다시 열면(importSVG) 겹친 이름이 모두 마지막 정의를 가리켜 그라데이션이 바뀌고 두 번째
-  // 클리핑 마스크부터 사라진다 — 엔트리 결함(확장 없이도 같음, 10-18 실험 vector-roundtrip). 이름이 겹칠 때만 도형 SVG(맨 위 svg의
+  // 클리핑 마스크부터 사라진다 — 엔트리 결함(확장 없이도 같음, 실험 vector-roundtrip). 이름이 겹칠 때만 도형 SVG(맨 위 svg의
   // 자식 svg)마다 그 안 정의 이름과 그 안 참조(url(#…)·href="#…")를 고유하게 바꾼다. 저장할 때 고쳐 서버 파일이 바르게 남고, 열 때도
   // 고쳐 예전에 저장된 파일도 바르게 열린다. 고치다 실패하면 원래 글을 그대로 쓴다.
   function uniqueSvgIds(text) {
@@ -1219,6 +1258,34 @@
     const out = new XMLSerializer().serializeToString(doc);
     return text.startsWith('<?xml') && !out.startsWith('<?xml') ? `<?xml version="1.0" encoding="utf-8"?>\n${out}` : out;
   }
+  // ---- 벡터 SVG 그림 주소 접두사(커뮤니티에서 벡터 버그로 알려진 것) ----
+  // 엔트리는 벡터 모양 속 그림(<image>)마다 xlink 이름공간을 임의 접두사로 그 요소에 선언해 보낸다(xmlns:ns1="…xlink" ns1:href). 엔트리 서버는
+  // 저장하며 SVG를 다시 쓰는데, 그림이 둘 이상이면 두 번째부터 그 선언을 빼 버려 XML로 읽히지 않는다(실제 서버 탐침) — 실행 화면(PNG)은 멀쩡한데
+  // 편집 창이 그 모양을 못 열거나 일부만 열고, 그대로 다시 저장하면 빠진 부분이 굳는다. 저장할 때 맨 위에 선언된 xlink: 접두사로 바꿔 보내고,
+  // 열 때 이미 선언이 빠진 파일도 같은 이름공간으로 고쳐 연다(서버 SVG를 읽는 곳 모두 — svgText·readSvg·레이어 원본). 고친 글이 원래보다
+  // 못 읽히면 원래 글을 그대로 쓴다.
+  const XLINK = 'http://www.w3.org/1999/xlink';
+  function xlinkPrefix(text) {
+    if (typeof text !== 'string' || !/\s[A-Za-z_][\w.-]*:href=/.test(text)) return text;
+    const declared = new Map();
+    for (const [, prefix, uri] of text.matchAll(/\sxmlns:([A-Za-z_][\w.-]*)="([^"]*)"/g)) {
+      if (!declared.has(prefix)) declared.set(prefix, new Set());
+      declared.get(prefix).add(uri);
+    }
+    // xlink 이름공간에 묶인 접두사, 또는 어디에도 선언이 없는데 href에 붙은 접두사(href의 이름공간은 xlink뿐)
+    const prefixes = new Set([...text.matchAll(/\s([A-Za-z_][\w.-]*):href=/g)].map(match => match[1]).filter(prefix => prefix !== 'xlink' && prefix !== 'xml' && prefix !== 'xmlns' &&
+      (!declared.has(prefix) || [...declared.get(prefix)].every(uri => uri === XLINK))));
+    if (!prefixes.size) return text;
+    let out = text;
+    for (const prefix of prefixes) {
+      const p = prefix.replace(/[.-]/g, '\\$&');
+      out = out.replace(new RegExp(`\\sxmlns:${p}="${XLINK.replace(/[./]/g, '\\$&')}"`, 'g'), '').replace(new RegExp(`(\\s)${p}:([\\w.-]+)=`, 'g'), '$1xlink:$2=');
+    }
+    // 맨 위 svg에 xlink 선언이 없으면 넣는다
+    out = out.replace(/<svg\b[^>]*>/, tag => /\sxmlns:xlink=/.test(tag) ? tag : tag.replace(/^<svg\b/, `<svg xmlns:xlink="${XLINK}"`));
+    const reads = value => !new DOMParser().parseFromString(value, 'image/svg+xml').querySelector('parsererror');
+    return reads(out) ? out : text;
+  }
   const svgIdFixed = new WeakSet();
   // 엔트리는 모양 탭을 처음 열 때 그림판을 만들고(painter.initialize → EntryPaint.default.create) 곧바로 첫 그림을 연다 — 0.5초 점검에서
   // 그림판이 생긴 뒤 감싸면 첫 그림은 안 고친 채 열렸다(독립 검토 지적). 그림판 클래스(window.EntryPaint.default)의 공용 틀을 미리 감싼다.
@@ -1236,6 +1303,7 @@
     svgIdFixed.add(proto);
     const exportSVG = proto.exportSVG, addSVG = proto.addSVG;
     const fixed = (text, when) => {
+      try { text = xlinkPrefix(text); } catch (error) { console.warn(`[entry-vector-rig] SVG 그림 주소 접두사 고치기(${when})`, error); }
       try { return uniqueSvgIds(text); } catch (error) { console.warn(`[entry-vector-rig] SVG 이름 겹침 고치기(${when})`, error); return text; }
     };
     proto.exportSVG = function (...args) { return fixed(exportSVG.apply(this, args), '저장'); };
@@ -1297,6 +1365,11 @@
   // 자리에 칠해졌다(검토 M, 시험 재현). paper가 칠을 옮기는 때(행렬이 있을 때)·같은 항목(도형·겹친 경로 — 묶음에 적힌 색은 자식 좌표라 자식이
   // 따로 옮김)에만 같은 행렬로 옮긴 새 기록으로 바꾼다(복제본과 기록을 같이 쓰므로 제자리에서 고치지 않음). 열 때는 data가 transform 뒤에
   // 들어가 두 번 옮기지 않는다(검토 M 번들 확인).
+  const movedMaskStyle = (style, at) => {
+    const move = value => !value || typeof value === 'string' || !value.gradient ? value
+      : { ...value, origin: at(value.origin), destination: at(value.destination), highlight: at(value.highlight) };
+    return { ...style, fill: move(style.fill), stroke: move(style.stroke) };
+  };
   function hookMaskStyleTransform(P) {
     const proto = P?.Item?.prototype;
     if (!proto || own(proto, '__evrMaskStyleMove') || typeof proto.transform !== 'function') return;
@@ -1312,9 +1385,7 @@
             const moved = matrix.transform(new P.Point(point[0], point[1]));
             return [moved.x, moved.y];
           };
-          const move = value => !value || typeof value === 'string' || !value.gradient ? value
-            : { ...value, origin: at(value.origin), destination: at(value.destination), highlight: at(value.highlight) };
-          this._data.evrMaskStyle = { ...style, fill: move(style.fill), stroke: move(style.stroke) };
+          this._data.evrMaskStyle = movedMaskStyle(style, at);
         } catch (error) { console.warn('[entry-vector-rig] 마스크 틀 그라데이션 점 옮기기', error); }
       }
       return result;
@@ -1393,10 +1464,19 @@
       if (painter.__evrLoading === token) showLoadingCover(painter, true, retry);
     }, LOAD_SLOW_MS);
   }
+  // 다시 연 비트맵은 엔트리가 저장 그림을 빈 바탕 위 조각으로 골라 둔다 — 그 조각만 떼어 낸 것으로 다룬다(bonesOnFloating). 붙여넣은 조각·
+  // 가져온 그림도 떠 있지만 바탕에서 떼어 낸 것이 아니라, 끌어도 관절·옮긴 양을 건드리지 않는다.
+  const openedPieces = new WeakSet();
+  function markOpenedPieces(painter) {
+    const ep = painter?.entryPaint, layer = ep?.mode === 'BITMAP' ? paintLayer(ep)?.layer : null;
+    if (!layer) return;
+    for (const piece of layer.children.filter(item => isRasterLayer(item) && !isLayerHelper(item)).slice(1)) openedPieces.add(piece);
+  }
   // 엔트리는 그림을 다 넣은 뒤 saveSnapshot → SNAPSHOT_SAVED를 낸다. 오지 않으면(그림 오류 등) 5초 뒤 푼다.
   function waitImported(painter, token) {
     const finish = () => {
       if (painter.__evrLoading !== token) return;
+      try { markOpenedPieces(painter); } catch (error) { console.warn('[entry-vector-rig] 미리 골라 둔 조각 기억', error); }
       painter.__evrLoading = null;
       clearTimeout(painter.__evrLoadingTimer);
       clearTimeout(painter.__evrLoadingSlowTimer);
@@ -1428,7 +1508,7 @@
   }
   // 엔트리가 작품을 불러오는 중인가. 엔트리 사이트는 .ent를 넣은 뒤 다른 정리를 기다렸다가 Entry.Loader.isLoaded()를 보고, 아직이면
   // loadComplete를 기다려 진행 창("업로드 중이에요.")을 닫는다. 그런데 엔트리는 loadComplete를 작품마다 한 번만 보내서, 그 사이 확장이
-  // 모양 그림을 다시 불러(setImage) 대기열에 넣으면 창이 영영 안 닫혔다(2026-10-15 재현, 애니메이터만 켜고 약 3번에 1번). 그래서 진행 창이
+  // 모양 그림을 다시 불러(setImage) 대기열에 넣으면 창이 영영 안 닫혔다(애니메이터만 켜고 약 3번에 1번 재현). 그래서 진행 창이
   // 떠 있거나 불러오는 중에는 작품을 연 뒤 모양을 바꾸는 자동 정리(주소 다시 걸기·자기 파일·.ent 레이어)를 다음 번으로 미룬다.
   function entryLoading() {
     const loader = window.Entry?.Loader;
@@ -1502,7 +1582,7 @@
   // ---- 오브젝트 단위 픽셀 아트: 아틀라스 ----
   // 모양마다 SVG를 올리면 서버가 요청마다 0.13초 넘게 써서(동시 2개까지) 모양 500개에 수십 초가 걸렸다.
   // 같은 크기 모양들을 SVG 한 장에 칸으로 모아 한 번 올리고, 모양은 "아틀라스.svg#f번호"로 자기 칸만 본다.
-  // 시험(2026-10-07, 시험 작품): 엔트리 무대에서 칸 SVG(1배·16배)가 여러 크기·소수 위치 모두 섞인 색 0%
+  // 시험(시험 작품): 엔트리 무대에서 칸 SVG(1배·16배)가 여러 크기·소수 위치 모두 섞인 색 0%
   // (1배 PNG 98~99%, 16배 PNG 8~41%), 모양 목록 썸네일(CSS 배경)도 칸을 따름, 서버는 <view>를 그대로 보관.
   // 칸 표시: dimension.entryVectorAtlas = { file: 아틀라스 파일 이름, view: 'f번호', base?: 원래 fileurl }
   const atlasOf = picture => {
@@ -1632,7 +1712,7 @@
   // 그림 층 맨 위 항목마다, 경로·복합 경로·글자는 칠(선 굵기 0)과 선(칠 없음)을 따로 72dpi로 굽고 알파 128 기준으로 끊어 칠·선
   // 색으로 칠한 뒤(getAliasingRaster) 한 장으로, 그 밖(묶음·그림 등)은 통째로 굽는다(번짐 그대로). 그 조각을 차례로 겹친다.
   // 엔트리는 조각을 무대 밖에서 자르지만 여기서는 모양 범위 그대로 둔다. 기준점 상자(확장 표시)는 뺀다.
-  // 예전(2026-10-14 오전)엔 실행 화면 PNG를 그대로 썼는데, 엔트리 기본 SVG는 크기가 없어 88×150으로 줄었고(모양은 144×246)
+  // 예전엔 실행 화면 PNG를 그대로 썼는데, 엔트리 기본 SVG는 크기가 없어 88×150으로 줄었고(모양은 144×246)
   // 맨 위 경로도 번짐이 남아 비트맵과 결과가 달랐다(사용자 지적).
   const ALIAS_ALPHA = 128;
   function aliasRaster(P, raster, color) {
@@ -1689,12 +1769,18 @@
     return items;
   }
   // 벡터 SVG 글 → 보이는 범위 크기(1단위 = 1px) 그림. paper importSVG는 SVG 좌표 그대로 읽는다(실험: 엔트리봇 기본 SVG viewBox 0 0 144 246).
-  function entryBitmapSvgArt(text) {
+  // 그림(<image>)의 크기·자리는 paper가 그 그림의 load 때(다음 박자) 정한다 — 그 전에 구우면 그림이 원점에 걸려 빠지거나 귀퉁이만 남았다.
+  async function entryBitmapSvgArt(text) {
     const P = window.Entry.playground.painter.entryPaint.paper;
     const doc = new DOMParser().parseFromString(text, 'image/svg+xml').documentElement;
     const view = doc.getAttribute('viewBox')?.split(/[\s,]+/).map(Number);
     if (view?.length !== 4 || !view.every(Number.isFinite) || !(view[2] > 0 && view[3] > 0)) throw Error('viewBox가 없는 SVG입니다.');
     const root = P.project.importSVG(text, { insert: false });
+    await Promise.all(root.getItems({ class: P.Raster }).map(raster => new Promise(resolve => {
+      raster.once('load', resolve);
+      raster.once('error', resolve);
+      setTimeout(resolve, 5000);
+    })));
     // 엔트리는 연 SVG를 화면 가운데(처음 중심 home)로 옮긴 뒤 굽는다(lC: position = view.center). 같은 좌표에서 구워야 번짐 경계 화소까지
     // 같다(SVG 좌표 그대로 구우면 엔트리봇에서 1화소 색이 달랐다 — 시험으로 찾음).
     const home = areaHome(window.Entry.playground.painter.entryPaint);
@@ -1708,7 +1794,7 @@
   // ---- 자기 파일 없는 모양(엔트리 라이브러리 그림) ----
   // 엔트리 라이브러리 그림(엔트리봇 등)은 파일 이름 없이 fileurl(/lib/… 주소)만으로 그림을 찾는다(entry.min.js 260921 _getImageSrc:
   // fileurl이 없으면 filename으로 만든 PNG 주소). 픽셀 아트가 그 fileurl을 아틀라스 칸(/uploads/…#f번호)으로 바꾸면 그 모양의 그림 단서가
-  // 서버 파일 주소 하나뿐인데, 엔트리 서버는 .ent로 묶었다 다시 풀 때 /uploads/ fileurl을 지운다(실험 2026-10-14, 로그인 없이: /lib/ 주소는
+  // 서버 파일 주소 하나뿐인데, 엔트리 서버는 .ent로 묶었다 다시 풀 때 /uploads/ fileurl을 지운다(실험, 로그인 없이: /lib/ 주소는
   // 남기고 /uploads/ 주소는 #이 있든 없든 지움). 그래서 불러온 작품에서 그 모양은 그림 단서가 하나도 없어 엔트리가 작품 전체 불러오기를
   // 멈췄다(filename.substring 오류, 오브젝트 0개 — 확장이 있든 없든 같음). 확장이 fileurl을 바꾸기 전에 모양에 자기 파일을 만든다:
   // 원래 그림 그대로 SVG(+엔트리 저장처럼 같은 크기 PNG)·PNG로 올린다. 칸 주소가 빠져도 파일 이름으로 그림이 남는다(실행 화면은 보통
@@ -1775,7 +1861,7 @@
     const picture = object?.pictures?.find(item => item.id === id);
     if (!picture) return;
     try {
-      const cell = art || entryBitmapSvgArt(await svgText(vectorSource(picture)));
+      const cell = art || await entryBitmapSvgArt(await svgText(vectorSource(picture)));
       const filename = picture.filename || (await ownPictureFile(picture)).filename;
       const [mark] = await uploadAtlases([cell], 1);
       if (!objectPixel(object)) return; // 그 사이 픽셀 아트를 껐으면 이 모양만 픽셀로 되살리지 않는다
@@ -1811,7 +1897,7 @@
       const arts = new Array(pictures.length), owned = new Array(pictures.length);
       let loaded = 0;
       await runLimited(pictures.map((picture, index) => async () => {
-        arts[index] = vectors[index] ? entryBitmapSvgArt(await svgText(vectorSource(picture))) : canvasOfImage(await pictureImage(picture));
+        arts[index] = vectors[index] ? await entryBitmapSvgArt(await svgText(vectorSource(picture))) : canvasOfImage(await pictureImage(picture));
         // 파일 이름 없는 모양(라이브러리 그림)은 칸 주소를 걸기 전에 자기 파일을 만든다(ownPictureFile 설명)
         if (!picture.filename) owned[index] = (await ownPictureFile(picture)).filename;
         toast(`픽셀 아트로 바꾸는 중… 그림 불러오기 ${++loaded}/${pictures.length}`);
@@ -2421,7 +2507,7 @@
     const saved = (i, file) => { uploaded.set(i, file); toast(`${verb}… 올리기 ${++sent}/${list.length}`); };
     const vectorList = list.filter(i => vectors[i]);
     // 그림이 십자 기준으로 옮겨진 거리(잘라 낸 그림의 기준점이 틀 가운데에 옴). 레이어 원본·비트맵 뼈대 관절도 십자 기준이라 같이 옮긴다 —
-    // 예전엔 PNG만 묶어 올려 비트맵 레이어 모양의 레이어가 사라지고, 관절은 옛 자리에 남았다(검토로 찾음 2026-10-16).
+    // 예전엔 PNG만 묶어 올려 비트맵 레이어 모양의 레이어가 사라지고, 관절은 옛 자리에 남았다(검토로 찾음).
     const shiftOf = i => ({ x: arts[i].width / 2 - items[i].rect.x - anchors[i][0], y: arts[i].height / 2 - items[i].rect.y - anchors[i][1] });
     const layeredList = k ? [] : list.filter(i => !vectors[i] && pictures[i].dimension?.[LAYER_MARK]);
     const layeredSet = new Set(layeredList), lostLayers = new Set(), flattened = new Set();
@@ -2450,7 +2536,7 @@
       const { view } = vectors[i], { x, y } = items[i].rect;
       const center = { x: view[0] + x + anchors[i][0], y: view[1] + y + anchors[i][1] };
       const { canvas, payload } = await alignedSvg(vectors[i], center, box);
-      made.set(i, pixelVector(pictures[i]) ? entryBitmapSvgArt(payload.svg) : canvas);
+      made.set(i, pixelVector(pictures[i]) ? await entryBitmapSvgArt(payload.svg) : canvas);
       saved(i, await uploadPayload(payload));
     }), UPLOAD_SLOTS);
     let marks = null;
@@ -2505,7 +2591,7 @@
   // 모양 탭 "중심 맞추기": 창에서 맞출 기준점(3×3)을 고르면 오브젝트의 비트맵 모양을 그 규칙으로 맞춰 모두 같은 크기 틀에
   // 다시 올린다. 미리보기는 맞춘 모양 전체를 옅게 겹치고 하나씩 재생한다. 모양 id·이름은 그대로라 블록 코드는 그대로이고,
   // 되돌리기 한 번으로 돌아온다(옛 파일은 서버에 남음). 예전에는 이웃 모양끼리 윤곽이 가장 잘 겹치게 자동으로 옮겼는데,
-  // 동작이 섞이면 이어 맞추며 옮긴 양이 쌓여 결국 모두 다시 검사해야 했다(사용자: "거의 쓸모없음").
+  // 동작이 섞이면 이어 맞추며 옮긴 양이 쌓여 결국 모두 다시 검사해야 했다.
   let centerDialog = null;
   async function openCenterDialog(c) {
     if (centerDialog) return;
@@ -4108,7 +4194,7 @@
   // 뼈대 모드 밖에서 레이어가 바뀌었으면 맞춘다.
   // - 옮기기만 했으면 뼈대와 기준 모양을 같이 옮긴다(자세 그대로).
   // - 엔트리 선택 도구로 돌리기·크기 바꾸기·뒤집기를 했으면 관절도 같은 변환으로 옮기고 지금 모양을 새 기준으로 삼는다.
-  //   예전에는 옮기기만 따라가서 돌린 그림 위에 관절이 제자리로 남았다(사용자 "벡터에서 회전하는 거는 안 되더라", 실제 엔트리 재현).
+  //   예전에는 옮기기만 따라가서 돌린 그림 위에 관절이 제자리로 남았다(실제 엔트리 재현).
   // - 그 밖에 고쳤으면 지금 모양을 새 기준으로 삼는다(관절은 그 자리).
   function reconcileRig(s, rig, item) {
     const sig = shapeSig(item);
@@ -4375,7 +4461,7 @@
     return Math.hypot(x - a.x - t * dx, y - a.y - t * dy);
   }
   // ---- 뼈대 굽힘: 표준 스키닝 ----
-  // 사용자 요청(2026-10-09 "따로 알고리즘 만들지 마")으로 직접 만든 굽힘(관절 원호·같이 도는 범위 규칙 등) 대신 업계 표준
+  // 직접 만든 굽힘(관절 원호·같이 도는 범위 규칙 등) 대신 업계 표준
   // 순서를 그대로 쓴다. 비교 시험(굵기 44 팔 90·100·150°, 관절 6개 꼬리, 몸통+팔 한 레이어)에서 접힘 0~3, 굵기 유지, 몸통 안 끌림.
   //  1) 그림 안을 삼각망으로 나눈다: 경로 경계와 안쪽 격자 점 → delaunator(ISC) 들로네 삼각분할 → 칠해진 곳 안 삼각형만.
   //  2) 자동 가중치 bone heat(Baran & Popović 2007 "Automatic Rigging and Animation of 3D Characters" 4절, Blender "Automatic
@@ -4732,13 +4818,19 @@
     else h = 0;
     return (h >>> 0).toString(36);
   }
-  // 뼈대를 기록한 뒤 그림만 옮겼으면(그림 전체 이동 — 화소 같고 자리만 다름) 관절도 그만큼. 다시 열 때 reconcileBitmapRig가 하는 판단과 같다 —
-  // 저장은 다시 열기 전에도 하므로 기록할 때 맞춘다.
+  // 같은 크기 그림의 자리 차이 = 옮김(옮긴 뒤 그리거나 지웠어도). 크기가 다르면(넓히기·자르기·다른 그림) 옮김으로 보지 않는다.
+  function sigMove(from, to) {
+    if (!from || !to || !Number.isFinite(from.x) || !Number.isFinite(from.y)) return null;
+    const size = sig => String(sig.abs || '').split(':')[1];
+    if (!size(from) || size(from) !== size(to)) return null;
+    const dx = to.x - from.x, dy = to.y - from.y;
+    return Math.abs(dx) > .01 || Math.abs(dy) > .01 ? { dx, dy } : null;
+  }
+  // 뼈대를 기록한 뒤 그림을 옮겼으면 관절도 그만큼 — 다시 열 때 reconcileBitmapRig와 같은 판단. 저장은 다시 열기 전에도 하므로 기록할 때 맞춘다.
   function rigMovedTo(rig, sig) {
-    if (!rig?.sig || !sig || rig.sig.abs !== sig.abs || !Number.isFinite(rig.sig.x) || !Number.isFinite(rig.sig.y)) return rig;
-    const dx = sig.x - rig.sig.x, dy = sig.y - rig.sig.y;
-    if (Math.abs(dx) <= .01 && Math.abs(dy) <= .01) return rig;
-    return { ...rig, joints: rig.joints.map(j => ({ ...j, x: clean(j.x + dx), y: clean(j.y + dy) })) };
+    const move = sigMove(rig?.sig, sig);
+    if (!move) return rig;
+    return { ...rig, joints: rig.joints.map(j => ({ ...j, x: clean(j.x + move.dx), y: clean(j.y + move.dy) })) };
   }
   // 칠해진 곳 윤곽선(그림 좌표 경로 글 목록). 큰 그림은 줄여서 딴다(화소 60만 개 안).
   function rasterOutline(paper, canvas, x, y) {
@@ -4816,7 +4908,7 @@
       Math.abs(raster.bounds.width - raster.width) < .5 && Math.abs(raster.bounds.height - raster.height) < .5;
   };
   // ---- 묶음 레이어 안의 그림 ----
-  // 사용자 결정(10-18, 제보 "비트맵 레이어를 그룹화 하면 뼈대에서 레이어 인식이 안돼"): 엔트리 [그룹화]로 묶은 묶음은 벡터 레이어처럼
+  // 사용자 결정: 엔트리 [그룹화]로 묶은 묶음은 벡터 레이어처럼
   // 레이어 하나이고, 뼈대 하나로 안의 그림(Raster)이 모두 같이 휜다(합치지 않음). 그림마다 자기 윤곽선 삼각망·가중치로 같은 뼈를 따른다
   // (Spine의 뼈대 하나·그림 조각 여럿과 같음). 묶음 안 경로는 지금처럼 묶음 전체가 한 삼각망. 그림마다의 기준(윤곽선·휘기 전 자리·요약)은
   // 묶음 뼈대의 parts에 그림 차례대로 두고, 휘기 전 그림 데이터(BITMAP_REST)는 그림마다 둔다. 돌리거나 늘린 그림·묶음은 빼고, 빈 그림도 뺀다.
@@ -5068,9 +5160,11 @@
       }
       if (hadRest || !posed(rig)) return rig;
     }
+    // 그림을 고친 데다 옮기기도 했으면(같은 크기에서 자리 다름) 관절도 옮긴 만큼 옮겨 새 기준으로 삼는다
+    const move = sigMove(rig.sig, sig) || { dx: 0, dy: 0 };
     const points = jointPoints(rig);
     restCanvases.set(item, restHere(item));
-    const base = bitmapRigBase(s, item, rig.joints.map(j => ({ ...j, x: clean(points[j.id].x), y: clean(points[j.id].y) })));
+    const base = bitmapRigBase(s, item, rig.joints.map(j => ({ ...j, x: clean(points[j.id].x + move.dx), y: clean(points[j.id].y + move.dy) })));
     base.sig = sig;
     return base;
   }
@@ -5312,6 +5406,7 @@
         if (!pivotUI?.adjusting || event.button !== 0) return;
         event.preventDefault(); event.stopPropagation();
         overlay.setPointerCapture(event.pointerId);
+        if (bitmapMode(pivotUI)) try { bonesBeforeMove(pivotUI); } catch (error) { console.warn('[entry-vector-rig] 관절 기록 옮겨 두기', error); }
         pivotUI.dragging = { id: event.pointerId,
           point: pointer(pivotUI, event) };
       });
@@ -5336,7 +5431,11 @@
         }
         const move = new p.ep.paper.Point(step.x, step.y);
         movableItems(p).forEach(item => item.translate(move));
-        if (bitmapMode(p)) shiftLayerDisplays(p, move);
+        if (bitmapMode(p)) {
+          shiftLayerDisplays(p, move);
+          const total = p.dragging.boneShift ||= { x: 0, y: 0 };
+          total.x += move.x; total.y += move.y;
+        }
         const box = canvasBox(p);
         const bounds = box && movableBounds(p);
         if (bounds) {
@@ -5360,9 +5459,10 @@
       });
       const stopDrag = event => {
         if (pivotUI?.dragging?.id !== event.pointerId) return;
-        const shift = pivotUI.dragging.layerShift;
+        const shift = pivotUI.dragging.layerShift, boneShift = pivotUI.dragging.boneShift;
         pivotUI.dragging = null;
         if (shift) try { commitLayerShift(pivotUI.ep, shift); } catch (error) { console.warn('[entry-vector-rig] 레이어 같이 옮기기', error); }
+        if (boneShift) try { contentMoved(pivotUI, movableItems(pivotUI), boneShift); } catch (error) { console.warn('[entry-vector-rig] 관절 같이 옮기기', error); }
       };
       overlay.addEventListener('pointerup', stopDrag);
       overlay.addEventListener('pointercancel', stopDrag);
@@ -5370,26 +5470,100 @@
     }
     drawPivotUI();
   }
-  // 그림 전체 이동(비트맵): 지금 레이어만 옮기면 레이어가 여럿일 때 그림이 갈라졌다(사용자 결정 10-18 — 모든 레이어를 같이). 끄는 동안은
+  // 그림 전체 이동(비트맵): 지금 레이어만 옮기면 레이어가 여럿일 때 그림이 갈라졌다(사용자 결정 — 모든 레이어를 같이). 끄는 동안은
   // 다른 레이어 표시 그림도 같이 옮기고(아래 묶음의 무대 틀은 그대로), 놓을 때 다른 레이어 그림 자리를 옮긴 만큼 확정한다.
   function shiftLayerDisplays(p, move) {
     const meta = layerMeta(p.ep);
-    if (!meta || meta.layers.length < 2) return;
-    for (const item of layerUi.displays) item.translate(move);
-    layerUi.under?.children.slice(1).forEach(item => item.translate(move));
+    if (!meta) return;
+    // 표시 그림은 레이어가 둘 이상일 때만 있다. 옮긴 양은 한 장이어도 모은다 — 그 레이어의 아직 안 연 관절도 놓을 때 같이 옮긴다(commitLayerShift)
+    if (meta.layers.length > 1) {
+      for (const item of layerUi.displays) item.translate(move);
+      layerUi.under?.children.slice(1).forEach(item => item.translate(move));
+    }
     const shift = p.dragging.layerShift ||= { x: 0, y: 0 };
     shift.x += move.x; shift.y += move.y;
+  }
+  // 관절이 모양 정보에만 있는 한 장 그림(PNG로 다시 엶)은 그림 data에 뼈대가 없어 옮겨도 관절이 옛 자리에 남았다. 끌기 전에 뼈대 모드를 열 때와
+  // 같이 기록을 그림 data 뼈대로 옮겨 둔다(화면은 열지 않음). 레이어 그림의 파일 관절은 commitLayerShift가 옮긴다.
+  function bonesBeforeMove(p) {
+    const c = context();
+    if (c && c.picture?.id === p.picture?.id && !layerMeta(c.ep)) bonesToPicture(c);
+  }
+  // 관절이 모양 정보(한 장 그림)나 레이어 파일(지금 레이어, 아직 안 연 관절)에만 있으면 뼈대 모드를 열 때처럼 그림 data 뼈대로 옮겨 둔다(화면은
+  // 열지 않음) — 옮기기는 그림 data 뼈대만 같이 옮긴다(moveRasterBones·selectionMove)
+  function bonesToPicture(c) {
+    if (session || !c || !bitmapMode(c)) return;
+    const first = c.layer.children.find(isRasterLayer);
+    if (!first || first.data?.[BONES] || !plainRaster(first)) return;
+    const meta = layerMeta(c.ep);
+    if (meta ? !layerBonesOf(activeLayer(meta))?.joints : !(c.picture.dimension?.[BITMAP_RIG] && pictureRigJoints(c))) return;
+    clearEntrySelection(c);
+    flattenLooseRasters(c.ep); // 뼈대 모드 열기와 같은 까닭(되돌리기로 따로 남은 조각)
+    const raster = fillRasterToStage(c);
+    if (raster && rasterInk(raster) !== null) makeSession(c, null);
+  }
+  // 확장이 비트맵 그림 내용을 옮겼을 때(그림 전체 이동·캔버스 기준점): 그림 data 관절과 서버 그림 기준 옮긴 양을 같이 옮긴다
+  function contentMoved(c, items, shift) {
+    if (!bitmapMode(c) || (!shift.x && !shift.y)) return;
+    moveRasterBones(items, shift);
+    // 저장하면 모양 객체가 새 것으로 바뀌어(applyUploaded·엔트리) 들고 있던 객체의 파일 이름이 낡는다 — 지금 모양 정보에서 찾는다
+    const picture = c.object?.pictures?.find(item => item.id === c.picture?.id) || c.picture;
+    addServerShift(c.layer.children.find(isRasterLayer), shift, picture);
+  }
+  // 그림 data의 뼈대도 옮긴 만큼 바로 옮긴다. 열 때 그림 자리 차이로 따라가는 길(reconcileBitmapRig)은 엔트리 붓이 옮긴 그림을 무대 크기로
+  // 잘라 새로 만들면(크기가 달라짐) 이동을 못 알아본다. 그림 요약은 자리만 옮긴다 — 고친 그림인지 판단(화소 요약)은 그대로.
+  function moveRasterBones(items, shift) {
+    if (!shift.x && !shift.y) return;
+    for (const raster of items) {
+      const moved = isRasterLayer(raster) && raster.data?.[BONES] && shiftedBones(raster.data[BONES], shift);
+      if (moved) raster.data[BONES] = moved;
+    }
+  }
+  // 마지막으로 불러오거나 저장한 뒤 이 모양 그림 내용을 옮긴 양(그림 전체 이동·선택 도구로 그림 전체 옮기기) — 새 모양으로 저장할 때 원래 모양
+  // 기록을 서버 그림에 맞춘다. 그림 층 첫 그림 data에 둬 엔트리 되돌리기 기록과 같이 돌아가고, 저장을 마치면 지운다(settleSave). 어느 서버 그림
+  // 기준인지(파일)를 같이 적는다 — 그림 data는 임시저장으로도 되살아나, 다른 서버 그림 때 값이 쓰였다. 서버 그림과의 관계를 모르면 null.
+  const SERVER_SHIFT = 'entryVectorShift';
+  function serverShift(item, picture) {
+    const text = String(item?.data?.[SERVER_SHIFT] || '');
+    if (!text) return { x: 0, y: 0 };
+    const [value, file] = text.split('|'), [x, y] = String(value).split(',').map(Number);
+    return picture && file === String(pictureFile(picture) || '') && Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  }
+  function addServerShift(item, shift, picture) {
+    const old = isRasterLayer(item) && picture && serverShift(item, picture);
+    if (!old) return; // 관계를 모르면 그대로 둔다(새 모양으로 저장이 원래 모양 기록을 남기지 않음)
+    const x = clean(old.x + shift.x), y = clean(old.y + shift.y);
+    if (Math.abs(x) <= .01 && Math.abs(y) <= .01) delete item.data[SERVER_SHIFT];
+    else item.data[SERVER_SHIFT] = `${x},${y}|${pictureFile(picture) || ''}`;
+  }
+  // 뼈대 글(관절·휘기 전 자리·윤곽선, 그림 자체가 옮겨졌으면 그림 요약 자리도)을 옮긴 만큼 옮긴 새 글. 깨졌으면 null.
+  function shiftedBones(text, shift, pictureMoved = true) {
+    let rig = null;
+    try { rig = JSON.parse(text); } catch { return null; }
+    if (!validRig(rig)) return null;
+    rig.joints = rig.joints.map(j => ({ ...j, x: clean(j.x + shift.x), y: clean(j.y + shift.y) }));
+    if (rig.bitmap) Object.assign(rig.bitmap, { x: clean(rig.bitmap.x + shift.x), y: clean(rig.bitmap.y + shift.y) });
+    rig.source = shiftPaths(rig.source, shift.x, shift.y);
+    if (pictureMoved && Number.isFinite(rig.sig?.x) && Number.isFinite(rig.sig?.y)) rig.sig = { ...rig.sig, x: clean(rig.sig.x + shift.x), y: clean(rig.sig.y + shift.y) };
+    return JSON.stringify(rig);
   }
   function commitLayerShift(ep, shift) {
     const meta = layerMeta(ep);
     if (!meta || (!shift.x && !shift.y)) return;
     for (const layer of meta.layers) {
-      // 파일에서 읽고 아직 안 연 레이어 관절도 같이 옮긴다(연 뼈대는 그림 자리가 바뀐 만큼 열 때 따라감 — reconcileBitmapRig)
+      // 파일에서 읽고 아직 안 연 레이어 관절, 다른 레이어의 연 뼈대도 같이 옮긴다(지금 레이어 연 뼈대는 그림 data 쪽 — moveRasterBones)
       const kept = layerBonesOf(layer);
       if (kept?.joints && !kept.bones) {
         const ref = layerUid('b');
         layerBones.set(ref, { ...kept, joints: kept.joints.map(j => ({ ...j, x: clean(j.x + shift.x), y: clean(j.y + shift.y) })) });
         layer.bonesRef = ref;
+      } else if (kept?.bones && layer.id !== meta.active) {
+        const moved = shiftedBones(kept.bones, shift);
+        if (moved) {
+          const ref = layerUid('b');
+          layerBones.set(ref, { ...kept, bones: moved });
+          layer.bonesRef = ref;
+        }
       }
       const content = layer.id !== meta.active && layer.ref && layerCache.get(layer.ref);
       if (!content) continue;
@@ -5636,16 +5810,18 @@
   }
   // 점에 보이는 다른 비트맵 레이어(위부터, 클리핑 레이어는 기준이 칠해진 곳만 — 맨 아래 클리핑 레이어는 그 자신이 기준). 지금 레이어가
   // 칠해진 곳이면 null — 그 위에서는 평소처럼 뼈를 다룬다.
+  // 다른 레이어의 칠해진 곳 = 보이는 불투명도(화소 알파 × 레이어 불투명도, 숨김이면 0)가 알파 8 넘음. 지금 레이어는 화소 알파로 본다.
   function bitmapLayerAt(s, p) {
     const meta = bitmapMode(s) ? layerMeta(s.ep) : null, ink = 8;
+    const seen = layer => layer.visible ? bitmapAlphaAt(s, meta, layer, p) * Math.max(0, Math.min(1, Number(layer.opacity ?? 1))) : 0;
     if (!meta || meta.layers.length < 2 || bitmapAlphaAt(s, meta, activeLayer(meta), p) > ink) return null;
     for (let i = meta.layers.length - 1; i >= 0; i--) {
       const layer = meta.layers[i];
-      if (layer.id === meta.active || !layer.visible || !(layer.opacity > 0) || bitmapAlphaAt(s, meta, layer, p) <= ink) continue;
+      if (layer.id === meta.active || seen(layer) <= ink) continue;
       if (layer.clip) {
         let base = null;
         for (let j = i - 1; j >= 0 && !base; j--) if (!meta.layers[j].clip) base = meta.layers[j];
-        if (base && (!base.visible || !(base.opacity > 0) || bitmapAlphaAt(s, meta, base, p) <= ink)) continue;
+        if (base && seen(base) <= ink) continue;
       }
       return layer;
     }
@@ -6074,6 +6250,9 @@
     document.addEventListener('keydown', s.onKey, true);
   }
 
+  // 엔트리 되돌리기는 기록해 둔 그림 층으로 통째로 바꾸는데 뼈대 작업은 그 기록에 없다 — 다음 엔트리 작업을 되돌리면 뼈대 작업까지
+  // 사라졌다. 뼈대 모드가 끝날 때(어느 길로든) 바뀐 것이 있고 그 모양이 그대로 열려 있으면 한 단계로 남긴다. 다른 모양으로 바뀌어 끝나면 남기지 않는다.
+  const rigState = s => JSON.stringify(s.layers.map(item => item.data?.[BONES] || null));
   function close() {
     const s = session;
     if (!s) return;
@@ -6082,6 +6261,12 @@
     s.ui?.top.remove(); s.ui?.side.remove();
     document.removeEventListener('keydown', s.onKey, true);
     s.opener?.setAttribute('aria-pressed', 'false');
+    if (current(s) && rigState(s) !== s.entryStart) {
+      // 기록을 남기면 엔트리가 고침 표시를 켠다 — 뼈대 모드 안에서 저장한 뒤라면 표시는 그대로 둔다
+      const modified = s.p?.file?.modified;
+      if (!saveEntryHistory(s.ep)) console.warn('[entry-vector-rig] 뼈대: 되돌리기 기록을 남기지 못함');
+      else if (s.p?.file && !modified) s.p.file.modified = false;
+    }
   }
   // 엔트리 선택 도구는 고른 도형마다 복제한 윤곽선과 변형 상자·손잡이를 guide 레이어에 그려 두고, 도형이 바뀌어도 다시
   // 그리지 않는다(entry-paint Nn.activateItem: clone + 그때의 globalMatrix). 모양을 열면 엔트리가 그림 전체를 골라 두므로,
@@ -6090,12 +6275,17 @@
   // 액션(selectedItems = [])을 먼저 보내고, 선택 도구가 이를 받아 윤곽선·상자·손잡이를 지운다(실제 엔트리: guide 51개 → 0,
   // 수정됨 표시 그대로, 5ms). 실패해도 뼈대 모드는 연다(옛 윤곽선이 남는 것뿐).
   function clearEntrySelection(c) {
-    if (!c.layer.getItems({ match: item => item.data?.selected || item.data?.guideItem }).length) return;
-    try { c.ep.getPaperJSON(); } catch (error) { console.warn('[entry-vector-rig] 엔트리 선택 풀기 실패', error); }
+    if (c.layer.getItems({ match: item => item.data?.selected || item.data?.guideItem }).length) {
+      try { c.ep.getPaperJSON(); } catch (error) { console.warn('[entry-vector-rig] 엔트리 선택 풀기 실패', error); }
+    }
+    // 엔트리 저장소 선택도 비운다 — 되돌리기로 되살린 조각은 그림 층 표시 없이 저장소에만 골라져 있어, 그대로 두면 조각을 합친 뒤 지워진 조각에
+    // 선택 상자가 남고 [삭제]가 아무것도 안 지웠다(임시저장 열기·필터와 같은 동작)
+    const store = paintStore();
+    if (store?.getState?.()?.paint?.selectedItems?.length) store.dispatch({ type: 'SELECT_ITEMS', payload: [] });
   }
   // ---- 엔트리 선택 윤곽선 다시 맞추기 ----
   // 같은 까닭으로 확장이 고른 도형을 엔트리 모르게 옮기거나(그림 전체 이동·십자 맞추기·캔버스 크기 등) 숨기거나 그림에서 빼면 옛 윤곽선과
-  // 변형 상자가 그 자리에 남는다(사용자 화면 "박스 남음" — 실제 엔트리에서 그림 전체 이동 뒤 41개 모두 옛 자리). 도형을 바꾸는 곳마다 막는
+  // 변형 상자가 그 자리에 남는다(실제 엔트리에서 그림 전체 이동 뒤 41개 모두 옛 자리). 도형을 바꾸는 곳마다 막는
   // 대신, 고른 도형의 윤곽선이 지금 도형과 어긋났으면 선택을 다시 해 엔트리가 새로 그리게 한다. 엔트리는 윤곽선이 이미 있으면 그대로 쓰므로
   // (activateItem) 먼저 비우고 같은 것을 다시 고른다. 숨겼거나 그림에서 빠진 도형은 선택에서 뺀다. 누르고 있는 동안(엔트리 끌기 중)은
   // 건드리지 않는다. 윤곽선은 고를 때 도형의 전역 위치로 만든 복제본이라 둘 다 전역 범위로 견준다(getBounds(전역 행렬)).
@@ -6151,7 +6341,9 @@
     if (!c.layer.children.length) throw Error(bitmapMode(c) ? '그림이 비어 있습니다.' : '벡터 모양이 비어 있습니다.');
     clearEntrySelection(c);
     if (bitmapMode(c)) {
-      // 엔트리 선택을 풀면 잘라 든 조각이 그림에 합쳐진다. 그 뒤 그림 한 장을 칸만큼 넓혀 둔다.
+      // 엔트리 선택을 풀면 잘라 든 조각이 그림에 합쳐진다. 다시 연 그림을 엔트리 되돌리기로 되살리면 빈 바탕 + 골라지지 않은 조각이 따로 남아
+      // (임시저장 열기와 같은 꼴) 그것도 합친다. 그 뒤 그림 한 장을 칸만큼 넓혀 둔다.
+      flattenLooseRasters(c.ep);
       // 넓히기 전에 검사한다(넓히기는 행렬을 빼고 원래 화소로 다시 그려, 크기를 바꾸거나 돌린 그림이 말없이 되돌아갔다)
       const first = c.layer.children.find(isRasterLayer);
       if (first && !plainRaster(first)) throw Error('크기를 바꾸거나 돌리거나 뒤집은 비트맵이라 뼈대를 쓸 수 없습니다. 저장한 뒤 다시 열어 주세요.');
@@ -6193,6 +6385,7 @@
     }
     refreshPivotUI(c);
     session = makeSession(c, opener);
+    session.entryStart = rigState(session);
     buildRigUI(session);
     opener?.setAttribute('aria-pressed', 'true');
   }
@@ -6476,7 +6669,7 @@
     area.addEventListener('pointerdown', event => {
       if (!(event.button === 0 || event.button === 1 || event.button === 2)) return;
       // 그림판 칸 안에 띄운 확장 창(레이어 창·투명도 상자·그라데이션 창)은 화면 이동으로 가로채지 않는다 — 손 도구·스페이스일 때 창의 단추·밀대가
-      // 눌리지 않았다(검토로 찾음 2026-10-16)
+      // 눌리지 않았다(검토로 찾음)
       if (event.target?.closest?.('.evr-layers, .evr-opacity-opts, .evr-grad-win')) return;
       const now = current();
       if (!now || (event.button === 0 && !painterSpace && !entryHandTool(now))) return;
@@ -6603,7 +6796,7 @@
     try { return run(); } finally { restore(); }
   }
   // 엔트리 선택 이동(entry-paint 261015 Mt.onMouseDrag)은 끄는 점을 xt.getValidMousePoint로 옛 무대(모듈 안 상수 ue.minX..maxY
-  // = 720..1680, 405..945)에 묶어, 캔버스를 키우면 옛 무대 밖으로 옮길 수 없었다(사용자 제보 2026-10-16, 벡터·비트맵 모두 재현 — 1900까지
+  // = 720..1680, 405..945)에 묶어, 캔버스를 키우면 옛 무대 밖으로 옮길 수 없었다(사용자 제보, 벡터·비트맵 모두 재현 — 1900까지
   // 끌면 1680에서 멈춤). 그 함수가 view.on('mousedrag')로 붙을 때 감싸, 첫 묶기 네 번(Math.max(x, minX), Math.min(·, maxX), y도 같은
   // 차례)의 경계만 지금 배경 범위로 바꿔 부른다.
   const moveDrags = new WeakMap();
@@ -6634,7 +6827,7 @@
     };
   }
   // 엔트리 사각형·원 도구(entry-paint 261015 Wr.doing)는 끄는 점을 Math.max(0, x)·Math.max(0, y)로 캔버스 원점에 묶어, 캔버스를 2400보다
-  // 넓히거나(가로 3배 등) 비트맵 무한 배경을 켜서 배경이 0보다 왼쪽·위로 넓어지면 그쪽으로는 도형을 키울 수 없었다(검토로 찾음 2026-10-16).
+  // 넓히거나(가로 3배 등) 비트맵 무한 배경을 켜서 배경이 0보다 왼쪽·위로 넓어지면 그쪽으로는 도형을 키울 수 없었다(검토로 찾음).
   // 두 도구의 끌기를 감싸 배경이 0 밖으로 나갈 때만 그 두 경계를 배경 끝으로 바꾼다.
   const shapeDragTools = new WeakSet(); // 도구마다 한 번만 감싼다(다른 확장이 위에 또 감싸도 0.5초마다 쌓이지 않게)
   function hookShapeDrag(ep) {
@@ -6870,12 +7063,12 @@
     if (own(layer, '__evrPaintHook')) return;
     Object.defineProperty(layer, '__evrPaintHook', { value: true });
     const original = layer.rasterize, add = layer.addChild;
-    let carry = null;
+    let carry = null, carrySig = false, carryWarp = null;
     layer.addChild = function (item, ...rest) {
       if (isRasterLayer(item)) {
         try {
           // 모양을 바꾸면 엔트리는 file.id를 먼저 바꾸고 그림을 넣는다. 작업 영역은 0.5초 갱신·SNAPSHOT_SAVED에서야 새 모양 것으로 바뀌어,
-          // 무한 배경 모양에서 큰 모양으로 바꾸면 들어오는 그림이 앞 모양 칸으로 접혀 들어갔다(재현 2026-10-16: 1920 그림이 960 칸에
+          // 무한 배경 모양에서 큰 모양으로 바꾸면 들어오는 그림이 앞 모양 칸으로 접혀 들어갔다(재현: 1920 그림이 960 칸에
           // 겹쳐 열림, 3번 중 3번). 넣기 전에 지금 모양 작업 영역으로 맞춘다.
           const painter = window.Entry?.playground?.painter;
           if (areaState.ep === ep && painter?.entryPaint === ep && (painter.file?.id ?? null) !== areaState.fileId) syncAreaFile(painter, ep);
@@ -6887,16 +7080,47 @@
             item.position = tile.center;
           }
         } catch (error) { console.warn('[entry-vector-rig] 무한 배경 잇기', error); }
-        if (carry && !item.data?.[BONES]) { Object.assign(item.data, carry); carry = null; }
+        if (carry && !item.data?.[BONES]) {
+          // 휜 그림 전체를 고른 순수 이동이면 합친 그림이 옮긴 그림 그대로다 — 요약을 합친 그림으로 맞춰 자세·휘기 전 그림을 지킨다.
+          // 엔트리가 막 구운 그림은 처음 읽은 화소 요약이 그 뒤 읽기와 달라 한 번 읽고 잰다.
+          if (carrySig && carry[BONES]) try { const rig = JSON.parse(carry[BONES]); rasterSig(item); rig.sig = rasterSig(item); carry[BONES] = JSON.stringify(rig); } catch { /* 그대로 */ }
+          Object.assign(item.data, carry);
+          // 휜 조각을 합친 그림: 관절은 휜 자리, 합친 그림이 새 기준(각도 0)
+          if (carryWarp) try {
+            restCanvases.set(item, restHere(item));
+            const next = bitmapRigBase(context(), item, carryWarp);
+            rasterSig(item); next.sig = rasterSig(item);
+            item.data[BONES] = JSON.stringify(next);
+            delete item.data[BITMAP_REST];
+          } catch (error) { console.warn('[entry-vector-rig] 휜 조각 관절', error); }
+          carry = null; carrySig = false; carryWarp = null;
+        }
       }
       return add.call(this, item, ...rest);
     };
     layer.rasterize = function (...args) {
-      const held = !ownRasterizing && this.children.find(item => isRasterLayer(item) && item.data?.[BONES]);
-      if (held) {
-        carry = { [BONES]: held.data[BONES] };
-        if (held.data[BITMAP_REST]) carry[BITMAP_REST] = held.data[BITMAP_REST];
-        queueMicrotask(() => { carry = null; });
+      if (!ownRasterizing) {
+        const first = this.children.find(isRasterLayer), held = this.children.find(item => isRasterLayer(item) && item.data?.[BONES]);
+        const cutBase = selectionCut?.base?.parent === this ? selectionCut.base : null;
+        const moved = cutBase && selectionMove(this, cutBase);
+        if (held || moved || first?.data?.[SERVER_SHIFT]) {
+          carry = {};
+          if (held) carry[BONES] = held.data[BONES];
+          if (held?.data[BITMAP_REST]) carry[BITMAP_REST] = held.data[BITMAP_REST];
+          const picture = context()?.picture, raw = first?.data?.[SERVER_SHIFT], total = raw ? serverShift(first, picture) : { x: 0, y: 0 };
+          if (!total) carry[SERVER_SHIFT] = raw; // 서버 그림과의 관계를 모르는 채로 이어 간다
+          else if (moved?.unknown && cutBase === first) carry[SERVER_SHIFT] = 'unknown';
+          else {
+            if (moved && cutBase === first) { total.x += moved.x; total.y += moved.y; }
+            if (picture && (Math.abs(total.x) > .01 || Math.abs(total.y) > .01)) carry[SERVER_SHIFT] = `${clean(total.x)},${clean(total.y)}|${pictureFile(picture) || ''}`;
+          }
+          if (moved && !moved.unknown && held === cutBase) {
+            carry[BONES] = shiftedBones(carry[BONES], moved, false) || carry[BONES]; // 그림은 제자리, 안의 내용만 옮겨짐
+            carrySig = moved.whole && !!carry[BITMAP_REST];
+          }
+          if (moved?.warp && held === cutBase) carryWarp = moved.warp;
+          queueMicrotask(() => { carry = null; carrySig = false; carryWarp = null; });
+        }
       }
       return original.apply(this, args);
     };
@@ -7122,10 +7346,14 @@
       const dx = Math.round((anchor.x - .5) * (w - now.w)), dy = Math.round((anchor.y - .5) * (h - now.h));
       // 고른 값을 먼저 기억한다(되돌리기 기록의 SNAPSHOT_SAVED에서 작업 영역을 다시 정할 때 이 값을 쓰게).
       areaChoices.set(painter.file?.id ?? null, { w, h, wrap: wrapSelect.value });
+      // 관절이 모양 정보·레이어 파일에만 있으면 먼저 그림 data로(그림 전체 이동과 같은 단계) — 그래야 같이 옮겨진다. 작업 영역을 바꾸기 전에
+      // 한다(바꾼 뒤 하면 그림을 새 영역에 맞춰 채우며 관절 자리가 어긋났음).
+      if (dx || dy) try { bonesToPicture(c); } catch (error) { console.warn('[entry-vector-rig] 캔버스 기준점: 관절 기록 옮겨 두기', error); }
       setArea(ep, w, h, wrapSelect.value);
       if (dx || dy) {
         const items = c.layer.children.filter(item => item.data?.entryVectorCanvasBox !== '1');
         items.forEach(item => item.translate(dx, dy));
+        try { contentMoved(c, items, { x: dx, y: dy }); } catch (error) { console.warn('[entry-vector-rig] 캔버스 기준점 관절', error); }
         if (items.length) saveEntryHistory(ep);
       }
       close();
@@ -7237,7 +7465,7 @@
   // 넣는다. 획 모양·같은 색 붓 획 합치기·지우개로 빼기·되돌리기 기록은 모두 엔트리 코드 그대로다.
   // 예전엔 엔트리 획 만들기를 버리고 perfect-freehand 바깥선 → union → 곡선 맞춤으로 모양을 새로 만들었는데, 굵기가 변하는 선용
   // 라이브러리를 굵기가 일정한 붓에 써서 단계마다 따로 망가졌다(곧은 획 방추꼴, 점 하나면 굵기 3배 덩어리, 곡선 맞춤 오차 단위로
-  // 확대 시 깎임 — 2026-10-14 사용자 영상·실측). 그래서 모양은 엔트리에 맡긴다.
+  // 확대 시 깎임 — 사용자 영상·실측). 그래서 모양은 엔트리에 맡긴다.
   // 설정은 붓·지우개가 같이 쓰고 이 탭에서만 기억한다(새로 고치면 처음 값).
   const smoothBrush = { on: true, level: 1 };
   // 손떨림 보정 단계(0=끔)별 1€ 최소 차단 주파수(Hz, 낮을수록 많이 거름)와 빠르게 그릴 때 지연을 줄이는 beta(화면 px 기준).
@@ -7398,7 +7626,7 @@
   // 화면에서 듬성해져(1400%에서 비트맵 4화소 = 화면 56px) 보정을 켜도 꺾은선이었다.
   // 엔트리 drawRaster는 부를 때마다 두 점 사이 선을 72dpi로 구워 알파 경계로 끊은 그림 조각을 하나 만들고(한 번 약 2ms, 선분 길이와 거의
   // 무관 — 실측) 놓을 때까지 쌓는다. 예전엔 거른 점(간격 하한 = 지름 10%, 굵기 10이면 1px)과 합쳐 온 표본마다 불러, 같은 거리에 엔트리
-  // 붓(도구 minDistance 4마다)보다 몇 배 많이 굽고 조각이 쌓여 획이 끊기고 길수록 느려졌다(사용자 제보 "랙·뚝뚝" — 몰아 보낸 입력 시험에서
+  // 붓(도구 minDistance 4마다)보다 몇 배 많이 굽고 조각이 쌓여 획이 끊기고 길수록 느려졌다(몰아 보낸 입력 시험에서
   // 이벤트 47개에 56번). 이제 거른 점을 모았다가 화면 한 프레임에 한 번, 앞 점에서 엔트리 도구 자신의 간격(minDistance) 이상 떨어진
   // 점까지만 잇는다(엔트리 붓과 같은 촘촘함, 점은 거른 것이라 매끄러움). 모자란 끝 점은 다음 프레임이나 손을 뗄 때 잇는다.
   // 한 프레임에 잇는 수는 실제로 걸린 시간으로 정한다(프레임당 약 4ms 안): 빠르게 그으면 한 프레임에 간격 4짜리 점이 십여 개 생겨
@@ -7515,7 +7743,7 @@
   }
   // 엔트리 벡터 지우개(erasePath, entry-paint 260921)는 닫힌 도형에서 지우개 모양을 뺀 묶음 경로를 만든 뒤 조각을 하나씩 꺼내 위에
   // 얹고, 비운 묶음 경로는 그대로 남긴다(보이지 않는 빈 항목 — 다음 지우기에선 빈 경로가 됨). 열린 선은 자른 조각이 따로 선이 된다.
-  // 확장은 그림 층 맨 위 항목 하나를 레이어 하나로 세므로 지울 때마다 레이어가 불어났다(사용자 제보 "지 맘대로 늘어남", 확장 없는
+  // 확장은 그림 층 맨 위 항목 하나를 레이어 하나로 세므로 지울 때마다 레이어가 불어났다(확장 없는
   // 엔트리에서 사각형 하나를 두 번 지우면 7개). 지운 직후(엔트리 되돌리기 기록 전) 조각을 원래 항목 하나로 되돌리고 빈 항목을 지운다:
   // 닫힌 도형은 비운 묶음 경로에 조각을 다시 넣고(모양·구멍 그대로), 열린 선은 엔트리 묶기(Wn)처럼 묶음 하나로 모은다.
   function wrapVectorErase(ep, tool) {
@@ -7640,7 +7868,7 @@
   // 붓·지우개 옵션 줄(엔트리 아래쪽 "펜 | 윤곽선 굵기 | 채우기 색상" 등) 끝에 부드럽게·보정을 붙인다(벡터·비트맵 같은 설정).
   // 엔트리 옵션 줄은 넘치면 옆으로 넘기는(화살표) 한 줄이고 끝 표식(#rightObserver)으로 끝을 안다 — 확장 옵션 상자는 그 앞에 둔다.
   // 확장 상자끼리는 차례를 다투지 않는다: 예전엔 비트맵 붓에서 붓 옵션과 사각 펜 옵션이 서로 끝 표식 바로 앞이어야 한다며 0.5초마다
-  // 자리를 바꿔(요소를 옮기면 끌던 밀대가 놓이고 초점이 빠짐) 보정 밀대를 끄는 중에 끊겼다(검토로 찾음 2026-10-16).
+  // 자리를 바꿔(요소를 옮기면 끌던 밀대가 놓이고 초점이 빠짐) 보정 밀대를 끄는 중에 끊겼다(검토로 찾음).
   function placeOptionBox(bar, box) {
     const end = bar.querySelector(':scope > #rightObserver');
     if (box.parentElement === bar) {
@@ -7716,7 +7944,7 @@
   // 엔트리 붓 색·굵기는 그림판 상태 저장소(redux, 모듈 안)에 있어 그림판 화면 요소의 React fiber로 읽는다. 쓰는 곳은 벡터 레이어 창의
   // 고르기(SELECT_ITEMS·CHANGE_TOOL_MODE, 엔트리가 쓰는 것과 같은 동작)와 모드 바꾸기 감지(hookModeSwitch — dispatch를 감싸 보기만 함)뿐.
   // alphaLock: 지금 쓰는 값(레이어가 있으면 지금 레이어 값), tabLock: 레이어 없는 모양에서 고른 이 탭 동안의 값. 예전엔 하나뿐이라 레이어 모양에서
-  // 켠 잠금이 레이어 없는 다음 모양에 그대로 남아 붓이 칠해진 곳에만 그려졌다(검토로 찾음 2026-10-16).
+  // 켠 잠금이 레이어 없는 다음 모양에 그대로 남아 붓이 칠해진 곳에만 그려졌다(검토로 찾음).
   const pixelPen = { square: false, alphaLock: false, tabLock: false };
   const PEN_TOOLS = { BRUSH: '비트맵 붓', ERASER: '비트맵 지우개', LINE: '비트맵 선' };
   let paintStoreCache = null;
@@ -7883,7 +8111,7 @@
   const layerUid = prefix => `${prefix}${Date.now().toString(36)}${(layerSeq++).toString(36)}`;
   // signature: 지금 화면 표시의 요약('' = 레이어 목록 없음), null = 다시 맞추기. 예전엔 다시 맞추기도 ''라 레이어 모양에서 레이어 없는
   // 모양으로 바꾸면(또는 레이어 추가를 되돌리면) 둘이 같다고 보고 표시를 안 지워, 앞 모양의 다른 레이어·클리핑 합성이 다음 모양에
-  // 남았다(사용자 제보 2026-10-16 "클리핑이 모양마다 따로 안 됨" — 재현: 앞 모양 바탕 원이 다음 모양 뒤에 남음).
+  // 남았다(재현: 앞 모양 바탕 원이 다음 모양 뒤에 남음).
   const layerUi = { ep: null, signature: null, displays: [], under: null, panel: null, open: false, importing: null,
     convert: null, vectorPick: null, vectorEpoch: 0, thumbs: new WeakMap(), panelRows: null };
   // 그림 층 data의 목록(모드는 보지 않음 — 모드를 바꾸는 순간에는 엔트리 상태가 이미 새 모드다)
@@ -7950,7 +8178,11 @@
   function storeActive(ep, meta) {
     const shot = paintSnapshot(ep), layer = activeLayer(meta);
     // 뼈대는 그림 data에 있고 레이어를 바꾸면 그림을 새로 만들므로(putActive) 레이어 쪽으로 옮겨 둔다 — 레이어마다 뼈대
-    const raster = paintLayer(ep)?.layer.children.find(isRasterLayer), bones = raster?.data?.[BONES] || null;
+    const raster = paintLayer(ep)?.layer.children.find(isRasterLayer), held = raster?.data?.[BONES] || null;
+    // 엔트리 선택 조각이 떠 있으면 레이어 그림은 옮긴 조각까지 찍힌다 — 관절도 그 이동을 넣는다
+    const pending = held && selectionMove(paintLayer(ep).layer, raster, true);
+    const bones = !held || !pending ? held : pending.warp ? JSON.stringify({ ...JSON.parse(held), joints: pending.warp })
+      : !pending.unknown ? shiftedBones(held, pending, false) || held : held;
     // 그림에 뼈대가 없다고 지우지 않는다 — 필터처럼 그림을 새로 바꾸는 기능도 data를 비운다. 뼈를 모두 지울 때만 deleteJoint가 지운다.
     if (bones) {
       const ref = layerUid('b');
@@ -7979,6 +8211,9 @@
     if (kept?.bones && kept.rest) raster.data[BITMAP_REST] = kept.rest;
     parts.layer.removeChildren();
     parts.layer.addChild(raster);
+    // 엔트리 선택이 방금 뺀 조각을 가리키면 비운다(그대로면 선택 상자가 남고 [삭제]가 아무것도 안 지웠다). 그림 층에서 뺀 뒤라 엔트리가 굽지 않는다.
+    const store = paintStore();
+    if (store?.getState?.()?.paint?.selectedItems?.some(item => !item?.isInserted?.())) store.dispatch({ type: 'SELECT_ITEMS', payload: [] });
   }
   function clipGroups(layers) {
     const groups = [];
@@ -8048,7 +8283,7 @@
     const contentOf = layer => layerContent(ep, meta, layer);
     // 지금 묶음보다 아래 묶음들: 잘라 보이는 층 밖(아래)에 무대 틀로 잘라 둔다(지금 묶음의 클리핑이 이것까지 쓰지 않게).
     // 아래·위 묶음은 각각 미리 한 장으로 겹쳐 둔다 — 묶음마다 한 장씩 두면 화면을 다시 그릴 때마다 레이어 수만큼 그려 레이어가 많으면
-    // 붓질이 끊겼다(사용자 요청 10-18 "랙 안 걸릴 방법", 실측 1000장: 붓질 중 233ms 프레임). 포토샵·크리타처럼 지금 레이어 아래·위 투영을
+    // 붓질이 끊겼다(실측 1000장: 붓질 중 233ms 프레임). 포토샵·크리타처럼 지금 레이어 아래·위 투영을
     // 한 장씩 두는 방식.
     const below = flattenParts(groups.slice(0, gi).map(group => groupComposite(group, contentOf)).filter(Boolean));
     if (below) {
@@ -8122,7 +8357,7 @@
     };
     layer.importJSON = function (...args) {
       // paper importJSON은 기록에 있는 칸만 덮는다. 레이어를 처음 만들기 전 기록에는 레이어 목록 칸이 없어(빈 data는 기록에서 빠짐)
-      // 첫 레이어 조작을 되돌려도 목록이 남았다(재현 2026-10-16: 추가 → 되돌리기 뒤에도 2장). 기록에 없으면 목록도 지운다.
+      // 첫 레이어 조작을 되돌려도 목록이 남았다(재현: 추가 → 되돌리기 뒤에도 2장). 기록에 없으면 목록도 지운다.
       const json = args[0];
       const carried = typeof json === 'string' ? json.includes(`"${LAYERS}"`) : json?.[1]?.data?.[LAYERS] !== undefined;
       const result = importJSON.apply(this, args);
@@ -8159,7 +8394,9 @@
     hookModeSwitch();
     if (!own(ep, '__evrLayerEpoch')) {
       Object.defineProperty(ep, '__evrLayerEpoch', { value: true });
-      ep.on?.('SNAPSHOT_SAVED', () => { layerUi.vectorEpoch++; });
+      ep.on?.('SNAPSHOT_SAVED', () => {
+        layerUi.vectorEpoch++;
+      });
     }
     // 열기가 끝났는데 엔트리가 첫 그림을 넣는 순간을 못 잡았으면(그림 층을 새로 만든 경우 등) 지금 넣고 기록을 하나 남긴다
     const painter = window.Entry?.playground?.painter, pending = layerUi.importing;
@@ -8477,6 +8714,20 @@
       } catch (error) { console.warn('[entry-vector-rig] 레이어 창 고른 줄', error); }
     });
   }
+  // 투명도 상자는 0.5초 점검이 치우므로, [붓] 등으로 바꾸자마자 상자 자리를 누르면 상자가 누르기를 받아 첫 획이 안 그려졌다.
+  // 엔트리 도구가 선택 도구에서 바뀌는 즉시 치운다.
+  const opacityWatched = new WeakSet();
+  function watchOpacityBox() {
+    const store = paintStore();
+    if (!store || opacityWatched.has(store) || typeof store.subscribe !== 'function') return;
+    opacityWatched.add(store);
+    store.subscribe(() => {
+      try { // 구독 함수 예외가 엔트리 dispatch 쪽으로 번지지 않게
+        if (store.getState().tool?.toolMode === 'SELECT') return;
+        document.querySelector('#entryPainter .evr-opacity-opts')?.remove();
+      } catch (error) { console.warn('[entry-vector-rig] 투명도 상자', error); }
+    });
+  }
   function vectorPrimary(ep, rows) {
     const on = vectorPicked(ep, rows);
     return on.find(row => row.item === layerUi.vectorPick) || on[on.length - 1] || null;
@@ -8639,8 +8890,8 @@
     const disarm = () => setTimeout(() => { if (layerUi.convert?.layer === layer) layerUi.convert = null; }, 0);
     if (from === 'VECTOR' && to === 'BITMAP') {
       const rows = vectorRows(layer);
-      // 벡터 레이어(맨 위 항목) 하나 = 비트맵 레이어 하나. 합치지 않는다(사용자 요청 10-18 "백터에서 비트맵으로 변환할 때 레이어 하나로
-      // 합치지 마" — 1.3.0 전에는 레이어 창에서 손대지 않은 줄이 이어지면 한 장으로 합쳤음). 엔트리봇(맨 위 묶음 16개)이면 비트맵 레이어
+      // 벡터 레이어(맨 위 항목) 하나 = 비트맵 레이어 하나. 합치지 않는다(사용자 요청 — 1.3.0 전에는 레이어 창에서 손대지 않은 줄이
+      // 이어지면 한 장으로 합쳤음). 엔트리봇(맨 위 묶음 16개)이면 비트맵 레이어
       // 16개가 된다. 줄이 하나뿐이고 손대지 않았으면 엔트리 변환 그대로(결과도 한 장).
       const touched = row => row.item !== row.unit || row.clip || !!row.item.data?.evrName || !!row.item.data?.evrAlphaLock ||
         !row.item.visible || row.item.opacity !== 1;
@@ -8790,7 +9041,7 @@
     // 404: 서버에 레이어 원본이 없다(1.2.0 공통 크기 맞추기가 합친 PNG만 올려 표시만 남은 모양) — 부른 쪽이 보통 그림으로 다룬다(missing)
     if (!response?.ok && !carried) throw Object.assign(Error(`레이어 원본을 받을 수 없습니다 (${response?.status ?? '파일 없음'})`),
       { missing: !response || response.status === 404 });
-    const text = response?.ok ? await response.text() : entLayerSvgText(carried);
+    const text = response?.ok ? xlinkPrefix(await response.text()) : entLayerSvgText(carried);
     const node = new DOMParser().parseFromString(text, 'image/svg+xml');
     const meta = node.getElementById(LAYER_SVG) || node.querySelector(`metadata#${LAYER_SVG}`);
     const list = meta && JSON.parse(meta.textContent);
@@ -8852,7 +9103,7 @@
   }
   // 레이어 SVG를 읽어 { meta, frame(엔트리에 넘길 지금 레이어 PNG — 가운데가 십자) } — 레이어 그림은 사본으로 남긴다
   function readLayerSvg(text, ep, pictureRig) {
-    const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+    const doc = new DOMParser().parseFromString(xlinkPrefix(text), 'image/svg+xml');
     const node = doc.getElementById(LAYER_SVG) || doc.querySelector(`metadata#${LAYER_SVG}`);
     if (!node) return null;
     const list = JSON.parse(node.textContent);
@@ -8908,7 +9159,7 @@
   // ---- .ent로 내려받기·불러오기 ----
   // 엔트리 .ent는 서버가 브라우저의 작품 JSON(Entry.exportProject — 모양 정보 dimension 통째)과 모양 파일을 묶는다(엔트리 웹사이트:
   // POST /rest/project/download {content, name}). 불러오기는 .ent를 서버에 올려(POST /rest/project/upload) 풀어 준 작품 JSON으로
-  // 다시 연다. 실험(2026-10-14, 로그인 없이 8×8 시험 그림): 모양 정보 키는 그대로 남고, SVG 모양은 SVG도 묶여 벡터 뼈대(SVG 안
+  // 다시 연다. 실험(로그인 없이 8×8 시험 그림): 모양 정보 키는 그대로 남고, SVG 모양은 SVG도 묶여 벡터 뼈대(SVG 안
   // data-paper-data)도 남는다. 하지만 PNG 모양은 PNG만 묶여, 같은 이름의 SVG에 둔 비트맵 레이어 원본이 빠지고 불러오면 파일 이름도
   // 새로 바뀌어 레이어가 사라졌다. fileurl도 /uploads/ 주소는 빠진다 — 픽셀 아트 칸 주소는 restorePixelFileurls가 다시 걸지만, 파일
   // 이름 없는 라이브러리 그림은 그림 단서가 사라져 작품이 안 열렸다(ownPictureFile 설명).
@@ -9020,7 +9271,31 @@
     wrapped.__evrRepair = true;
     E.loadProject = wrapped;
   }
-  // 엔트리 웹사이트는 내려받기를 axios(XMLHttpRequest)로 보낸다. 그 요청만 본문을 바꾸고 나머지는 그대로 보낸다.
+  // 엔트리 모양 [복제하기](clonePicture)는 모델의 마지막 저장본을 복사한다. 그리던 모양(저장 안 함)을 복제하면 복제본은 그리기 전 그림이 되고,
+  // 목록은 복제본을 고른 채 "저장할까요?"가 떠서 [확인]이면 그린 것이 원래 모양에만 들어갔다(확장 없이도 같음). 그리던 모양 자신을 복제할 때만
+  // 엔트리 [새 모양으로 저장하기]와 같은 길(file.mode = 'new' + fileSave)로 지금 그림을 새 모양으로 만들고 원래 모양은 마지막 저장본 그대로 둔다.
+  const pictureCloneHooked = new WeakSet();
+  function hookPictureClone() {
+    const pg = window.Entry?.playground;
+    if (!pg || typeof pg.clonePicture !== 'function' || pictureCloneHooked.has(pg)) return;
+    pictureCloneHooked.add(pg);
+    const original = pg.clonePicture;
+    pg.clonePicture = function (id, ...rest) {
+      try {
+        const painter = this.painter, file = painter?.file;
+        if (file?.modified && file.id === id && file.objectId === this.object?.id && window.Entry?.stage?.selectedObject &&
+          !painter.__evrLoading && typeof painter.fileSave === 'function') {
+          file.mode = 'new';
+          painter.__evrDuplicating = true;
+          try { painter.fileSave(false); } finally { painter.__evrDuplicating = false; }
+          return undefined;
+        }
+      } catch (error) { console.warn('[entry-vector-rig] 그리던 모양 복제', error); }
+      return original.call(this, id, ...rest);
+    };
+  }
+  // 엔트리 웹사이트는 내려받기를 axios(XMLHttpRequest)로 보낸다. 그 요청만 본문을 바꾸고 나머지는 그대로 보낸다. 모양 저장 올리기는 결과만 본다
+  // (siteSaveFailed).
   function hookEntDownload() {
     const proto = window.XMLHttpRequest?.prototype;
     if (proto && !own(proto, '__evrEntHook')) {
@@ -9028,9 +9303,11 @@
       const open = proto.open, send = proto.send;
       proto.open = function (method, url, ...rest) {
         this.__evrEnt = isEntDownload(method, url) ? String(url) : null;
+        this.__evrPictureSave = isPictureSave(url);
         return open.call(this, method, url, ...rest);
       };
       proto.send = function (body) {
+        if (this.__evrPictureSave) this.addEventListener('loadend', () => { if (this.status >= 200 && this.status < 300) lastSiteSave = null; else siteSaveFailed(); });
         if (!this.__evrEnt || typeof body !== 'string') return send.call(this, body);
         withEntLayers(body, this.__evrEnt).then(next => send.call(this, next), () => send.call(this, body));
         return undefined;
@@ -9043,6 +9320,10 @@
         const url = typeof input === 'string' ? input : input?.url;
         if (init && typeof init.body === 'string' && isEntDownload(init.method || 'GET', url))
           return withEntLayers(init.body, url).catch(() => init.body).then(body => fetch0.call(this, input, { ...init, body }, ...rest));
+        if (isPictureSave(url) && !init?.__evrOwn) return fetch0.call(this, input, init, ...rest).then(response => {
+          if (response.ok) lastSiteSave = null; else siteSaveFailed();
+          return response;
+        }, error => { siteSaveFailed(); throw error; });
         return fetch0.call(this, input, init, ...rest);
       };
       wrapped.__evrEntHook = true;
@@ -9050,14 +9331,14 @@
     }
   }
   // ---- 그림 임시저장(1.3, 사용자 요청 2명 + 사용자 결정) ----
-  // 그림판에서 그리던 그림(지금 모양)을 서버에도 작품에도 넣지 않고 이 브라우저 안(IndexedDB)에 잠깐 저장했다가 다시 연다(사용자 "임시 저장은
-  // 그림 임시저장", "말 그대로 임시" — 댓글 요청 "작품에는 바로 적용되지 않지만 오브젝트 창에서는 편집하고 저장"). 엔트리 그림판 [저장하기]
+  // 그림판에서 그리던 그림(지금 모양)을 서버에도 작품에도 넣지 않고 이 브라우저 안(IndexedDB)에 잠깐 저장했다가 다시 연다.
+  // 엔트리 그림판 [저장하기]
   // 펼침 메뉴(저장하기·새 모양으로 저장하기) 아래에 엔트리 항목과 같은 클래스로 [임시저장]과 이 모양의 임시저장 목록(모양마다 최근 5개)을
   // 붙인다(사용자 결정). 연 그림은 작품에 바로 들어가지 않고 엔트리 [저장하기]를 눌러야 들어간다.
   // 담는 것 = 엔트리 되돌리기 기록과 같은 그림 층 JSON(paper exportJSON — 자리·이름·확장 data 그대로) + 비트맵 레이어 그림(지금 레이어
   // 말고는 확장 메모리 layerCache에만 있어 PNG로 같이 담음). 여는 것 = 엔트리 되돌리기처럼 그림 층 importJSON(확장 레이어 목록도 같이
-  // 돌아옴) 뒤 엔트리 되돌리기 기록 하나 — 되돌리면 연 직전(열 때 목록에 자동 기록을 남기지 않는다 — 사용자 "연 기록은 왜 뜨는 거야
-  // 복잡하게", 5개 한도에서 직접 저장한 것을 밀어냈음). 벡터·비트맵이 다르면 열지 않는다
+  // 돌아옴) 뒤 엔트리 되돌리기 기록 하나 — 되돌리면 연 직전(열 때 목록에 자동 기록을 남기지 않는다 — 5개 한도에서 직접 저장한 것을 밀어냈음).
+  // 벡터·비트맵이 다르면 열지 않는다
   // (그림 층 JSON이 모드마다 다름). 브라우저를 닫으면 지운다(/ws 경로 세션 쿠키가 없으면 새 브라우저 세션 → 모두 지움. 여러 탭은 쿠키를
   // 같이 써서 서로 지우지 않음. 크롬 "중단한 위치에서 계속하기"는 세션 쿠키를 되살려 남을 수 있음). 엔트리 자체 임시 보관(localStorageProject)과
   // 다른 칸이다. 목록(TEMP_STORE: id·작품 열쇠·모양 id·이름·모드·시각)과 내용(TEMP_DATA)을 따로 둔다 — 목록을 열 때 큰 그림을 다 읽지 않게.
@@ -9176,7 +9457,8 @@
       const kept = layerBonesOf(layer);
       if (kept) bones[layer.bonesRef] = kept;
     }
-    return { v: 1, mode: ep.mode, json: parts.layer.exportJSON({ asString: true }), refs, bones };
+    const picture = currentPicture(window.Entry?.playground?.painter);
+    return { v: 1, mode: ep.mode, json: parts.layer.exportJSON({ asString: true }), refs, bones, file: picture ? pictureFile(picture) || null : null };
   }
   async function draftSaveNow(painter) {
     await tempSessionCheck();
@@ -9207,23 +9489,82 @@
     if (session) throw Error('뼈대 모드를 끈 뒤 여세요.');
     const payload = JSON.parse(stored.data);
     if (payload.mode !== ep.mode) throw Error(`${payload.mode === 'BITMAP' ? '비트맵' : '벡터'}에서 임시저장한 그림입니다. 그 모드로 바꾼 뒤 여세요.`);
-    // 비트맵 레이어 그림을 먼저 되살린다(그림 층 JSON의 레이어 목록이 이 참조를 씀 — 참조는 한 번 만들면 바뀌지 않음)
+    await putPaintPayload(painter, picture, payload);
+    return item;
+  }
+  // 담은 그림에 엔트리 선택 조각이 따로 들어 있으면(다시 연 그림은 엔트리가 그림을 빈 바탕 위 조각으로 골라 둠) 한 장으로 합친다 — 넣을 때 선택은
+  // 풀린 채라 엔트리가 합치지 않아, 뼈대 모드가 빈 바탕만 보고 "그림이 비어 있습니다"였다(엔트리 되돌리기도 같은 꼴을 남김). 돌리거나 늘린 조각은
+  // 그 행렬대로 그려 굽는다(엔트리가 확정할 때처럼, 픽셀 아트 모양은 가장 가까운 화소로 — 바탕 없이 한 장만 남아도). 섞기·숨김을 바꾼 조각이 있으면 그대로 둔다.
+  // 그림 층의 그림(Raster)이 모두 불러와질 때까지(막 넣은 그림은 잠깐 크기 0). load 처리는 남기지 않는다(setImage가 다시 부름).
+  function rastersLoaded(layer, timeout = 3000) {
+    const waiting = layer.children.filter(item => isRasterLayer(item) && !item.loaded);
+    return Promise.all(waiting.map(raster => new Promise(resolve => {
+      const done = () => { raster.off('load', done); clearTimeout(timer); resolve(); };
+      const timer = setTimeout(done, timeout);
+      raster.on('load', done);
+    })));
+  }
+  // 불투명도는 엔트리가 확정할 때처럼 넣어 굽는다(그대로 두면 조각이 따로 남아 뼈대 모드가 "그림이 비어 있습니다"). 섞기·숨김은 같은 결과로
+  // 굽기 어려워 그대로 둔다.
+  const mergeableRaster = raster => raster.width && raster.height && raster.visible && (!raster.blendMode || raster.blendMode === 'normal');
+  // 그림 층 그림들을 감싸는 사각(정수)과, 그 사각 왼쪽 위 기준으로 그린 캔버스 — 돌리거나 늘린 그림은 그 행렬대로 그린다
+  function drawLayerRasters(rasters) {
+    const left = Math.floor(Math.min(...rasters.map(r => r.bounds.left))), top = Math.floor(Math.min(...rasters.map(r => r.bounds.top)));
+    const right = Math.ceil(Math.max(...rasters.map(r => r.bounds.right))), bottom = Math.ceil(Math.max(...rasters.map(r => r.bounds.bottom)));
+    const canvas = canvasOfSize(Math.max(1, right - left), Math.max(1, bottom - top)), g = canvas.getContext('2d');
+    g.imageSmoothingEnabled = !pixelOf(window.Entry?.playground?.object?.selectedPicture);
+    for (const r of rasters) {
+      const source = r.canvas || r.image;
+      if (!source) continue;
+      g.globalAlpha = Math.max(0, Math.min(1, r.opacity ?? 1));
+      if (plainRaster(r)) g.drawImage(source, Math.round(r.bounds.left - left), Math.round(r.bounds.top - top));
+      else {
+        // paper 그림은 제 가운데를 원점으로 그린 뒤 행렬을 건다
+        const m = r.matrix;
+        g.setTransform(m.a, m.b, m.c, m.d, m.tx - left, m.ty - top);
+        g.drawImage(source, -r.width / 2, -r.height / 2);
+        g.setTransform(1, 0, 0, 1, 0, 0);
+      }
+    }
+    g.globalAlpha = 1;
+    return { canvas, left, top };
+  }
+  function flattenLooseRasters(ep) {
+    const layer = paintLayer(ep)?.layer, rasters = ep.mode === 'BITMAP' && layer ? layer.children.filter(item => isRasterLayer(item) && !isLayerHelper(item)) : [];
+    if (!rasters.length || (rasters.length < 2 && plainRaster(rasters[0])) || !rasters.every(mergeableRaster)) return;
+    const { canvas, left, top } = drawLayerRasters(rasters);
+    const merged = new ep.paper.Raster({ insert: false });
+    merged.setImage(canvas);
+    merged.position = new ep.paper.Point(left + canvas.width / 2, top + canvas.height / 2);
+    Object.assign(merged.data, rasters[0].data);
+    delete merged.data.selected; delete merged.data.guideItem;
+    if (rasters.some(r => !plainRaster(r))) merged.data[SERVER_SHIFT] = 'unknown'; // 돌리거나 늘린 것을 구움 — 서버 그림과 평행 이동이 아님
+    rasters[0].replaceWith(merged);
+    rasters.slice(1).forEach(r => r.remove());
+  }
+  // 담아 둔 그림(draftPayload)을 지금 모양 그림판에 넣는다. 비트맵 레이어 그림을 먼저 되살린다(그림 층 JSON의 레이어 목록이 이 참조를 씀 — 참조는
+  // 한 번 만들면 바뀌지 않음). 연 직전 상태를 되돌리기 기록에 남긴다 — 그림 전체 이동처럼 기록을 남기지 않는 변경도 되돌리기 한 번에 돌아오게.
+  async function putPaintPayload(painter, picture, payload) {
+    const ep = painter.entryPaint;
     for (const [ref, content] of Object.entries(payload.refs || {})) {
       if (!layerCache.has(ref)) layerCache.set(ref, { canvas: canvasOfImage(await loadImage(content.png)), x: content.x, y: content.y });
     }
     for (const [ref, kept] of Object.entries(payload.bones || {})) if (!layerBones.has(ref)) layerBones.set(ref, kept);
     if (painter.file?.id !== picture.id || ep.mode !== payload.mode) throw Error('그 사이 모양이나 모드가 바뀌어 열지 않았습니다.');
     paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: [] });
-    // 연 직전 상태를 되돌리기 기록에 남긴다 — 그림 전체 이동처럼 기록을 남기지 않는 변경도 되돌리기 한 번에 돌아오게(검토 지적)
     saveEntryHistory(ep);
     paintLayer(ep).layer.importJSON(payload.json);
+    await rastersLoaded(paintLayer(ep).layer);
+    flattenLooseRasters(ep);
+    // 담을 때와 서버 그림이 다르면(그 뒤 저장함, 다른 모양에 넣음 등) 넣은 그림과 서버 그림 사이 옮긴 양을 모른다
+    const first = paintLayer(ep).layer.children.find(isRasterLayer);
+    if (first && payload.file !== (pictureFile(picture) || null)) first.data[SERVER_SHIFT] = 'unknown';
     ep.project.view.update();
     saveEntryHistory(ep);
     painter.file.modified = true;
-    return item;
   }
   // 엔트리 그림판 [저장하기]를 누르면 엔트리가 펼침 메뉴를 새로 그린다 — 몇 프레임 동안 찾아 확장 항목을 붙인다. 확장 항목은 누르기를
-  // 엔트리로 보내지 않아(엔트리 항목으로 읽히지 않게) 메뉴가 열린 채라, 일을 마치면 [저장하기]를 한 번 더 눌러 닫는다(10-18 실험: 닫힘).
+  // 엔트리로 보내지 않아(엔트리 항목으로 읽히지 않게) 메뉴가 열린 채라, 일을 마치면 [저장하기]를 한 번 더 눌러 닫는다(실험: 닫힘).
   function hookDraftMenu() {
     if (draftMenuHooked) return;
     draftMenuHooked = true;
@@ -9627,7 +9968,7 @@
     lock.title = view.canLock ? '이 레이어의 칠해진 곳에만 그림(붓·선·영역 채우기)' : '투명 잠금은 비트맵 레이어에서만(포토샵도 벡터 모양 레이어에는 없음)';
     const filterButton = panel.querySelector('.evr-layers-filter');
     // 포토샵처럼 숨긴 레이어·여러 레이어에는 걸지 않는다(숨긴 레이어는 결과가 안 보이고, 여러 줄이면 어디에 걸지 모름 — 예전엔 숨긴 채 걸리거나
-    // 여러 줄 중 하나에만 말없이 걸렸음, 10-19)
+    // 여러 줄 중 하나에만 말없이 걸렸음)
     // 벡터는 숨긴 도형을 엔트리 선택에서 곧 빼므로(선택 윤곽선 다시 맞추기) 레이어 창에서 숨긴 줄을 누르면 고른 레이어가 없어진다 — 그때도 숨김이 이유.
     // 창에서 누른 줄 기록이 낡으면 watchVectorPick이 지운다.
     const pickedHidden = mode === 'VECTOR' && !active && layerUi.vectorPick?.visible === false && view.rows?.some?.(row => row.item === layerUi.vectorPick);
@@ -9648,7 +9989,7 @@
     panel.querySelector('.evr-layers-del').disabled = !active || !many;
     clip.disabled = !active || at === 0;
   }
-  // ---- 필터(1.3, 사용자 요청 "각종 필터") ----
+  // ---- 필터(1.3, 사용자 요청) ----
   // 비트맵 지금 레이어(그림 층 내용)에 건다. 벡터 도형은 흐림 같은 필터가 저장 SVG에 남지 않아 비트맵만. 계산은 표준 그대로: 색·흐림·그림자 =
   // 캔버스 filter(CSS 필터 함수), 모자이크 = 줄였다 보간 없이 키우기, 외곽선 = 실루엣을 반지름 안 정수 칸마다 찍기(도장 외곽선).
   // 미리보기는 그림 층에 결과 한 장을 넣어 보이고, [취소]는 떼어 둔 원래 항목을 그대로 되돌리고, [적용]은 되돌리기 기록을 한 번 남긴다.
@@ -9794,7 +10135,7 @@
     showFilterResult(first);
     selectFilter(FILTERS[0]);
   }
-  // ---- 벡터 필터(1.3, 사용자 요청 10-18 "백터에서도 필터 돼게", 사용자 결정: 색 필터는 벡터 그대로) ----
+  // ---- 벡터 필터(1.3, 사용자 요청, 사용자 결정: 색 필터는 벡터 그대로) ----
   // 대상 = 레이어 창의 지금 벡터 레이어(맨 위 항목). 색 필터(밝기·대비·채도·색조·흑백·세피아·색 반전)는 칠·선 색(그라데이션 정지점 포함)과
   // 안에 든 그림 화소만 바꿔 벡터로 남긴다 — 색 계산은 비트맵과 같은 브라우저 표준 CSS 필터(1×1 칸에 그려 읽음). 흐림·모자이크·외곽선·
   // 그림자는 저장 SVG에 남길 수 없어 그 레이어를 그림(Raster, 그림 좌표 1:1)으로 구운 뒤 비트맵과 같은 계산으로 건다(이름·불투명도·
@@ -9985,7 +10326,14 @@
     const kept = trimFilterContent(ui.result, ui.grid), stage = paintLayer(ui.ep)?.stage;
     ui.layer.removeChildren();
     // 다 투명해졌으면 작업 영역만 한 빈 그림(엔트리 비트맵 그림 층은 그림 한 장을 기대함)
-    if (kept) ui.layer.addChild(contentRaster(ui.ep, kept));
+    const bones = ui.original.find(item => isRasterLayer(item) && item.data?.[BONES])?.data[BONES];
+    const shifted = ui.original.find(isRasterLayer)?.data?.[SERVER_SHIFT];
+    if (kept) {
+      const raster = contentRaster(ui.ep, kept);
+      if (bones) raster.data[BONES] = bones;
+      if (shifted) raster.data[SERVER_SHIFT] = shifted;
+      ui.layer.addChild(raster);
+    }
     else if (stage) ui.layer.addChild(contentRaster(ui.ep, { canvas: canvasOfSize(Math.max(1, Math.round(stage.width)), Math.max(1, Math.round(stage.height))), x: Math.round(stage.x), y: Math.round(stage.y) }));
     for (const item of ui.original) if (item.data?.entryVectorCanvasBox === '1') ui.layer.addChild(item);
     ui.ep.project.view.update();
@@ -10059,12 +10407,904 @@
       closeFilterPanel(false);
     }
   }
+  // ---- 원근 변형(1.3.2, 사용자 요청·결정) — 엔트리 선택 도구 모서리 ----
+  // 엔트리 선택 도구로 고른 것(비트맵 떠 있는 조각, 벡터 고른 항목)의 둘레 사각 모서리 손잡이를 Ctrl(맥 Cmd)을 누른 채 끌면 — [원근] 단추를 켜 두면 그냥
+  // 끌어도 — 크기 바꾸기 대신 그 모서리만 옮겨 원근(네 점 사각)으로 휜다(포토샵 자유 변형의 Ctrl+모서리). Shift를 같이 누르면 같은 가로 변·세로 변의 맞은편
+  // 모서리가 반대로 따라가 대칭 사다리꼴. 놓을 때마다 엔트리 되돌리기 한 칸(엔트리 크기·회전처럼)이고, 확정은 엔트리 선택이 끝날 때 그대로다.
+  // 엔트리 둘레 사각(boundsPath, 8마디 [왼아래, 왼가운데, 왼위, 위가운데, 오른위, 오른가운데, 오른아래, 아래가운데] — entry-paint 261024)을 휜 네 점으로
+  // 바꿔 두면 엔트리 옮기기·크기·회전이 그림과 사각을 같은 아핀으로 바꿔 둘이 계속 맞는다. 엔트리는 손잡이만 사각의 바깥 상자에 다시 놓으므로 손잡이
+  // 자리는 확장이 맞춘다. 사상은 단위 사각형 → 네 점 사영 변환(Heckbert 1989, "Fundamentals of Texture Mapping and Image Warping"의 닫힌 식). 비트맵은
+  // 결과 화소마다 역사상으로 원본을 읽고(미리 곱한 쌍선형, 픽셀 아트 오브젝트는 가장 가까운 화소), 벡터는 Warp.js로 곡선을 잘게 나눠 점을 옮긴다.
+  // 관절도 같은 사상으로 옮겨(지금 자세 자리) 그 모양을 새 기준으로 삼는다.
+  let perspectiveOn = false, perspectiveDrag = null, quadGuide = null, quadLayers = [];
+  const QUAD_MARK = 'evrQuad';
+  const GUIDE_POINTS = ['bottomLeft', 'leftCenter', 'topLeft', 'topCenter', 'topRight', 'rightCenter', 'bottomRight', 'bottomCenter'];
+  // 둘레 사각 → 그 선택에서 처음 끌 때의 원본. 그 뒤 끌기는 늘 원본에서 다시 그린다(비트맵 화질이 쌓여 나빠지지 않게) — 사이에 엔트리가 한 아핀 변환은
+  // 둘레 사각에도 같이 걸려 원본 사각 → 지금 사각의 사영 사상에 그대로 담긴다
+  const perspectiveSources = new WeakMap();
+  function squareToQuad(q) {
+    const [p0, p1, p2, p3] = q, dx3 = p0.x - p1.x + p2.x - p3.x, dy3 = p0.y - p1.y + p2.y - p3.y;
+    if (Math.abs(dx3) < 1e-9 && Math.abs(dy3) < 1e-9)
+      return [p1.x - p0.x, p3.x - p0.x, p0.x, p1.y - p0.y, p3.y - p0.y, p0.y, 0, 0, 1];
+    const dx1 = p1.x - p2.x, dx2 = p3.x - p2.x, dy1 = p1.y - p2.y, dy2 = p3.y - p2.y, den = dx1 * dy2 - dx2 * dy1;
+    const g = (dx3 * dy2 - dx2 * dy3) / den, h = (dx1 * dy3 - dx3 * dy1) / den;
+    return [p1.x - p0.x + g * p1.x, p3.x - p0.x + h * p3.x, p0.x, p1.y - p0.y + g * p1.y, p3.y - p0.y + h * p3.y, p0.y, g, h, 1];
+  }
+  const applyHomography = (m, x, y) => { const w = m[6] * x + m[7] * y + m[8]; return { x: (m[0] * x + m[1] * y + m[2]) / w, y: (m[3] * x + m[4] * y + m[5]) / w }; };
+  function invert3(m) {
+    const [a, b, c, d, e, f, g, h, i] = m, A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g, det = a * A + b * B + c * C;
+    return [A / det, -(b * i - c * h) / det, (b * f - c * e) / det, B / det, (a * i - c * g) / det, -(a * f - c * d) / det, C / det, -(a * h - b * g) / det, (a * e - b * d) / det];
+  }
+  // 원래 사각(src) 안의 점 → 끈 네 점 사각형 안의 점
+  function perspectiveMap(src, quad) {
+    const m = squareToQuad(quad), inv = invert3(m);
+    return {
+      forward: p => applyHomography(m, (p.x - src.x) / src.width, (p.y - src.y) / src.height),
+      inverse: p => { const u = applyHomography(inv, p.x, p.y); return { u: u.x, v: u.y }; },
+    };
+  }
+  function convexQuad(q) {
+    let sign = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4], cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+      if (Math.abs(cross) < 1e-6 || (sign && Math.sign(cross) !== sign)) return false;
+      sign = Math.sign(cross);
+    }
+    return true;
+  }
+  // 원본 캔버스를 사상해 그린 캔버스와 그 자리. map.inverse(그림 좌표) = 원본 안 비율 {u, v}, quad = 원본 네 모서리가 간 자리. nearest면 가장 가까운 화소.
+  function warpCanvas(source, map, quad, nearest) {
+    const left = Math.floor(Math.min(...quad.map(p => p.x))), top = Math.floor(Math.min(...quad.map(p => p.y)));
+    const width = Math.max(1, Math.ceil(Math.max(...quad.map(p => p.x))) - left), height = Math.max(1, Math.ceil(Math.max(...quad.map(p => p.y))) - top);
+    const out = canvasOfSize(width, height), sw = source.width, sh = source.height;
+    const from = source.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, sw, sh).data;
+    const image = out.getContext('2d').createImageData(width, height), to = image.data;
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      const { u, v } = map.inverse({ x: left + x + .5, y: top + y + .5 });
+      if (!(u >= 0 && u <= 1 && v >= 0 && v <= 1)) continue;
+      const fx = u * sw - .5, fy = v * sh - .5, k = (y * width + x) * 4;
+      if (nearest) {
+        const sx = Math.min(sw - 1, Math.max(0, Math.round(fx))), sy = Math.min(sh - 1, Math.max(0, Math.round(fy))), s = (sy * sw + sx) * 4;
+        to[k] = from[s]; to[k + 1] = from[s + 1]; to[k + 2] = from[s + 2]; to[k + 3] = from[s + 3];
+        continue;
+      }
+      const x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+      let r = 0, g = 0, b = 0, a = 0;
+      for (const [dx, dy, wgt] of [[0, 0, (1 - tx) * (1 - ty)], [1, 0, tx * (1 - ty)], [0, 1, (1 - tx) * ty], [1, 1, tx * ty]]) {
+        const sx = x0 + dx, sy = y0 + dy;
+        if (sx < 0 || sy < 0 || sx >= sw || sy >= sh || !wgt) continue;
+        const s = (sy * sw + sx) * 4, alpha = from[s + 3] * wgt;
+        r += from[s] * alpha; g += from[s + 1] * alpha; b += from[s + 2] * alpha; a += alpha;
+      }
+      if (a > 0) { to[k] = r / a; to[k + 1] = g / a; to[k + 2] = b / a; to[k + 3] = a; }
+    }
+    out.getContext('2d').putImageData(image, 0, 0);
+    return { canvas: out, x: left, y: top };
+  }
+  // 그라데이션 덮개(evrCover)는 이미 바꾼 결과라 다시 바꾸지 않는다
+  const shapesIn = item => (item.className === 'Shape' ? [item] : item.getItems?.({ className: 'Shape' }) || []).filter(shape => !shape.data?.evrCover);
+  // 행렬의 고른 배율(돌림·뒤집기 포함), 가로세로 배율이 다르면(한쪽으로 늘림) NaN
+  function matrixScale(m) {
+    const { a, b, c, d } = m, sx = Math.hypot(a, b), sy = Math.hypot(c, d);
+    if (Math.abs(sx - sy) > 1e-3 * Math.max(sx, sy) || Math.abs(a * c + b * d) > 1e-3 * sx * sy) return NaN;
+    return (sx + sy) / 2;
+  }
+  // 그림 층까지의 묶음 행렬(엔트리 [그룹화] 묶음은 applyMatrix false라 크기 손잡이 변환을 묶음이 지닌다)
+  function ancestorsMatrix(item) {
+    let up = item.matrix.clone().reset();
+    for (let p = item.parent; p && p.className !== 'Layer'; p = p.parent) up = p.matrix.clone().append(up);
+    return up;
+  }
+  // 점선은 그리는 시작점을 따라 놓인다 — Shape가 그리는 시작점(원: 오른쪽 — 크롬 ctx.arc 실측, 사각: 왼쪽 위, 둥근 사각: 왼쪽 변 위 끝 — 번들
+  // Shape#_draw, 방향은 모두 시계)의 경로 점 번호(Path.Circle·Rectangle은 왼쪽·왼쪽 아래에서 시작, 타원은 같음)
+  const shapeStart = shape => shape.type === 'circle' ? (shape.strokeScaling !== false ? 2 : 0)
+    : shape.type === 'rectangle' ? (shape.radius?.width || shape.radius?.height ? 2 : 1) : 0;
+  function startAt(path, start) {
+    if (!start) return path;
+    const segments = path.removeSegments();
+    path.addSegments(segments.slice(start).concat(segments.slice(0, start)));
+    path.closed = true;
+    return path;
+  }
+  // Shape 자기 좌표의 윤곽(toPath와 같은 모양, Shape가 그리는 시작점부터)
+  const localOutline = (P, shape) => startAt(new P.Path[shape.type === 'circle' ? 'Circle' : shape.type === 'ellipse' ? 'Ellipse' : 'Rectangle']({
+    center: [0, 0], size: shape.size, radius: shape.radius, insert: false }), shapeStart(shape));
+  // 캔버스 점선 규칙(홀수 개면 두 번 이음, lineDashOffset만큼 무늬 안에서 시작)으로 켜진 구간들. 닫힌 윤곽은 시작점 앞뒤가 모두 켜져 있으면 한
+  // 점선으로 이어 그린다(크롬 실측)
+  function dashIntervals(length, dash, offset) {
+    const list = dash.length % 2 ? dash.concat(dash) : dash, period = list.reduce((sum, value) => sum + value, 0), out = [];
+    let i = 0, phase = ((offset % period) + period) % period;
+    while (phase > 0 && phase >= list[i]) { phase -= list[i]; i = (i + 1) % list.length; }
+    for (let s = -phase, guard = 0; s < length && guard < 100000; guard++) {
+      const e = s + list[i];
+      if (i % 2 === 0 && e >= 0) out.push([Math.max(s, 0), Math.min(e, length)]);
+      s = e; i = (i + 1) % list.length;
+    }
+    if (out.length > 1 && out[0][0] <= 0 && out[out.length - 1][1] >= length) { const first = out.shift(); out[out.length - 1][1] = length + first[1]; }
+    return out;
+  }
+  // 한쪽으로 늘린 Shape의 테두리는 행렬 아래에서 그려져 방향마다 굵기가 다르다. 경로는 행렬을 지니지 못하므로(엔트리가 다시 열 때 경로·묶음 행렬을
+  // 점에 굽는다 — 실측) 테두리를 같은 자리의 칠한 띠로 옮긴다: 자기 좌표에서 굵기 w의 띠(윤곽에서 w/2 안의 점, 이음·끝 모양·점선은 캔버스 규칙)를
+  // 만들어 Shape 행렬로 옮김. 원·사각·같은 반지름 둥근 사각은 식 그대로, 타원·타원 모서리는 평행 곡선(점 + w/2 × 법선)을 그림 1px 간격으로 재고,
+  // 굵어서 안쪽 평행 곡선이 꼬이는 곳은 실선이면 안쪽을 반평면 교차(Sutherland–Hodgman)로 깎은 영역으로 만든다
+  function strokeBand(P, shape) {
+    const m = shape.matrix, h = shape.strokeWidth / 2, outline = localOutline(P, shape), L = outline.length;
+    const type = shape.type, r = shape.radius, W = shape.size.width, H = shape.size.height;
+    const rx = type === 'circle' ? r : r.width, ry = type === 'circle' ? r : r.height;
+    // 사각의 모서리 반지름 한쪽이 0이면(SVG rx만 적으면 paper가 ry를 0으로 읽음) Shape는 모서리를 각지게 그리고 이음 모양이 걸린다
+    const sharp = type === 'rectangle' && (!rx || !ry), round = sharp || Math.abs(rx - ry) <= 1e-9 * Math.max(rx, ry, 1);
+    const minR = sharp ? Infinity : Math.min(rx, ry) ** 2 / Math.max(rx, ry);
+    // 자기 좌표에서 그림 1px(묶음 행렬까지 합친 배율)
+    const g = ancestorsMatrix(shape).append(m), px = 1 / (Math.max(Math.hypot(g.a, g.b), Math.hypot(g.c, g.d)) || 1);
+    const probe = outline.getPointAt(L / 8), sign = outline.contains(probe.add(outline.getNormalAt(L / 8).multiply(Math.min(W, H) * 0.01 || 0.01))) ? -1 : 1;
+    const wrap = v => Math.min(((v % L) + L) % L, L - 1e-9);
+    // 점은 s에서, 방향(법선·접선)은 sn에서 — 모서리에 닿는 조각 끝은 그 조각 쪽 변의 방향을 쓴다
+    const at = (s, sn = s) => ({ p: outline.getPointAt(wrap(s)), n: outline.getNormalAt(wrap(sn)).multiply(sign), t: outline.getTangentAt(wrap(sn)) });
+    // u~v 사이 표본 자리: 걸음마다 윤곽 길이 ≤ spacing, 두 끝 법선이 돈 각 × w/2 ≤ spacing(평행 곡선 위 간격). 볼록한 윤곽은 걸음 안에서 돈 양이 두 끝
+    // 법선 각과 같아, 아주 좁은 뾰족한 끝도 건너뛰지 않는다. 곡률 합이 2π라 표본 수는 (길이 + 2π × w/2) / spacing 남짓
+    const normal = s => outline.getNormalAt(wrap(s));
+    const along = (u, v, spacing) => { const out = [u];
+      for (let s = u, n0 = normal(u); s < v;) {
+        let step = Math.min(spacing, v - s), n1 = normal(s + step);
+        while (h * Math.abs(Math.atan2(n0.x * n1.y - n0.y * n1.x, n0.x * n1.x + n0.y * n1.y)) > spacing && step > spacing * 1e-5) { step /= 2; n1 = normal(s + step); }
+        s += step; n0 = n1; out.push(Math.min(s, v));
+      }
+      return out; };
+    const poly = (points, clockwise = true) => { const path = new P.Path({ segments: points, closed: true, insert: false }); path.clockwise = clockwise; return path; };
+    const disk = (center, radius = h) => new P.Path.Circle({ center, radius, insert: false });
+    const dash = shape.dashArray || [], period = dash.every(value => Number.isFinite(value) && value >= 0) ? dash.reduce((sum, value) => sum + value, 0) : 0;
+    const list = period > 0 ? dashIntervals(L, dash, shape.dashOffset || 0) : [];
+    const solid = !(period > 0) || (list.length === 1 && list[0][0] <= 0 && list[0][1] >= L);
+    const parts = [];
+    if (solid) {
+      let outer, inner = null;
+      if (type !== 'rectangle' && round) {
+        outer = disk([0, 0], rx + h);
+        if (rx > h) inner = disk([0, 0], rx - h);
+      } else if (type === 'rectangle' && round) {
+        const rect = (d, radius) => new P.Path.Rectangle({ point: [-W / 2 - d, -H / 2 - d], size: [W + 2 * d, H + 2 * d], radius, insert: false }), rr = sharp ? 0 : rx;
+        if (rr > 0 || shape.strokeJoin === 'round') outer = rect(h, rr > 0 ? rr + h : h);
+        else if (shape.strokeJoin === 'miter' && shape.miterLimit >= Math.SQRT2) outer = rect(h, 0);
+        else outer = poly([[-W / 2, -H / 2 - h], [W / 2, -H / 2 - h], [W / 2 + h, -H / 2], [W / 2 + h, H / 2], [W / 2, H / 2 + h], [-W / 2, H / 2 + h], [-W / 2 - h, H / 2], [-W / 2 - h, -H / 2]]);
+        if (W > 2 * h && H > 2 * h) inner = rect(-h, Math.max(rr - h, 0));
+      } else {
+        const samples = along(0, L, Math.min(3 * px, L / 48)).slice(0, -1).map(s => at(s));
+        outer = poly(samples.map(({ p, n }) => p.add(n.multiply(h))));
+        outer.smooth({ type: 'catmull-rom' });
+        if (h < minR * 0.98) { inner = poly(samples.map(({ p, n }) => p.subtract(n.multiply(h)))); inner.smooth({ type: 'catmull-rom' }); }
+        else {
+          // 볼록한 도형을 굵기만큼 깎은 영역 = 윤곽 점마다 안쪽 반평면(법선 쪽으로 w/2 들어간 선 안)의 교집합
+          let core = [[-W / 2, -H / 2], [W / 2, -H / 2], [W / 2, H / 2], [-W / 2, H / 2]];
+          for (const s of along(0, L, Math.min(px, L / 96))) {
+            if (!core.length) break;
+            const { p, n } = at(s), qx = p.x - h * n.x, qy = p.y - h * n.y, next = [];
+            for (let j = 0; j < core.length; j++) {
+              const A = core[j], B = core[(j + 1) % core.length];
+              const da = (A[0] - qx) * n.x + (A[1] - qy) * n.y, db = (B[0] - qx) * n.x + (B[1] - qy) * n.y;
+              if (da <= 0) next.push(A);
+              if ((da <= 0) !== (db <= 0)) { const k = da / (da - db); next.push([A[0] + (B[0] - A[0]) * k, A[1] + (B[1] - A[1]) * k]); }
+            }
+            core = next;
+          }
+          if (core.length >= 3) inner = poly(core);
+        }
+      }
+      outer.clockwise = true;
+      parts.push(outer);
+      if (inner) { inner.clockwise = false; parts.push(inner); }
+    } else {
+      const corners = sharp ? [0, W, W + H, 2 * W + H] : [], eps = L * 1e-7;
+      // 점선 조각 = 바깥 평행선 → 안쪽 평행선 거꾸로의 윤곽 하나. 안쪽이 접혀 꼬여도 그대로 둔다 — 캔버스 테두리가 그렇게 칠한다(실측, 법선 선분을
+      // 모두 칠하면 뾰족한 끝에서 더 칠해짐)
+      const strip = (u, v) => {
+        const side = (corners.length ? [u, v] : along(u, v, px)).map(s => at(s, Math.min(Math.max(s, u + eps), v - eps)));
+        return [poly([...side.map(({ p, n }) => p.add(n.multiply(h))), ...side.map(({ p, n }) => p.subtract(n.multiply(h))).reverse()])];
+      };
+      const join = c => {
+        const p = at(c).p, n1 = at(c - eps).n, n2 = at(c + eps).n;
+        if (shape.strokeJoin === 'round') return disk(p);
+        if (shape.strokeJoin === 'miter' && shape.miterLimit >= Math.SQRT2) return poly([p, p.add(n1.multiply(h)), p.add(n1.add(n2).multiply(h)), p.add(n2.multiply(h))]);
+        return poly([p, p.add(n1.multiply(h)), p.add(n2.multiply(h))]);
+      };
+      const cap = (s, dir) => {
+        if (shape.strokeCap === 'round') return disk(at(s).p);
+        if (shape.strokeCap !== 'square') return null;
+        const p = at(s).p, { n, t } = at(s - dir * eps);
+        return poly([p.add(n.multiply(h)), p.add(n.multiply(h)).add(t.multiply(dir * h)), p.subtract(n.multiply(h)).add(t.multiply(dir * h)), p.subtract(n.multiply(h))]);
+      };
+      for (const [a, b] of list) {
+        const inside = corners.flatMap(c => [c, c + L]).filter(c => c > a + eps && c < b - eps).sort((x, y) => x - y);
+        let u = a;
+        for (const c of [...inside, b]) { if (c - u > eps) parts.push(...strip(u, c)); u = c; }
+        inside.forEach(c => parts.push(join(c)));
+        parts.push(cap(a, -1), cap(b, 1));
+      }
+    }
+    const band = new P.CompoundPath({ children: parts.filter(Boolean), fillRule: 'nonzero', insert: false });
+    band.transform(m);
+    return band;
+  }
+  // 선형 그라데이션은 행렬 아래에서도 선형(같은 색 선이 나란한 직선)이라, 행렬 없이 같은 색이 되는 끝점을 다시 잡는다: 자기 좌표 u = A⁻¹(끝 − 시작)에서
+  // 값 f(p) = (p − 시작)·A⁻ᵀu / |u|² — 그 기울기 g로 끝 = 시작 + g/|g|²
+  function evenLinear(P, color, m) {
+    const out = color.clone(), o = color.origin, inv = new P.Matrix(m.a, m.b, m.c, m.d, 0, 0).inverted();
+    const u = inv.transform(color.destination.subtract(o)), uu = u.x * u.x + u.y * u.y;
+    if (!uu) return out;
+    const gx = (inv.a * u.x + inv.b * u.y) / uu, gy = (inv.c * u.x + inv.d * u.y) / uu, gg = gx * gx + gy * gy;
+    out.destination = new P.Point(o.x + gx / gg, o.y + gy / gg);
+    return out;
+  }
+  // 방사 그라데이션은 Shape 자기 좌표에서 초점→끝 원으로 커지는 원들이 같은 색 선이라(번들 toCanvasStyle) 한쪽으로 늘린 행렬 아래에서 타원으로
+  // 퍼지는데, 경로 칠은 원으로만 퍼진다. 칠할 모양(clip)을 잘라 보이는 틀로 두고 그 안에 같은 행렬·같은 칠의 사각 Shape(덮개)를 둔다 — 그라데이션은
+  // 캔버스가 원래처럼 그리고, Shape는 다시 열어도 행렬을 지키며(실측) 잘라 보이는 묶음도 남는다(vector-clip 시험)
+  function gradientCover(P, clip, color, m) {
+    const cover = new P.Shape.Rectangle({ point: [0, 0], size: [1, 1], insert: false });
+    cover.fillColor = color.clone();
+    cover.data.evrCover = true;
+    coverFit(P, cover, clip, m);
+    clip.data = {}; clip.name = null;
+    const group = new P.Group({ children: [clip, cover], insert: false });
+    group.clipped = true;
+    return group;
+  }
+  // 덮개 칠할 영역(clip — 휘기 전)의 점들(전역 좌표): 상자 위 격자 중 안쪽 점, 모자라면(가는 띠·짧은 점선은 격자 사이로 빠짐) 윤곽을 따라 고르게 뽑은
+  // 점도 — 가는 영역은 윤곽이 곧 영역이다
+  function coverPoints(P, clip) {
+    const b = clip.bounds, g = clip.parent.globalMatrix, n = 12, out = [];
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      const p = new P.Point(b.x + b.width * (i + 0.5) / n, b.y + b.height * (j + 0.5) / n);
+      if (clip.contains(p)) { const w = g.transform(p); out.push([w.x, w.y]); }
+    }
+    if (out.length < 48) {
+      const paths = clip.className === 'CompoundPath' ? clip.children : [clip], step = paths.reduce((sum, path) => sum + path.length, 0) / 200;
+      for (const path of paths) for (let s = step / 2; step > 0 && s < path.length; s += step) {
+        const p = path.getPointAt(s);
+        if (p) { const w = path.globalMatrix.transform(p); out.push([w.x, w.y]); }
+      }
+    }
+    return out;
+  }
+  // 덮개(휠 수 없는 사각 Shape)가 따라갈, 사영 사상 map에 가장 가까운 아핀(전역 좌표): 칠할 영역의 점들(coverPoints)에서 최소제곱으로 맞춘다. 점들이
+  // 한 줄이면 그 무게중심에서의 사영 사상 기울기(야코비안), 점이 없으면 null
+  function coverAffine(P, points, map) {
+    if (!points.length) return null;
+    const pts = points.map(([x, y]) => { const q = map.forward(new P.Point(x, y)); return [x, y, q.x, q.y]; });
+    const mean = k => pts.reduce((sum, v) => sum + v[k], 0) / pts.length, mx = mean(0), my = mean(1), nx = mean(2), ny = mean(3);
+    let sxx = 0, sxy = 0, syy = 0, txx = 0, txy = 0, tyx = 0, tyy = 0;
+    for (const [x, y, X, Y] of pts) {
+      const dx = x - mx, dy = y - my, ex = X - nx, ey = Y - ny;
+      sxx += dx * dx; sxy += dx * dy; syy += dy * dy; txx += ex * dx; txy += ex * dy; tyx += ey * dx; tyy += ey * dy;
+    }
+    const det = sxx * syy - sxy * sxy;
+    if (pts.length < 3 || !(det > 1e-9 * sxx * syy)) {
+      const f = (x, y) => map.forward(new P.Point(x, y)), c0 = f(mx, my), x1 = f(mx + 1, my), x0 = f(mx - 1, my), y1 = f(mx, my + 1), y0 = f(mx, my - 1);
+      const a = (x1.x - x0.x) / 2, bb = (x1.y - x0.y) / 2, c = (y1.x - y0.x) / 2, d = (y1.y - y0.y) / 2;
+      return new P.Matrix(a, bb, c, d, c0.x - (a * mx + c * my), c0.y - (bb * mx + d * my));
+    }
+    const a = (txx * syy - txy * sxy) / det, c = (txy * sxx - txx * sxy) / det, bb = (tyx * syy - tyy * sxy) / det, d = (tyy * sxx - tyx * sxy) / det;
+    return new P.Matrix(a, bb, c, d, nx - (a * mx + c * my), ny - (bb * mx + d * my));
+  }
+  // 덮개를 행렬 base의 자기 좌표에서 clip 상자를 덮는 사각으로(가운데·크기만 바꿈 — 칠 점은 부모 좌표라 그대로)
+  function coverFit(P, cover, clip, base) {
+    const inv = base.inverted(), b = clip.bounds, pts = [b.topLeft, b.topRight, b.bottomRight, b.bottomLeft].map(p => inv.transform(p));
+    const xs = pts.map(p => p.x), ys = pts.map(p => p.y), pad = (Math.max(...xs) - Math.min(...xs) + Math.max(...ys) - Math.min(...ys)) * 0.01 + 1;
+    const x0 = Math.min(...xs) - pad, y0 = Math.min(...ys) - pad, x1 = Math.max(...xs) + pad, y1 = Math.max(...ys) + pad;
+    cover.size = new P.Size(x1 - x0, y1 - y0);
+    cover.matrix = base.clone().translate((x0 + x1) / 2, (y0 + y1) / 2);
+  }
+  // 한쪽으로 늘린 Shape를 보이는 그대로 행렬 없는 경로로: 칠 모양은 행렬을 구운 경로(정확), 선형 그라데이션은 끝점을 다시 잡고, 방사 그라데이션(묶음이
+  // 한쪽으로 늘렸으면 선형도 — upEven false)은 잘라 보이는 덮개로, 행렬 따라 굵기가 변하는 테두리는 칠한 띠로. 여럿이면 묶음 하나(이름·data·투명도·섞기는
+  // 묶음이 갖는다)
+  function flatShape(P, shape, upEven = true) {
+    const m = shape.matrix, path = shape.toPath(false), fill = shape.fillColor, stroke = shape.strokeColor;
+    const covered = color => !!color?.gradient && (color.gradient.radial || !upEven);
+    const scaledStroke = shape.hasStroke() && shape.strokeScaling !== false;
+    if (scaledStroke) path.strokeColor = null;
+    const parts = [];
+    if (shape.hasFill() && covered(fill)) {
+      const clip = path.clone({ insert: false });
+      clip.strokeColor = null;
+      parts.push(gradientCover(P, clip, fill, m));
+      path.fillColor = null;
+    } else if (shape.hasFill() && fill.gradient) path.fillColor = evenLinear(P, fill, m);
+    if (path.dashArray?.length && path.hasStroke()) startAt(path, shapeStart(shape));
+    if (path.hasFill() || path.hasStroke()) parts.push(path);
+    if (scaledStroke) {
+      const band = strokeBand(P, shape);
+      if (covered(stroke)) parts.push(gradientCover(P, band, stroke, m));
+      else { band.fillColor = stroke.gradient ? evenLinear(P, stroke, m) : stroke.clone(); parts.push(band); }
+    }
+    if (!parts.length || (parts.length === 1 && parts[0] === path)) return path;
+    const result = parts.length === 1 ? parts[0] : new P.Group({ children: parts, insert: false });
+    for (const part of parts) { part.opacity = 1; part.blendMode = 'normal'; part.visible = true; if (part !== result) { part.data = {}; part.name = null; } }
+    Object.assign(result, { opacity: shape.opacity, blendMode: shape.blendMode, visible: shape.visible });
+    if (result !== path) { result.data = path.data; if (shape.name) result.name = shape.name; }
+    return result;
+  }
+  // SVG에서 온 사각·원·타원(Shape)을 같은 자리·보이는 그대로의 경로로 바꾼다(엔트리 지우개도 Shape를 경로로 바꿈). 고른 배율이면 굵기·점선에 배율을
+  // 곱하고, 한쪽으로 늘렸으면 flatShape. [취소]면 원래 Shape로 되돌린다
+  function shapesToPaths(P, items) {
+    const swapped = [];
+    const swap = shape => {
+      // 엔트리는 다시 열 때 그림 층까지의 묶음 행렬을 안 경로 점에 굽고 선 굵기·방사 그라데이션 모양은 그 배율대로 옮기지 않는다(실측 — Shape는 그
+      // 행렬을 자기 행렬로 받아 지킨다). 그래서 테두리는 묶음이 크기를 바꿨으면, 방사 그라데이션은 묶음까지 합친 변환이 한쪽으로 늘었으면 flatShape
+      const scale = matrixScale(shape.matrix), up = ancestorsMatrix(shape), upScale = matrixScale(up), upEven = !Number.isNaN(upScale);
+      const stroked = shape.hasStroke() && shape.strokeScaling !== false, colors = [shape.fillColor, shape.strokeColor].filter(color => color?.gradient);
+      const radial = colors.some(color => color.gradient.radial), linear = colors.some(color => !color.gradient.radial);
+      // 선형도 묶음이 한쪽으로 늘렸으면 굽은 뒤 같은 색 선 기울기가 바뀐다(고른 배율·돌림은 직각을 지켜 괜찮음)
+      const flat = Number.isNaN(scale) || (stroked && !(Math.abs(upScale - 1) <= 1e-3)) || (radial && Number.isNaN(matrixScale(up.clone().append(shape.matrix)))) || (linear && !upEven);
+      let path;
+      if (flat && !shape.clipMask) path = flatShape(P, shape, upEven);
+      else {
+        path = shape.toPath(false);
+        if (shape.hasStroke() && shape.strokeScaling !== false && scale !== 1 && !Number.isNaN(scale)) {
+          path.strokeWidth = shape.strokeWidth * scale;
+          path.dashArray = (shape.dashArray || []).map(value => value * scale);
+          path.dashOffset = (shape.dashOffset || 0) * scale;
+        }
+        // 원은 원호와 곡선의 길이 재기가 달라 점선 끝이 1px 남짓 밀릴 수 있다
+        if (path.dashArray?.length) startAt(path, shapeStart(shape));
+      }
+      shape.replaceWith(path);
+      swapped.push({ shape, path });
+      return path;
+    };
+    return { items: items.map(item => item.className === 'Shape' ? swap(item) : (shapesIn(item).forEach(swap), item)), swapped };
+  }
+  // 엔트리 둘레 사각과 손잡이 — 크기 손잡이는 둘레 사각과 같은 층, 돌리기 손잡이는 안내 층(되돌리기가 되살린 둘레 사각은 다른 층에 들 수 있음)
+  function guideParts(bounds) {
+    const items = quadLayers.flatMap(layer => layer?.children || []);
+    return { bounds, handles: items.filter(item => item.data?.isScaleHandle), rotate: items.find(item => item.className === 'Group' && item.data?.pointName === 'rotate') };
+  }
+  function findGuide(ep) {
+    const bounds = ep?.project?.getItems?.({ match: item => !!item.data?.isGuide && !!item.data.originBounds && item.segments?.length === 8 })?.[0];
+    if (!bounds) { quadGuide = null; quadLayers = []; return null; }
+    const rotate = ep.project.getItems({ match: item => item.className === 'Group' && item.data?.pointName === 'rotate' })[0];
+    quadLayers = [...new Set([bounds.parent, rotate?.parent].filter(Boolean))];
+    quadGuide = bounds.data[QUAD_MARK] ? bounds : null;
+    return guideParts(bounds);
+  }
+  const guidePoints = bounds => bounds.segments.map(segment => bounds.localToGlobal(segment.point));
+  const guideQuad = bounds => { const p = guidePoints(bounds); return [p[2], p[4], p[6], p[0]].map(q => ({ x: q.x, y: q.y })); };
+  function placeQuadHandles(parts) {
+    const bounds = parts?.bounds;
+    if (!bounds?.data?.[QUAD_MARK] || !bounds.isInserted()) return;
+    const points = guidePoints(bounds);
+    for (const handle of parts.handles) {
+      const i = GUIDE_POINTS.indexOf(handle.data.pointName);
+      if (i >= 0 && !handle.position.isClose(points[i], 1e-6)) handle.position = points[i];
+    }
+    if (parts.rotate && !parts.rotate.position.isClose(points[3], 1e-6)) parts.rotate.position = points[3];
+  }
+  function setGuideQuad(P, parts, quad) {
+    const bounds = parts.bounds, [tl, tr, br, bl] = quad.map(p => new P.Point(p.x, p.y)), mid = (a, b) => a.add(b).divide(2);
+    const points = [bl, mid(bl, tl), tl, mid(tl, tr), tr, mid(tr, br), br, mid(br, bl)];
+    bounds.segments.forEach((segment, i) => { segment.point = bounds.globalToLocal(points[i]); });
+    // 엔트리 크기 바꾸기는 이 크기(자기 좌표)에 배율을 곱해 잰다
+    bounds.data.originBounds = bounds.internalBounds.clone();
+    bounds.pivot = bounds.globalToLocal(bounds.bounds.center);
+    bounds.data[QUAD_MARK] = true;
+    quadGuide = bounds;
+    placeQuadHandles(parts);
+  }
+  // 엔트리가 옮기기·크기·회전·되돌리기 뒤 손잡이를 둘레 사각의 바깥 상자에 다시 놓았으면 네 점 자리로(full: 둘레 사각을 새로 찾음)
+  function fixQuadHandles(full) {
+    const c = context();
+    if (!c?.ep?.project || (!full && !quadGuide?.isInserted())) return;
+    try { placeQuadHandles(full || !quadGuide?.isInserted() ? findGuide(c.ep) : guideParts(quadGuide)); }
+    catch (error) { console.warn('[entry-vector-rig] 원근 손잡이 자리', error); }
+  }
+  for (const type of ['pointerup', 'keyup']) document.addEventListener(type, () => setTimeout(() => fixQuadHandles(true), 0), true);
+  const perspectiveWatched = new WeakSet();
+  function watchPerspective() {
+    const store = paintStore();
+    if (!store || perspectiveWatched.has(store) || typeof store.subscribe !== 'function') return;
+    perspectiveWatched.add(store);
+    let picked = store.getState().paint?.selectedItems;
+    store.subscribe(() => {
+      try { // 구독 함수 예외가 엔트리 dispatch 쪽으로 번지지 않게
+        const state = store.getState(), now = state.paint?.selectedItems, changed = now !== picked;
+        picked = now;
+        if (perspectiveOn && state.tool?.toolMode !== 'SELECT') { perspectiveOn = false; syncPerspectiveTool(); }
+        if (changed || quadGuide) queueMicrotask(() => fixQuadHandles(changed));
+      } catch (error) { console.warn('[entry-vector-rig] 원근 손잡이', error); }
+    });
+  }
+  const selectedNow = () => (paintStore()?.getState()?.paint?.selectedItems || []).filter(item => item?.isInserted?.());
+  // 누른 곳이 엔트리 둘레 사각의 모서리 손잡이면 그 모서리(0 왼위·1 오른위·2 오른아래·3 왼아래). 누르는 범위는 화면 12px(손잡이 그림보다 넓게 —
+  // W3C WCAG 2.2 누르기 대상 최소 24×24)
+  function perspectiveCorner(c, event) {
+    if (event.button !== 0 || !(perspectiveOn || event.ctrlKey || event.metaKey) || painterSpace || session) return null;
+    if (event.target !== c.ep.project?.view?.element || paintStore()?.getState()?.tool?.toolMode !== 'SELECT') return null;
+    const parts = findGuide(c.ep);
+    if (!parts?.handles.length) return null; // 글상자 하나만 고르면 엔트리는 크기 손잡이를 두지 않는다
+    const at = pointer(c, event), reach = 12 / (c.ep.project.view.zoom || 1);
+    let corner = -1, best = reach;
+    guideQuad(parts.bounds).forEach((p, i) => { const d = Math.hypot(p.x - at.x, p.y - at.y); if (d <= best) { best = d; corner = i; } });
+    return corner < 0 ? null : { parts, corner, at };
+  }
+  document.addEventListener('pointerdown', event => {
+    if (perspectiveDrag) return;
+    const c = context(), hit = c && perspectiveCorner(c, event);
+    if (!hit) return;
+    // 엔트리 크기 바꾸기·선택으로 가지 않게(pointerdown을 막으면 이어지는 마우스 이벤트도 생기지 않음)
+    event.preventDefault(); event.stopImmediatePropagation();
+    let source = null;
+    try { source = perspectiveSource(c, hit.parts); } catch (error) { console.warn('[entry-vector-rig] 원근 원본', error); }
+    if (!source) return;
+    try { c.ep.project.view.element.setPointerCapture(event.pointerId); } catch { /* 창 밖에서 놓아도 window pointerup이 받음 */ }
+    perspectiveDrag = { c, source, parts: source.parts, id: event.pointerId, corner: hit.corner, start: hit.at, quad: guideQuad(source.parts.bounds),
+      marked: !!source.parts.bounds.data[QUAD_MARK], now: null, frame: 0 };
+  }, true);
+  window.addEventListener('pointermove', event => {
+    const d = perspectiveDrag;
+    if (!d || event.pointerId !== d.id) return;
+    event.preventDefault(); event.stopImmediatePropagation();
+    const now = pointer(d.c, event), dx = now.x - d.start.x, dy = now.y - d.start.y, i = d.corner;
+    const quad = d.quad.map(p => ({ ...p }));
+    quad[i] = { x: d.quad[i].x + dx, y: d.quad[i].y + dy };
+    if (event.shiftKey) {
+      const row = [1, 0, 3, 2][i], column = [3, 2, 1, 0][i];
+      quad[row] = { x: d.quad[row].x - dx, y: d.quad[row].y };
+      quad[column] = { x: d.quad[column].x, y: d.quad[column].y - dy };
+    }
+    if (!convexQuad(quad)) return; // 꼬이거나 오목한 사각형은 막는다(사상이 뒤집힘)
+    d.now = quad;
+    if (!d.frame) d.frame = requestAnimationFrame(() => { d.frame = 0; drawPerspectiveDrag(d); });
+  }, true);
+  function drawPerspectiveDrag(d) {
+    if (!d.now) return;
+    try {
+      renderPerspective(d.c, d.source, d.now);
+      setGuideQuad(d.c.ep.paper, d.parts, d.now);
+      d.c.ep.project.view.update();
+    } catch (error) { console.warn('[entry-vector-rig] 원근 그리기', error); }
+  }
+  // cancel(Esc·포인터 취소): 누르기 전 네 점으로 다시 그리고 기록하지 않는다
+  function endPerspectiveDrag(event, cancel = false) {
+    const d = perspectiveDrag;
+    if (!d || (event && event.pointerId !== d.id)) return;
+    if (event) { event.preventDefault(); event.stopImmediatePropagation(); }
+    perspectiveDrag = null;
+    if (d.frame) cancelAnimationFrame(d.frame);
+    // 제자리로 돌아와 놓았으면 바뀐 것이 없다(기록·경로 바꾸기를 남기지 않음)
+    const moved = d.now && d.now.some((q, i) => q.x !== d.quad[i].x || q.y !== d.quad[i].y);
+    if (cancel || !moved) {
+      if (d.source.used) { if (d.now) { d.now = d.quad; drawPerspectiveDrag(d); } }
+      else { if (d.now) restoreSource(d); unswapShapes(d); }
+      return;
+    }
+    drawPerspectiveDrag(d);
+    d.source.used = true;
+    try { perspectiveBones(d.c, d.source, d.now); } catch (error) { console.warn('[entry-vector-rig] 원근: 관절 옮기기', error); }
+    if (!saveEntryHistory(d.c.ep)) console.warn('[entry-vector-rig] 원근: 되돌리기 기록을 남기지 못함');
+  }
+  // 처음 끌기를 취소하면 원본을 그대로 되돌린다(원본에서 다시 그리면 반 화소 자리 그림이 흐려질 수 있음)
+  function restoreSource(d) {
+    const { source, c } = d, P = c.ep.paper;
+    for (const piece of [...(source.pieces || []), ...(source.images || [])]) {
+      replaceRasterImage(piece.raster, piece.original);
+      piece.raster.matrix = piece.matrix.clone();
+      piece.shown = piece.raster.canvas;
+      const guide = piece.raster.data?.guideItem;
+      if (guide?.segments && piece.outline) { guide.matrix = new P.Matrix(); guide.segments = piece.outline; }
+    }
+    for (const entry of source.leaves || []) {
+      for (const part of entry.parts) { part.path.pathData = part.d; syncOutline(P, part.path); }
+      for (const [key, saved] of [['fillColor', entry.fill], ['strokeColor', entry.stroke]]) {
+        const color = entry.leaf[key];
+        if (!saved || !color?.gradient) continue;
+        color.origin = saved.origin; color.destination = saved.destination;
+        if (saved.highlight) color.highlight = saved.highlight;
+      }
+    }
+    for (const { item, style } of source.masks || []) item.data.evrMaskStyle = style;
+    for (const { cover, matrix, size, color } of source.covers || []) { cover.matrix = matrix; cover.size = size; cover.fillColor = color.clone(); syncOutline(P, cover); }
+    setGuideQuad(P, d.parts, d.quad);
+    if (!d.marked) { delete d.parts.bounds.data[QUAD_MARK]; quadGuide = null; }
+    c.ep.project.view.update();
+  }
+  // 한 번도 휘지 않고 끝났으면(누르기만·취소) 처음 끌 때 경로로 바꾼 SVG 사각·원을 원래 Shape로 되돌리고 원래 고른 것을 다시 고른다(엔트리가 둘레 사각을
+  // Shape에서 다시 잡음)
+  function unswapShapes(d) {
+    const { swapped, picked } = d.source;
+    if (!swapped?.length) return;
+    for (const { shape, path } of swapped) if (path.isInserted()) { dropOutline(path); path.replaceWith(shape); }
+    perspectiveSources.delete(d.parts.bounds);
+    paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: picked.filter(item => item.isInserted()) });
+    d.c.ep.project.view.update();
+  }
+  window.addEventListener('pointerup', event => endPerspectiveDrag(event), true);
+  window.addEventListener('pointercancel', event => endPerspectiveDrag(event, true), true);
+  window.addEventListener('keydown', event => {
+    if (!perspectiveDrag) return;
+    // 끄는 동안 엔트리 단축키(지우기·되돌리기 등)가 휘는 중인 그림을 바꾸지 않게 — Esc는 끌기 취소
+    event.preventDefault(); event.stopImmediatePropagation();
+    if (event.key === 'Escape') endPerspectiveDrag(null, true);
+  }, true);
+  const gradientPoints = color => color?.gradient ? { origin: color.origin?.clone(), destination: color.destination?.clone(), highlight: color.highlight?.clone() } : null;
+  const parseRig = text => { try { const rig = JSON.parse(text || 'null'); return validRig(rig) ? rig : null; } catch { return null; } };
+  // 그림을 전역 좌표 캔버스로 — 평범한 그림은 화소 그대로, 돌리거나 늘린 그림은 그 행렬로 그려 넣는다
+  function globalCanvas(raster, nearest) {
+    const guide = raster.data?.guideItem, g0 = raster.globalMatrix, w = raster.width / 2, h = raster.height / 2;
+    // 그림이 차지하는 네 모서리(행렬을 거친 사각 — 돌린 그림의 바깥 상자 모서리는 원래 사각 밖이라 사영 사상에서 멀리 튈 수 있음)
+    const corners = [[-w, -h], [w, -h], [w, h], [-w, h]].map(([x, y]) => ({ x: g0.a * x + g0.c * y + g0.tx, y: g0.b * x + g0.d * y + g0.ty }));
+    const kept = { original: raster.canvas, matrix: raster.matrix.clone(), corners, outline: guide?.segments ? guide.segments.map(segment => guide.localToGlobal(segment.point)) : null };
+    if (plainRaster(raster)) return { ...kept, canvas: rasterCopy(raster), at: { x: raster.bounds.left, y: raster.bounds.top } };
+    const b = raster.bounds, left = Math.floor(b.left), top = Math.floor(b.top), m = raster.globalMatrix;
+    const canvas = canvasOfSize(Math.max(1, Math.ceil(b.right) - left), Math.max(1, Math.ceil(b.bottom) - top)), g = canvas.getContext('2d');
+    g.imageSmoothingEnabled = !nearest;
+    g.setTransform(m.a, m.b, m.c, m.d, m.tx - left, m.ty - top);
+    const image = raster.canvas || raster.image;
+    if (image) g.drawImage(image, -raster.width / 2, -raster.height / 2);
+    return { ...kept, canvas, at: { x: left, y: top } };
+  }
+  function perspectiveSource(c, parts) {
+    const items = selectedNow();
+    if (!items.length) return null;
+    const cached = perspectiveSources.get(parts.bounds);
+    if (cached && cached.items.length === items.length && items.every(item => cached.items.includes(item)) && cached.alive()) return cached;
+    const source = bitmapMode(c) ? bitmapPerspectiveSource(c, parts, items) : vectorPerspectiveSource(c, parts, items);
+    if (source) perspectiveSources.set(source.parts.bounds, source);
+    return source;
+  }
+  function bitmapPerspectiveSource(c, parts, items) {
+    const rasters = items.filter(item => isRasterLayer(item) && item.parent === c.layer && !isLayerHelper(item) && item.width && item.height);
+    if (!rasters.length || rasters.length !== items.length) return null;
+    const first = c.layer.children.find(isRasterLayer), nearest = objectPixel(c.object) > 0;
+    // 다시 연 그림에서 엔트리가 미리 골라 둔 조각이면 관절이 기록에만 있을 수 있다 — 조각을 누를 때와 같이 그림 data로(합칠 때 옮김)
+    for (const raster of rasters) if (raster !== first) try { bonesOnFloating(c, first, raster); } catch (error) { console.warn('[entry-vector-rig] 고른 조각 관절 옮겨 두기', error); }
+    const pieces = rasters.map(raster => ({ raster, ...globalCanvas(raster, nearest), shown: raster.canvas }));
+    const bones = rasters.map(item => ({ item, rig: parseRig(item.data?.[BONES]) })).filter(entry => entry.rig);
+    return { kind: 'bitmap', items, parts, quad: guideQuad(parts.bounds), pieces, bones, nearest,
+      alive: () => pieces.every(piece => piece.raster.isInserted() && piece.raster.canvas === piece.shown) };
+  }
+  // 벡터 원근이 휘는 것은 경로(SVG에서 온 사각·원·타원은 같은 모습의 경로로 바꿈)와 맨 위 그림뿐이다 — 그 밖의 것(글상자, 묶음 안 그림)이 들면 그것만
+  // 그대로 남고 관절은 옮겨져 그림과 어긋난다. 걸린 것의 이름(알림에 씀)을 모은다
+  function unwarpable(item, top = true, found = new Set()) {
+    if (item.className === 'Path' || item.className === 'CompoundPath' || item.className === 'Shape') return found;
+    if (item.className === 'Group') { item.children.forEach(child => unwarpable(child, false, found)); return found; }
+    const kind = isRasterLayer(item) ? (top ? '' : '그림') : item.className === 'PointText' ? '글상자' : '휠 수 없는 항목';
+    if (kind) found.add(top ? kind : `묶음 안 ${kind}`);
+    return found;
+  }
+  function vectorPerspectiveSource(c, parts, items) {
+    const P = c.ep.paper, tops = [];
+    // 엔트리는 맨 위 항목 단위로 고른다
+    for (const item of items) {
+      let top = item;
+      while (top.parent && top.parent !== c.layer) top = top.parent;
+      if (top.parent === c.layer && !isLayerHelper(top) && !tops.includes(top)) tops.push(top);
+    }
+    if (!tops.length) return null;
+    // 뼈대가 있는 레이어 안 SVG 사각·원은 경로로 바꾸면 뼈대가 휘는 경로 목록에 들어가 자세를 바꿀 때 같이 휜다(Shape는 안 휨) — 바꾸지 않고
+    // 그 레이어째 막는다(묶음 안이면 원만 뺄 수 없어 레이어를 빼고 고르게)
+    const kinds = new Set();
+    let bonyGroup = false;
+    for (const item of tops) {
+      const found = unwarpable(item);
+      if (item.data?.[BONES] && shapesIn(item).length) found.add('SVG 사각·원이 든 뼈대 레이어');
+      if (item.data?.[BONES] && [...found].some(kind => kind.startsWith('묶음 안'))) bonyGroup = true;
+      found.forEach(kind => kinds.add(kind));
+    }
+    if (kinds.size) {
+      const grouped = [...kinds].some(kind => kind.startsWith('묶음 안')) ? ` 묶음 안에 든 것은 묶음째로만 골라져 그 묶음은 기울일 수 없습니다${bonyGroup ? '(그룹을 풀면 그 묶음 뼈대가 없어집니다)' : ''}.` : '';
+      toast(`원근으로 기울일 수 없는 것이 들어 있습니다(${[...kinds].join(', ')}).${grouped} 그것을 빼고 기울일 도형만 고르세요.`, 7000);
+      return null;
+    }
+    const quad = guideQuad(parts.bounds), { items: converted, swapped } = shapesToPaths(P, tops);
+    if (swapped.length) {
+      // 엔트리 선택이 바꾼 Shape를 가리키지 않게 새 경로로 다시 고른다 — 엔트리가 둘레 사각을 새로 만들므로 누른 네 점을 그대로 옮겨 놓는다. 엔트리는 다시
+      // 고를 때 지금 끝 항목의 윤곽선만 지우므로(묶음 안 Shape면 묶음이 그대로 골라짐) 바뀐 Shape의 윤곽선은 여기서 지운다
+      for (const { shape } of swapped) dropOutline(shape);
+      const swap = new Map(swapped.map(({ shape, path }) => [shape, path]));
+      paintStore()?.dispatch({ type: 'SELECT_ITEMS', payload: items.map(item => swap.get(item) || item) });
+      parts = findGuide(c.ep);
+      if (!parts) return null;
+      setGuideQuad(P, parts, quad);
+    }
+    const nearest = objectPixel(c.object) > 0;
+    // 겹친 경로는 안쪽 경로마다 따로 휜다 — 겹친 경로에 경로 글을 통째로 넣으면 안쪽 경로가 새로 만들어져, 엔트리가 안쪽 경로마다 붙인 선택 윤곽선이
+    // 주인을 잃고 휘기 전 자리에 남았다. 칠(그라데이션)은 겹친 경로 것 하나
+    const leaves = converted.flatMap(item => pathItems(item)).map(leaf => ({ leaf,
+      parts: (leaf.className === 'CompoundPath' ? leaf.children : [leaf]).map(path => ({ path, d: path.pathData, g: path.globalMatrix.clone() })),
+      pg: leaf.parent?.globalMatrix?.clone() || new P.Matrix(), fill: gradientPoints(leaf.fillColor), stroke: gradientPoints(leaf.strokeColor) }));
+    const images = converted.filter(isRasterLayer).map(raster => ({ raster, ...globalCanvas(raster, nearest), shown: raster.canvas }));
+    // 클리핑 마스크 틀은 칠이 지워진 채 그라데이션 점을 data에 적어 둔다 — 그 점도 같이 옮긴다(옮기기·돌리기 갈고리와 같은 항목)
+    const masks = converted.flatMap(item => [item, ...(item.getItems?.({}) || [])])
+      .filter(item => [item.data?.evrMaskStyle?.fill, item.data?.evrMaskStyle?.stroke].some(value => value?.gradient) && (!item.children || item.className === 'CompoundPath'))
+      .map(item => ({ item, style: item.data.evrMaskStyle, pg: item.parent?.globalMatrix?.clone() || new P.Matrix() }));
+    // 그라데이션 덮개 — 경로가 아니라 점을 휠 수 없어 칠할 영역에 맞춘 아핀을 따라간다(coverAffine)
+    const covers = converted.flatMap(item => item.getItems?.({ className: 'Shape', match: shape => !!shape.data?.evrCover }) || [])
+      .map(cover => ({ cover, clip: cover.parent.firstChild, points: coverPoints(P, cover.parent.firstChild), matrix: cover.matrix.clone(), size: cover.size.clone(),
+        color: cover.fillColor.clone(), g: cover.parent.globalMatrix.clone() }));
+    const bones = converted.map(item => ({ item, rig: parseRig(item.data?.[BONES]) })).filter(entry => entry.rig);
+    return { kind: 'vector', items: selectedNow(), parts, quad, leaves, images, masks, covers, bones, nearest, swapped, picked: items,
+      alive: () => leaves.every(entry => entry.leaf.isInserted() && entry.parts.every(part => part.path.isInserted())) && images.every(image => image.raster.isInserted() && image.raster.canvas === image.shown) };
+  }
+  // 그림 한 장을 원본 사각(from) → 지금 사각(to) 사상으로 다시 그려 그 그림에 넣는다(돌림·크기는 비움). 결과 범위는 그림 네 모서리가 간 자리(못 구하면 quad)
+  function placeWarped(P, piece, from, to, quad, nearest) {
+    const w = piece.canvas.width, h = piece.canvas.height, at = piece.at;
+    const own = { inverse: p => { const { u, v } = to.inverse(p), q = from.forward({ x: u, y: v }); return { u: (q.x - at.x) / w, v: (q.y - at.y) / h }; } };
+    const mapped = piece.corners.map(p => { const { u, v } = from.inverse(p); return to.forward({ x: u, y: v }); });
+    const corners = mapped.every(p => Number.isFinite(p.x) && Number.isFinite(p.y)) ? mapped : quad;
+    const warped = warpCanvas(piece.canvas, own, corners, nearest), raster = piece.raster;
+    replaceRasterImage(raster, warped.canvas);
+    raster.pivot = null;
+    raster.matrix = new P.Matrix();
+    raster.position = new P.Point(warped.x + warped.canvas.width / 2, warped.y + warped.canvas.height / 2);
+    piece.shown = raster.canvas;
+    // 엔트리 선택 윤곽선(그림 사각 복제본 — 옮기기·크기는 같이 받음)도 휜 자리로
+    const guide = raster.data?.guideItem;
+    if (guide?.segments) { guide.matrix = new P.Matrix(); guide.segments = corners.map(p => [p.x, p.y]); guide.closed = true; }
+  }
+  // 엔트리 선택 윤곽선(경로마다 붙인 복제본 — 엔트리 activateItem처럼 같은 경로 글에 그 경로의 전역 행렬)을 지금 경로 모양으로
+  // 그 항목(묶음이면 안의 끝 항목들)의 엔트리 선택 윤곽선을 지운다
+  function dropOutline(item) {
+    for (const node of [item, ...(item.getItems?.({}) || [])]) {
+      node.data?.guideItem?.remove?.();
+      if (node.data?.guideItem) node.data.guideItem = null;
+    }
+  }
+  function syncOutline(P, path) {
+    const guide = path.data?.guideItem;
+    if (!guide?.segments) return;
+    if (path.className === 'Shape') {
+      // 경로가 아닌 항목(그라데이션 덮개 Shape)의 윤곽선은 자기 사각에 전역 행렬(엔트리 activateItem과 같음)
+      const m = path.globalMatrix, b = path.internalBounds;
+      guide.matrix = new P.Matrix();
+      guide.segments = [b.topLeft, b.topRight, b.bottomRight, b.bottomLeft].map(q => m.transform(q));
+      guide.closed = true;
+      return;
+    }
+    guide.pathData = path.pathData;
+    guide.matrix = path.globalMatrix;
+  }
+  // 원본(원본 사각 source.quad 자리)에서 네 점 quad로 다시 그린다 — 미리보기·놓기 모두 원본에서(여러 번 끌어도 화질이 쌓여 나빠지지 않게)
+  function renderPerspective(c, source, quad) {
+    const P = c.ep.paper, unit = { x: 0, y: 0, width: 1, height: 1 }, from = perspectiveMap(unit, source.quad), to = perspectiveMap(unit, quad);
+    const forward = p => { const { u, v } = from.inverse(p); return to.forward({ x: u, y: v }); };
+    for (const piece of source.pieces || []) placeWarped(P, piece, from, to, quad, source.nearest);
+    if (source.kind !== 'vector') return;
+    for (const image of source.images) placeWarped(P, image, from, to, quad, source.nearest);
+    for (const entry of source.leaves) {
+      for (const part of entry.parts) {
+        const gi = part.path.globalMatrix.inverted(), g0 = part.g;
+        const fn = ([x, y]) => { const q = forward(g0.transform(new P.Point(x, y))), r = gi.transform(new P.Point(q.x, q.y)); return [r.x, r.y]; };
+        const warp = new Warp(sourceSvg([part.d]));
+        warp.interpolate(4);
+        warp.transform(fn);
+        part.path.pathData = warp.paths.map(path => path.pathElement.getAttribute('d')).join(' ');
+        syncOutline(P, part.path);
+      }
+      for (const [key, saved] of [['fillColor', entry.fill], ['strokeColor', entry.stroke]]) {
+        const color = entry.leaf[key];
+        if (!saved || !color?.gradient) continue;
+        const pgi = (entry.leaf.parent?.globalMatrix?.clone() || new P.Matrix()).inverted();
+        const move = point => { if (!point) return point; const q = forward(entry.pg.transform(point)); return pgi.transform(new P.Point(q.x, q.y)); };
+        color.origin = move(saved.origin); color.destination = move(saved.destination);
+        if (saved.highlight) color.highlight = move(saved.highlight);
+      }
+    }
+    for (const { item, style, pg } of source.masks) {
+      const pgi = (item.parent?.globalMatrix?.clone() || new P.Matrix()).inverted();
+      const at = point => { if (!Array.isArray(point)) return point; const q = forward(pg.transform(new P.Point(point[0], point[1]))), r = pgi.transform(new P.Point(q.x, q.y)); return [r.x, r.y]; };
+      item.data.evrMaskStyle = movedMaskStyle(style, at);
+    }
+    const map = { forward };
+    for (const { cover, clip, points, matrix, size, color, g } of source.covers) {
+      cover.matrix = matrix; cover.size = size; cover.fillColor = color.clone();
+      const fit = coverAffine(P, points, map) || coverAffine(P, source.quad.map(p => [p.x, p.y]), map);
+      cover.transform(cover.parent.globalMatrix.inverted().append(fit).append(g));
+      coverFit(P, cover, clip, cover.matrix);
+      syncOutline(P, cover);
+    }
+  }
+  // 사각(src) 안 점 → 네 점 사각(quad) 안 점, 사각 밖 점은 사영 사상이 크게 늘어나거나 지평선을 넘어 뒤집힌다. 사각 안 가장 가까운 점의 사상에, 그 점의
+  // 국소 변환(야코비안, 사각 안쪽 차분)을 회전·늘어남으로 나눠(극분해) 건 나머지 거리를 더하되, 늘어남은 그림 전체의 평균 변환(마주 보는 변 평균 = 네
+  // 모서리에 맞춘 아핀)이 늘린 범위로 자른다. 원근이 없으면(평행사변형) 국소 변환이 곧 평균이라 그림과 똑같이 옮겨지고, 원근이 강해도(국소 늘어남이 큼)
+  // 뼈 끝이 그림 전체가 늘어난 것보다 멀리 가지 않는다.
+  function jointPlacer(src, quad) {
+    const map = perspectiveMap(src, quad), within = p => p.x >= src.x && p.x <= src.x + src.width && p.y >= src.y && p.y <= src.y + src.height;
+    const [tl, tr, br, bl] = quad;
+    const fit = [((tr.x - tl.x) + (br.x - bl.x)) / 2 / src.width, ((bl.x - tl.x) + (br.x - tr.x)) / 2 / src.height,
+      ((tr.y - tl.y) + (br.y - bl.y)) / 2 / src.width, ((bl.y - tl.y) + (br.y - tr.y)) / 2 / src.height];
+    const fitE = Math.hypot((fit[0] + fit[3]) / 2, (fit[2] - fit[1]) / 2), fitF = Math.hypot((fit[0] - fit[3]) / 2, (fit[2] + fit[1]) / 2);
+    const lo = Math.abs(fitE - fitF), hi = fitE + fitF, right = src.x + src.width, bottom = src.y + src.height;
+    // 자로 쓸 차분 한 걸음(사각 크기의 1/1000 — 단위 사각형에서도 안쪽)
+    const step = Math.min(src.width, src.height) / 1000;
+    return p => {
+      if (within(p)) return map.forward(p);
+      const q = { x: Math.min(Math.max(p.x, src.x), right), y: Math.min(Math.max(p.y, src.y), bottom) }, m = map.forward(q);
+      const sx = q.x + step <= right ? step : -step, sy = q.y + step <= bottom ? step : -step;
+      const ax = map.forward({ x: q.x + sx, y: q.y }), ay = map.forward({ x: q.x, y: q.y + sy }), dx = p.x - q.x, dy = p.y - q.y;
+      const a = (ax.x - m.x) / sx, b = (ay.x - m.x) / sy, c = (ax.y - m.y) / sx, d = (ay.y - m.y) / sy;
+      const angle = Math.atan2(c - b, a + d), cos = Math.cos(angle), sin = Math.sin(angle);
+      // 늘어남 S = Rᵀ·J(대칭)의 고윳값을 [lo, hi]로 자른 S'로 나머지 거리를 늘린 뒤 R로 돌린다
+      const s11 = cos * a + sin * c, s22 = -sin * b + cos * d, s12 = (cos * b + sin * d - sin * a + cos * c) / 2;
+      const mid = (s11 + s22) / 2, half = Math.hypot((s11 - s22) / 2, s12), phi = Math.atan2(2 * s12, s11 - s22) / 2;
+      const k1 = Math.min(Math.max(mid + half, lo), hi), k2 = Math.min(Math.max(mid - half, lo), hi), u = Math.cos(phi), v = Math.sin(phi);
+      const ex = (k1 * u * u + k2 * v * v) * dx + (k1 - k2) * u * v * dy, ey = (k1 - k2) * u * v * dx + (k1 * v * v + k2 * u * u) * dy;
+      return { x: m.x + cos * ex - sin * ey, y: m.y + sin * ex + cos * ey };
+    };
+  }
+  // 관절(지금 자세 자리)을 rect → quad 사상으로 옮긴 관절 목록. toRect: 관절 자리 → rect 좌표, all이 아니면 rect 안 관절만
+  function warpedJoints(rig, rect, quad, all, toRect = p => p) {
+    const place = jointPlacer(rect, quad), points = jointPoints(rig);
+    const inside = p => p.x >= rect.x && p.x <= rect.x + rect.width && p.y >= rect.y && p.y <= rect.y + rect.height;
+    return rig.joints.map(j => {
+      const p = points[j.id], r = p && toRect(p), m = r && Number.isFinite(r.x) && Number.isFinite(r.y) && (all || inside(r)) && place(r);
+      const q = m && Number.isFinite(m.x) && Number.isFinite(m.y) ? m : p;
+      return { ...j, x: clean(q.x), y: clean(q.y) };
+    });
+  }
+  // 놓을 때: 휜 항목에 든 관절을 원본 사각 → 지금 사각으로 옮기고(통째로 휨 — 칠 밖 관절인 뼈 끝까지) 지금 모양을 새 기준으로(각도 0). 떠 있는 조각의
+  // 관절(바탕 그림에 있음)은 엔트리가 조각을 합칠 때 옮긴다(selectionMove)
+  function perspectiveBones(c, source, quad) {
+    const unit = { x: 0, y: 0, width: 1, height: 1 }, from = perspectiveMap(unit, source.quad), first = c.layer.children.find(isRasterLayer);
+    // 원본 사각 자리 → 단위 사각형 자리(단위 사각형 → quad 사상이 곧 원본 → 지금 사상)
+    const toUnit = p => { const { u, v } = from.inverse(p); return { x: u, y: v }; };
+    for (const { item, rig } of source.bones) {
+      if (!item.isInserted()) continue;
+      const joints = warpedJoints(rig, unit, quad, true, toUnit);
+      if (isRasterLayer(item)) {
+        restCanvases.set(item, restHere(item));
+        const next = bitmapRigBase(c, item, joints);
+        rasterSig(item); next.sig = rasterSig(item);
+        item.data[BONES] = JSON.stringify(next);
+        delete item.data[BITMAP_REST];
+        continue;
+      }
+      const next = { ...rig, joints, pose: {}, source: pathItems(item).map(leaf => worldPathData(c.ep.paper, leaf)) };
+      next.sig = shapeSig(item);
+      item.data[BONES] = JSON.stringify(next);
+    }
+    if (source.kind !== 'bitmap') return;
+    // 바탕 그림을 통째로 휘면 서버 그림과의 관계가 평행 이동이 아니다 — 새 모양으로 저장이 원래 모양에 관절 기록을 되돌려 남기지 않게(틀린 자리보다 기록 없음)
+    if (source.pieces.some(piece => piece.raster === first)) first.data[SERVER_SHIFT] = 'unknown';
+    notePieceWarp(c, source, quad);
+  }
+  // 떠 있는 조각을 휘면 바탕 그림의 관절·서버 그림과의 관계는 엔트리가 조각을 합칠 때 옮긴다 — 떼어 낸 사각 → 마지막 둘레 사각(그 뒤 엔트리 옮기기·크기·
+  // 회전도 둘레 사각에 담겨, 놓을 때마다 적음)
+  function notePieceWarp(c, source, quad) {
+    const cut = selectionCut, first = c.layer.children.find(isRasterLayer);
+    if (!cut || cut.base !== first || !source.pieces.some(piece => piece.raster !== first)) return;
+    cut.warped = true;
+    cut.quad = quad;
+  }
+  // [원근] 단추: 켜 두면 엔트리 선택 도구 모서리가 Ctrl 없이도 원근이다. 켜면 선택 도구로 바꾸고, 선택 도구가 아닌 도구가 되면 꺼진다
+  function setPerspectiveOn(on) {
+    perspectiveOn = !!on;
+    const store = paintStore();
+    if (perspectiveOn && store && store.getState().tool?.toolMode !== 'SELECT') store.dispatch({ type: 'CHANGE_TOOL_MODE', payload: 'SELECT' });
+    if (perspectiveOn) toast('원근: 선택 도구로 고른 것의 모서리를 끌면 기울어집니다 · Shift = 맞은편 모서리도 같이(대칭) · 단추를 꺼도 Ctrl을 누른 채 모서리를 끌면 원근', 6000);
+    syncPerspectiveTool();
+  }
   // ---- 비트맵 선택이 반투명 화소를 지우지 않게(1.3) ----
   // 엔트리 비트맵 선택 도구는 고른 부분을 떼어 낼 때(getCutRaster → getAliasingRaster) 화소 투명도를 128 기준으로 0/255로 깎는다
-  // (entry-paint 261015 소스 — 확장 없이도 같음: 30%·10% 화소가 박스를 놓는 순간 사라지고 60%는 100%가 됨, 10-18 실험). 엔트리 붓·선은
-  // 원래 번짐 없이 그리지만, 흐림 필터·부드러운 붓·불투명도·불러온 그림의 반투명 화소까지 선택 한 번에 망가졌다(사용자 제보 10-18 "필터
-  // 적용 뒤 선택 박스 → 필터가 사라짐", 넓혀 본 탐색 95가지 중 흐림+선택 6가지만 실패). 떼어 낼 때 엔트리처럼 같은 해상도로 굽되 깎는
+  // (entry-paint 261015 소스 — 확장 없이도 같음: 30%·10% 화소가 박스를 놓는 순간 사라지고 60%는 100%가 됨, 실험). 엔트리 붓·선은
+  // 원래 번짐 없이 그리지만, 흐림 필터·부드러운 붓·불투명도·불러온 그림의 반투명 화소까지 선택 한 번에 망가졌다(넓혀 본 탐색 95가지 중
+  // 흐림+선택 6가지만 실패). 떼어 낼 때 엔트리처럼 같은 해상도로 굽되 깎는
   // 단계만 건너뛴다 — 반투명이 없는 그림(픽셀 아트)은 결과가 같다.
+  // 엔트리 선택 도구로 그림 전체를 골라 옮기면 엔트리는 합칠 때 같은 크기·같은 자리 그림으로 다시 구워, 관절이 "고친 그림"의 옛 자리에 남았다.
+  // 떼어 낸 사각을 적어 두고, 합칠 때(그림 층 rasterize) 같은 크기 조각이 돌거나 늘지 않고 옮겨졌으면 그만큼을 돌려준다(selectionMove).
+  // 엔트리는 떼어 낸 조각을 새 조각으로 바꿔 넣으므로 조각이 아니라 사각을 적는다.
+  let selectionCut = null;
+  const selectionPieceAt = (layer, cut) => {
+    const piece = layer.children.find(item => item !== cut.base && isRasterLayer(item) && item.width === cut.width && item.height === cut.height);
+    const m = piece?.matrix;
+    return m && { piece, x: piece.bounds.x, y: piece.bounds.y, plain: Math.abs(m.a - 1) <= 1e-9 && Math.abs(m.d - 1) <= 1e-9 && Math.abs(m.b) <= 1e-9 && Math.abs(m.c) <= 1e-9 };
+  };
+  // 조각을 놓을 때마다 자리를 적어 둔다 — 엔트리는 합치기 전에 무대 밖을 잘라 조각 크기가 바뀌어, 그때는 크기로 조각을 못 찾는다
+  for (const type of ['pointerup', 'keyup']) document.addEventListener(type, () => setTimeout(() => {
+    const cut = selectionCut, layer = cut?.base?.parent;
+    const at = layer && selectionPieceAt(layer, cut);
+    if (at) cut.seen = at;
+    if (cut?.warped && quadGuide?.isInserted()) cut.quad = guideQuad(quadGuide);
+  }, 0));
+  const alphaSum = raster => {
+    let data = null;
+    try { data = raster.getImageData({ x: 0, y: 0, width: raster.width, height: raster.height }).data; } catch { return null; }
+    let sum = 0;
+    for (let i = 3; i < data.length; i += 4) sum += data[i];
+    return sum;
+  };
+  const insideRect = (p, r) => p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height;
+  // 떼어 낸 사각과 조각의 칠 양, 휜 그림이 뼈대 모드에서 마지막으로 그린 그대로인지(합칠 때 자세를 지킬지)를 적는다
+  function noteCut(base, piece, fromBase = false) {
+    let rig = null;
+    try { rig = base.data?.[BITMAP_REST] ? JSON.parse(base.data[BONES] || 'null') : null; } catch { rig = null; }
+    selectionCut = { base, x: piece.bounds.x, y: piece.bounds.y, width: piece.width, height: piece.height, fromBase,
+      ink: alphaSum(piece) || 0, clean: !!rig?.sig && rasterSig(base).abs === rig.sig.abs };
+  }
+  // 옮긴 것을 따라가는 때는 둘뿐이다: 남은 칠이 하나도 없음(그림 전체를 골랐음 — 뼈 끝처럼 칠 밖 관절도 따라감), 또는 관절이 모두 떼어 낸 사각
+  // 안. 그 밖(그림 일부를 옮겼고 관절이 사각 밖에도 있음)은 어느 부분의 관절인지 칠로 가를 수 없어(가는·흐린·반투명 부분 — 과적합 검토 5~8차)
+  // 1.3.1처럼 관절을 두고 알린다. 뼈대가 없으면 일부만 옮겼을 때 { unknown } — 서버 그림과의 관계가 평행 이동이 아니다.
+  // whole: 남은 칠이 없고 조각이 잘리지 않아 합친 그림이 옮긴 그림 그대로다.
+  function selectionMove(layer, base, peek = false) {
+    const cut = selectionCut;
+    if (!cut || cut.base !== base) return null;
+    if (!peek) selectionCut = null;
+    if (cut.warped) return pieceWarpMove(base, cut, peek);
+    const found = selectionPieceAt(layer, cut), at = found || cut.seen;
+    if (!at?.plain || !cut.ink) return null;
+    const dx = clean(at.x - cut.x), dy = clean(at.y - cut.y);
+    if (Math.abs(dx) <= .01 && Math.abs(dy) <= .01) return null;
+    // 남은 칠은 화소 수로 센다(바탕과, 옮긴 조각을 알면 그 층의 다른 그림까지 — 무대 끝에서 잘려 크기로 못 찾으면 바탕만) — 옅은 기준점 화소
+    // (FAINT_ALPHA 이하, 저장 상자를 고정하려고 확장이 덧그림)는 칠이 아니다
+    let left = 0;
+    try {
+      const others = found ? layer.children.filter(item => isRasterLayer(item) && !isLayerHelper(item) && item !== found.piece && item.width && item.height) : [base];
+      for (const raster of others) {
+        const data = raster.getImageData({ x: 0, y: 0, width: raster.width, height: raster.height }).data;
+        for (let i = 3; i < data.length; i += 4) if (data[i] > FAINT_ALPHA) left++;
+      }
+    } catch { return null; }
+    let rig = null;
+    try { rig = JSON.parse(base.data?.[BONES] || 'null'); } catch { rig = null; }
+    if (validRig(rig)) {
+      if (left > 0 && !jointPoints(rig).every(p => insideRect(p, cut))) {
+        if (!peek && cut.fromBase) toast('관절은 그대로 두었습니다 — 그림 일부를 옮길 때는 관절이 모두 고른 사각 안에 있어야 같이 옮겨집니다.', 6000);
+        return null;
+      }
+    } else if (left > 0) return { unknown: true };
+    return { x: dx, y: dy, whole: !!found && left === 0 && cut.clean };
+  }
+  // 휜 조각을 합칠 때: 관절은 옮기기와 같은 규칙(남은 칠이 없거나 관절이 모두 떼어 낸 사각 안)일 때만 떼어 낸 사각 → 마지막 둘레 사각 사상으로 옮긴다
+  // (warp — 남은 칠이 없으면 칠 밖 관절인 뼈 끝까지). 서버 그림과의 관계는 평행 이동이 아니다(unknown)
+  function pieceWarpMove(base, cut, peek) {
+    let left = 0;
+    try {
+      const data = base.getImageData({ x: 0, y: 0, width: base.width, height: base.height }).data;
+      for (let i = 3; i < data.length; i += 4) if (data[i] > FAINT_ALPHA) left++;
+    } catch { return { unknown: true }; }
+    const rig = parseRig(base.data?.[BONES]);
+    if (rig && left > 0 && !jointPoints(rig).every(p => insideRect(p, cut))) {
+      if (!peek && cut.fromBase) toast('관절은 그대로 두었습니다 — 그림 일부를 기울일 때는 관절이 모두 고른 사각 안에 있어야 같이 옮겨집니다.', 6000);
+      return { unknown: true };
+    }
+    const rect = { x: cut.x, y: cut.y, width: cut.width, height: cut.height };
+    return { unknown: true, warp: rig && cut.quad ? warpedJoints(rig, rect, cut.quad, left === 0) : null };
+  }
+  // 엔트리 비트맵 선택 도구로 떠 있는 조각(다시 연 그림은 엔트리가 그림을 빈 바탕 위 조각으로 골라 둠)을 누를 때 관절이 모양 정보·레이어 파일에만
+  // 있으면 조각 그림으로 뼈대를 만들어 둔다. 엔트리 선택은 건드리지 않는다 — 조각 밖·돌리기 손잡이는 엔트리 그대로, 새로 떼어 내면 getCutRaster가 만든다.
+  document.addEventListener('pointerdown', event => {
+    if (session || event.button !== 0) return;
+    const c = context();
+    if (!c || !bitmapMode(c) || event.target !== c.ep.project?.view?.element) return;
+    const state = paintStore()?.getState(), first = c.layer.children.find(isRasterLayer);
+    if (state?.tool?.toolMode !== 'SELECT') return;
+    const floating = (state.paint?.selectedItems || []).filter(item => item !== first);
+    if (!floating.length) return;
+    const view = c.ep.project.view, box = event.target.getBoundingClientRect(), pad = 12 / (view.zoom || 1);
+    const at = view.viewToProject(new c.ep.paper.Point((event.clientX - box.left) * view.viewSize.width / box.width, (event.clientY - box.top) * view.viewSize.height / box.height));
+    const held = floating.find(item => item.bounds?.expand(pad * 2).contains(at));
+    if (held) try { bonesOnFloating(c, first, held); } catch (error) { console.warn('[entry-vector-rig] 고른 조각 관절 옮겨 두기', error); }
+  }, true);
+  // 관절이 모양 정보·레이어 파일(지금 레이어, 아직 안 연 관절)에만 있으면 art 그림으로 그림 data 뼈대를 만들어 base에 둔다 — 합칠 때 옮겨 실린다
+  // (엔트리 되돌리기 기록에도 같이 들어감)
+  function bonesFromRecord(c, base, art) {
+    if (session || !c || !bitmapMode(c) || !isRasterLayer(base) || !isRasterLayer(art) || base.parent !== c.layer) return false;
+    if (base.data?.[BONES] || art.data?.[BONES] || !plainRaster(art) || !art.width) return false;
+    const meta = layerMeta(c.ep), kept = meta && layerBonesOf(activeLayer(meta));
+    const joints = meta ? kept?.joints && !kept.bones && kept.joints.map(j => ({ ...j })) : pictureRigJoints(c);
+    if (!joints?.length) return false;
+    restCanvases.set(art, restHere(art));
+    const rig = bitmapRigBase(c, art, joints);
+    rig.sig = rasterSig(art);
+    if (!validRig(rig)) return false;
+    base.data[BONES] = JSON.stringify(rig);
+    if (meta) delete activeLayer(meta).bonesRef; // 파일 관절은 이제 그림 data 뼈대가 이어 간다
+    return true;
+  }
+  // 다시 연 직후 엔트리가 미리 골라 둔 조각을 바로 끌 때(떼어 내기 없음): 관절이 기록에만 있으면 조각 그림으로 뼈대를 만들고, 뼈대가 없어도
+  // 조각 자리를 떼어 낸 사각처럼 적는다
+  // (selectionMove가 합칠 때 옮긴 양을 준다 — 뼈대 없이 다시 연 그림의 미리 골라진 조각을 끌어도 새 모양으로 저장 기록이 맞게)
+  function bonesOnFloating(c, base, piece) {
+    if (selectionCut?.base === base || piece.parent !== base.parent || !openedPieces.has(piece)) return;
+    bonesFromRecord(c, base, piece);
+    noteCut(base, piece);
+  }
   function ensureSelectKeepsAlpha(painter) {
     const tool = painter?.entryPaint?.paper?.tools?.find(item => item.MY_MODE?.toolMode === 'SELECT' && item.MY_MODE?.graphicsMode === 'BITMAP');
     if (!tool || own(tool, '__evrKeepAlpha') || typeof tool.getCutRaster !== 'function') return;
@@ -10090,8 +11330,11 @@
         const x0 = Math.round(rect.x - dx), y0 = Math.round(rect.y - dy);
         const w = Math.max(1, Math.round(rect.x + rect.width - dx) - x0), h = Math.max(1, Math.round(rect.y + rect.height - dy) - y0);
         rect.x = x0; rect.y = y0; rect.width = w; rect.height = h;
+        // 관절이 모양 정보·레이어 파일에만 있으면 떼어 내기 전 그림으로 그림 data 뼈대를 만든다(그림 전체를 골라 옮기면 같이 옮기게)
+        try { bonesFromRecord(context(), raster, raster); } catch (error) { console.warn('[entry-vector-rig] 떼어 내기 전 관절 옮겨 두기', error); }
         const piece = raster.getSubRaster(x0, y0, w, h);
         piece.remove();
+        noteCut(raster, piece, true);
         return piece;
       }
       const piece = raster.getSubRaster(rect);
@@ -10190,9 +11433,9 @@
     const color = new paper.Color(value || '#000000');
     return [color.red * 255, color.green * 255, color.blue * 255, (color.alpha ?? 1) * 255];
   }
-  // ---- 엔트리 색 고르기 다시 쓰기(1.3, 사용자 요청 "우리가 따로 색을 고르게 한 거를 엔트리 css로 재사용") ----
+  // ---- 엔트리 색 고르기 다시 쓰기(1.3, 사용자 요청) ----
   // 확장이 따로 둔 색 칸(그라데이션 끝 색, 필터 외곽선·그림자 색)은 브라우저 기본 색 칸 대신 엔트리 그림판 색 칸과 같은 모양으로 그리고,
-  // 누르면 엔트리 색 고르기 창(EntryTool.ColorPicker — 엔트리 그림판 채우기·윤곽선 색이 띄우는 것과 같은 부품, 10-18 실험)을 띄운다.
+  // 누르면 엔트리 색 고르기 창(EntryTool.ColorPicker — 엔트리 그림판 채우기·윤곽선 색이 띄우는 것과 같은 부품, 실험)을 띄운다.
   // 색 칸 모양은 그림판 아래 막대의 ColorBox를 복제한다(엔트리 styled-components 이름은 빌드마다 바뀌어 직접 쓰지 않음). 아직 못 봤으면
   // 확장 칸으로 대신한다. 창 밖을 누르면 닫는다(필터 덮개가 누르기를 막아 엔트리 바깥 누르기 감지가 못 받으므로 캡처 단계에서 직접 봄).
   let colorBoxTemplate = null, entryPicker = null;
@@ -10223,10 +11466,16 @@
     face.querySelector('.color')?.classList.remove('multi');
     field.dataset.entryLook = String(!!template);
     field.append(face);
+    // 색 칸은 그 색 자체가 내용 — 화면 테마(다크 모드 확장 등)가 CSS 배경색을 바꿔도 고른 색이 보이게 같은 색 캔버스를 위에 덮는다
+    const box = face.querySelector('.color') || face;
+    const swatch = Object.assign(document.createElement('canvas'), { className: 'evr-color-swatch', width: 1, height: 1 });
+    box.append(swatch);
     field.setColor = color => {
       if (field.dataset.color === color) return;
       field.dataset.color = color;
-      (face.querySelector('.color') || face).style.background = color;
+      box.style.background = color;
+      const g = swatch.getContext('2d');
+      g.clearRect(0, 0, 1, 1); g.fillStyle = 'rgba(0, 0, 0, 0)'; g.fillStyle = color; g.fillRect(0, 0, 1, 1);
     };
     field.setColor(value);
     field.addEventListener('click', () => {
@@ -10286,7 +11535,49 @@
     rememberColorBox();
     if (entryPicker && !entryPicker.anchor.isConnected) closeEntryPicker();
   }
-  // ---- 그라데이션 도구(1.3, 사용자 요청 10-18 "영역 채우기 안에 그라데이션 하지 말고, 따로 별도의 도구로") ----
+  // ---- [원근] 도구 막대 단추(1.3.2, 사용자 요청 — [도구 ▾ → 원근]과 같은 일, 메뉴 쪽도 그대로 둠) ----
+  // 엔트리 도구 막대 맨 아래(엔트리 마지막 도구 다음 — 엔트리 도구 자리는 더 밀지 않음)에 엔트리 단추 모양으로 둔다. 누르면 켜고 끄는 스위치다 — 켜 있는
+  // 동안 엔트리 선택 도구 모서리가 Ctrl 없이도 원근이고 눌린 모양이다(엔트리 [선택]도 고른 채 — 선택 도구에 얹는 방식이라).
+  const perspectiveIcon = on => {
+    const line = on ? '#4F80FF' : '#979797', dot = on ? '#FFB500' : '#979797';
+    const corners = [[15, 11], [25, 11], [31.5, 29], [8.5, 29]].map(([x, y]) => `<circle cx="${x}" cy="${y}" r="2.25" fill="#FFF" stroke="${dot}" stroke-width="1.5"/>`).join('');
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40"><g fill="none" fill-rule="nonzero">' +
+      `<path d="M15 11h10l6.5 18h-23z" stroke="${line}" stroke-width="1.5" stroke-linejoin="round"/>${corners}</g></svg>`;
+    return `data:image/svg+xml;base64,${btoa(svg)}`;
+  };
+  // 도구 단추 그림은 켬/끔이 바뀔 때만 넣는다 — 화면 테마(다크 모드 확장 등)가 아이콘을 다시 칠해 주소를 바꿔 두면 되바꾸지 않는다
+  function setToolIcon(img, on, icon) {
+    if (img.dataset.evrIcon === String(on)) return;
+    img.dataset.evrIcon = String(on);
+    img.setAttribute('src', icon(on));
+  }
+  function ensurePerspectiveTool() {
+    const buttons = entryToolButtons(), last = buttons[buttons.length - 1];
+    let mine = document.querySelector('#entryPainter .evr-persp-tool');
+    if (!last || !toolLook.off) { mine?.remove(); return; }
+    if (!mine) {
+      mine = document.createElement('span');
+      mine.className = `${toolLook.off} evr-persp-tool`;
+      mine.setAttribute('role', 'button');
+      mine.title = '확장: 켜 두면 선택 도구로 고른 것의 모서리를 끌어 원근으로 기울이기(꺼 두어도 Ctrl을 누른 채 모서리를 끌면 원근) · ' +
+        'Shift = 맞은편 모서리도 같이(대칭) · 끌 때마다 되돌리기 한 칸';
+      const img = Object.assign(document.createElement('img'), { alt: '원근', draggable: false });
+      mine.append(img, document.createElement('br'), document.createTextNode('원근'));
+      mine.addEventListener('click', () => setPerspectiveOn(!perspectiveOn));
+    }
+    if (last.nextElementSibling !== mine) last.after(mine);
+    syncPerspectiveTool();
+  }
+  function syncPerspectiveTool() {
+    const mine = document.querySelector('#entryPainter .evr-persp-tool');
+    if (!mine || !toolLook.off) return;
+    const on = perspectiveOn && paintStore()?.getState()?.tool?.toolMode === 'SELECT';
+    const cls = `${on && toolLook.on ? toolLook.on : toolLook.off} evr-persp-tool`;
+    if (mine.className !== cls) mine.className = cls;
+    setToolIcon(mine.querySelector('img'), on, perspectiveIcon);
+    mine.setAttribute('aria-pressed', String(on));
+  }
+  // ---- 그라데이션 도구(1.3, 사용자 요청 — 영역 채우기와 따로 둔 도구) ----
   // 엔트리 도구 막대 [채우기] 바로 아래에 엔트리 단추와 같은 모양(같은 클래스, 40×40 아이콘, 엔트리 아이콘 색 규칙 — 보통 회색 #979797,
   // 고르면 파랑 #4F80FF + 주황 #FFB500)의 [그라데이션]을 둔다. 누르면 엔트리 채우기 도구를 고르고(시작 색 = 엔트리 채우기 색, 되돌리기·
   // 저장은 엔트리 채우기 그대로) 선으로 둘러싼 곳을 누른 채 끌어 그라데이션으로 칠한다(끌지 않고 누르면 한 색). 엔트리는 채우기를 고른
@@ -10302,7 +11593,9 @@
   };
   const toolLook = { on: null, off: null };
   let gradientToolHooked = false;
-  const entryToolButtons = () => [...document.querySelectorAll('#entryPainter .ToolButtonWrapper')].filter(button => !button.classList.contains('evr-grad-tool'));
+  // 엔트리가 그린 도구 단추만(React가 붙인 내부 표시가 있음) — 다른 확장이 복제해 넣은 단추·우리 단추는 없어, 모양 세기·자리 잡기에서 빠진다
+  const reactOwned = el => Object.keys(el).some(name => name.startsWith('__reactFiber$') || name.startsWith('__reactInternalInstance$'));
+  const entryToolButtons = () => [...document.querySelectorAll('#entryPainter .ToolButtonWrapper')].filter(reactOwned);
   function ensureGradientTool() {
     const buttons = entryToolButtons(), fill = buttons.find(button => button.innerText.trim() === '채우기');
     let mine = document.querySelector('#entryPainter .evr-grad-tool');
@@ -10343,7 +11636,7 @@
       // 엔트리 도구 단추를 누르면(채우기 포함) 그라데이션 도구를 끈다
       document.addEventListener('click', event => {
         const button = event.target.closest?.('#entryPainter .ToolButtonWrapper');
-        if (!button || button.classList.contains('evr-grad-tool') || !gradientFill.on) return;
+        if (!button || button.classList.contains('evr-grad-tool') || button.classList.contains('evr-persp-tool') || !gradientFill.on) return;
         gradientFill.on = false;
         cancelGradientDrag();
         setTimeout(() => {
@@ -10362,8 +11655,7 @@
     const on = gradientFill.on && isFill;
     const cls = `${on && toolLook.on ? toolLook.on : toolLook.off} evr-grad-tool`;
     if (mine.className !== cls) mine.className = cls;
-    const img = mine.querySelector('img'), src = gradientIcon(on);
-    if (img.getAttribute('src') !== src) img.setAttribute('src', src);
+    setToolIcon(mine.querySelector('img'), on, gradientIcon);
     mine.setAttribute('aria-pressed', String(on));
     // 엔트리 채우기 단추: 그라데이션일 때는 안 고름으로 보이게, 아니면 엔트리가 정한 대로. 되돌릴 때는 우리가 써 둔 글자가 그대로일 때만,
     // 엔트리 상태(저장소의 도구)가 채우기면 원래 글자로(엔트리는 도구가 바뀔 때만 단추를 다시 그려 우리 글자가 남을 수 있음 — 검토 지적)
@@ -10374,7 +11666,7 @@
       delete fill.dataset.evrLook;
       delete fill.dataset.evrSet;
     }
-    // 엔트리는 고른 도구의 아이콘도 색 아이콘으로 바꾼다 — 그라데이션일 때는 [채우기]를 회색 아이콘으로(사용자: "채우기 아이콘도 골라진 듯").
+    // 엔트리는 고른 도구의 아이콘도 색 아이콘으로 바꾼다 — 그라데이션일 때는 [채우기]를 회색 아이콘으로(채우기가 골라진 것처럼 보이지 않게).
     // 회색 아이콘은 엔트리가 안 고른 채우기에 쓰는 그림을 배워 두고, 아직 못 봤으면 색 아이콘의 파랑·주황을 엔트리 회색으로 바꿔 만든다
     const fillImg = fill.querySelector('img');
     if (fillImg) {
@@ -10391,7 +11683,7 @@
         delete fill.dataset.evrIconSet;
       }
     }
-    // 아래 막대 왼쪽 도구 이름(엔트리 ToolTitleComp — 엔트리는 채우기로 알고 있어 '채우기')도 그라데이션으로(사용자: "아래 막대가 '채우기'").
+    // 아래 막대 왼쪽 도구 이름(엔트리 ToolTitleComp — 엔트리는 채우기로 알고 있어 '채우기')도 그라데이션으로.
     // 엔트리가 도구를 바꾸며 다시 그릴 때 꼬이지 않게 글자 칸은 바꿔 끼우지 않고 안의 글자·그림만 고친다
     const title = document.querySelector('#entryPainter .ToolTitleComp');
     const titleImg = title?.querySelector('img'), titleText = title && [...title.querySelectorAll('div')].map(div => div.firstChild).find(node => node?.nodeType === 3);
@@ -10416,7 +11708,7 @@
       return `${head},${btoa(atob(body).replace(/#4F80FF|#FFB500/gi, '#979797'))}`;
     } catch { return src; }
   }
-  // ---- 그라데이션 창(1.3, 사용자 요청 "그라데이션은 따로 창으로"): 그라데이션 도구를 고르면 그림 칸 오른쪽 아래에 뜬다. 종류·끝 색·
+  // ---- 그라데이션 창(1.3, 사용자 요청): 그라데이션 도구를 고르면 그림 칸 오른쪽 아래에 뜬다. 종류·끝 색·
   // 끝 투명·단계를 여기서 고르고, 머리를 끌어 옮긴다(옮긴 자리는 이 페이지 동안 기억). [×] = 그라데이션 도구 끄기(채우기로).
   let gradientWinPos = null;
   function ensureGradientWindow(show) {
@@ -10518,7 +11810,7 @@
   }
   // ---- 그라데이션 채우기(1.3, 사용자 요청 3명) ----
   // 그라데이션 도구에서 누른 채 끌어 방향을 정한다(포토샵·크리타 그라데이션 도구와 같은 끌기, Shift = 15° 단위). 칠하는 범위는 포토샵·
-  // 일러스트레이터 방식(사용자 결정 10-18 — 선으로 둘러싼 곳만 칠하니 "달고나 틀로 잘라 낸 것처럼 잘린다"): 비트맵 = 지금 레이어 전체(작업
+  // 일러스트레이터 방식(사용자 결정 — 선 안쪽만 칠하던 방식은 경계에서 잘려 보였음): 비트맵 = 지금 레이어 전체(작업
   // 영역)에 덮어 칠함(투명 잠금이면 칠해진 화소의 색만), 벡터 = 누른 도형의 칠 전체(도형 모양 그대로), 빈 곳이면 그림 칸 크기 사각형을 맨
   // 아래(배경)에 — 맨 위면 그림을 다 덮으므로(내 결정). 끌지 않고 누르면 아무것도 안 한다. 시작 색 = 엔트리 채우기 색, 끝 색 = 확장 끝 색(투명이면 시작 색을
   // 투명하게 — 캔버스 그라데이션은 미리 곱하지 않은 색으로 섞여 흰 투명으로 가면 중간이 뿌옇게 됨). 색 계산은 표준 그대로: 벡터 = paper
@@ -10633,10 +11925,10 @@
     let raster = parts?.layer.children[0];
     if (!(raster instanceof ep.paper.Raster) || !raster.width || !raster.height) return null;
     // 캔버스를 키우면 그림(엔트리가 만든 무대 크기·불러온 그림 크기)보다 칸이 넓다. 그림 밖 칸을 누르면 그림을 칸만큼 넓힌 뒤 채운다 —
-    // 예전엔 엔트리 채우기로 넘겨 아무것도 칠해지지 않았다(재현 2026-10-16: 1920×1080 칸, 그림 왼쪽 빈 곳).
+    // 예전엔 엔트리 채우기로 넘겨 아무것도 칠해지지 않았다(재현: 1920×1080 칸, 그림 왼쪽 빈 곳).
     if (!raster.bounds.contains(event.point)) {
       // 픽셀 아트 모양은 넓히지 않는다(스프라이트 밖을 잘못 눌러 그림이 칸 전체가 되고 저장 때 k배로 아주 커짐 — 검토로 찾음). 칸 밖도.
-      // 이때는 엔트리 채우기로도 넘기지 않는다(엔트리는 그림 밖 점을 범위 검사 없이 써서 엉뚱한 곳을 칠함 — 재현 2026-10-16).
+      // 이때는 엔트리 채우기로도 넘기지 않는다(엔트리는 그림 밖 점을 범위 검사 없이 써서 엉뚱한 곳을 칠함 — 재현).
       if (pixelOf(window.Entry?.playground?.object?.selectedPicture) || !parts.stage?.contains(event.point) || !plainRaster(raster)) return FILL_SKIP;
       raster = fillRasterToStage({ layer: parts.layer, stage: parts.stage, ep }) || raster;
       delete raster.__evrSigBefore; // 넓히기 전 요약은 뼈대 열기용 — 곧 화소를 칠하므로 버린다(남으면 다음 자세 그리기가 칠한 것을 버림)
@@ -10648,8 +11940,8 @@
     const perUnit = w / raster.bounds.width; // 그림 좌표 1당 화소
     const image = raster.getImageData(new ep.paper.Rectangle(0, 0, w, h)), d = image.data;
     // 선 밑으로 1.5 넓히기는 투명 잠금이면 하지 않는다: 잠금은 칠해진 화소 색만 바꾸므로 넓힌 띠에 든 선 안쪽 가장자리까지 색이
-    // 바뀌었다(검토로 찾음 2026-10-16 — 잠금 없을 때는 불투명한 선 화소를 건너뛰어 괜찮음)
-    // 경계(선)는 보이는 레이어를 모두 겹친 그림에서 찾는다(사용자 결정 10-18 — 레이어가 여럿이면 지금 레이어만 보고 찾아 선이 다른 레이어에
+    // 바뀌었다(검토로 찾음 — 잠금 없을 때는 불투명한 선 화소를 건너뛰어 괜찮음)
+    // 경계(선)는 보이는 레이어를 모두 겹친 그림에서 찾는다(사용자 결정 — 레이어가 여럿이면 지금 레이어만 보고 찾아 선이 다른 레이어에
     // 있으면 바깥까지 칠해졌음, 포토샵·이비스페인트의 '모든 레이어 참조'와 같은 방식). 칠은 지금 레이어에.
     const bounds = visibleLayersPixels(ep, raster, w, h) || d;
     const region = fillRegion(bounds, w, h, sx, sy, regionFill.gap * perUnit, pixelPen.alphaLock ? 0 : FILL_EXPAND * perUnit);
@@ -10673,7 +11965,7 @@
     const q = (sy * w + sx) * 4;
     return `rgba(${d[q]},${d[q + 1]},${d[q + 2]},${d[q + 3] / 255})`;
   }
-  // 누른 곳에 보이는 맨 위 도형. 칠해진 곳·선 위, 그리고 선만 있는 닫힌 도형의 안쪽(사용자 결정 10-19 — 엔트리 채우기와 같음).
+  // 누른 곳에 보이는 맨 위 도형. 칠해진 곳·선 위, 그리고 선만 있는 닫힌 도형의 안쪽(사용자 결정 — 엔트리 채우기와 같음).
   // 보이지 않는 곳은 대상이 아니다(검토 L: 확장 클리핑의 기준 밖·엔트리 클립 묶음의 틀 밖·작업 영역 밖에서 숨은 도형이 칠해졌음):
   // 숨김·불투명도 0·잠금·확장 도우미도 뺀다. 엔트리 그림판 안내선(선택 윤곽선 등)은 그림 층 밖이라 여기 없다.
   function gradientTargetAt(ep, layer, stage, point) {
@@ -10720,14 +12012,14 @@
     const parts = paintLayer(ep), P = ep.paper;
     if (!parts) return false;
     const target = gradientTargetAt(ep, parts.layer, parts.stage, point);
-    // 빈 곳은 칠하지 않는다(사용자 결정 10-19 — 예전엔 작업 영역 크기 배경 사각형을 깔아 저장 모양이 무대만 해졌음: 캐릭터 크기·충돌이 바뀜)
+    // 빈 곳은 칠하지 않는다(사용자 결정 — 예전엔 작업 영역 크기 배경 사각형을 깔아 저장 모양이 무대만 해졌음: 캐릭터 크기·충돌이 바뀜)
     if (!target) { toast('도형 위에서 끄세요 — 빈 곳에서는 칠하지 않습니다.', 2500); return false; }
     if (target.className === 'Raster') { toast('그림(이미지)에는 그라데이션을 칠할 수 없습니다 — 도형 위에서 끄세요.', 3000); return false; }
     // paper는 그라데이션 점을 그 항목의 부모 좌표로 읽는다(Color#toCanvasStyle이 항목 행렬을 거꾸로 건다 — 검토 L, 엔트리 번들 paper 확인).
     // 자기 변환을 가진 경로(엔트리 선 도구로 닫은 경로 = applyMatrix false, 옮기면 행렬에 남음)는 저장 SVG가 그 변환을 따로 적어 다시 열면 점이
     // 어긋나므로 먼저 변환을 점에 반영한다(다시 연 뒤와 같은 상태).
     // 돌리거나 늘린 글상자·SVG 도형(자기 변환이 남는 항목)도 칠한다 — 저장 SVG에서는 그 요소의 좌표로 읽히므로 저장 때 바꿔 쓴다
-    // (hookGradientSvgSpace — 10-19, 예전엔 안내만 띄움)
+    // (hookGradientSvgSpace — 예전엔 안내만 띄움)
     if ((target.className === 'Path' || target.className === 'CompoundPath') && !target.applyMatrix && !target.matrix.isIdentity()) target.applyMatrix = true;
     const into = at => target.parent ? target.parent.globalToLocal(at) : at;
     target.fillColor = gradientPaperColor(P, tool.fillColor, into(grad.start), into(grad.end));
@@ -11067,10 +12359,10 @@
   }
   // 틀의 칠·선: paper는 clipMask를 켜면 틀과 그 안 모든 도형의 칠·선을 지운다(Item#setClipMask → setFillColor(null), 묶음이면 자식까지).
   // SVG clipPath에도 칠이 안 남는다. 예전엔 틀 자신 것만 적어 둬, 묶음(엔트리봇 조각 등)을 틀로 했다 풀면 안 도형 색이 모두 사라졌다
-  // (사용자 제보 "클리핑을 풀면 그림이 사라짐" — 실제 엔트리 재현). 틀과 그 안 항목마다 적어 두고 되살린다(위 항목부터 — 묶음 색을 먼저 칠한 뒤
+  // (실제 엔트리 재현). 틀과 그 안 항목마다 적어 두고 되살린다(위 항목부터 — 묶음 색을 먼저 칠한 뒤
   // 자식 색으로 덮음).
   // 색은 글(CSS)로, 그라데이션은 정지점·점 자리로 적는다(저장 SVG의 data에도 남음). 예전엔 그라데이션을 빼고 적어, 그라데이션 칠한 도형을
-  // 틀로 했다 풀면 칠이 사라졌다(10-19 찾음). 색 글은 rgba로 적는다 — 16진 글(toCSS(true))은 투명도를 버려, 끝이 투명한 그라데이션·반투명
+  // 틀로 했다 풀면 칠이 사라졌다. 색 글은 rgba로 적는다 — 16진 글(toCSS(true))은 투명도를 버려, 끝이 투명한 그라데이션·반투명
   // 틀이 풀면 불투명해졌다(검토 M, 시험 재현). 예전에 적은 16진 글도 그대로 읽힌다.
   const maskCss = color => {
     if (!color) return null;
@@ -11082,7 +12374,7 @@
   const maskColorOf = (P, value) => typeof value === 'string' ? new P.Color(value) : new P.Color({
     gradient: { stops: value.gradient.stops.map(([css, offset]) => new P.GradientStop(new P.Color(css), offset)), radial: value.gradient.radial },
     origin: value.origin, destination: value.destination, ...(value.highlight ? { highlight: value.highlight } : {}) });
-  // 적어 둔 틀 색에 색 필터를 건다(벡터 필터 — 틀은 칠이 지워져 있어 적어 둔 색에 걸어야 [마스크 풀기] 뒤에도 필터 색, 10-19 고침)
+  // 적어 둔 틀 색에 색 필터를 건다(벡터 필터 — 틀은 칠이 지워져 있어 적어 둔 색에 걸어야 [마스크 풀기] 뒤에도 필터 색)
   function filterMaskStyle(P, style, css) {
     const one = value => {
       if (!value) return value;
@@ -11149,8 +12441,8 @@
     if (!saveEntryHistory(ep)) console.warn('[entry-vector-rig] 마스크 풀기: 되돌리기 기록을 남기지 못함');
   }
   // 엔트리 "그룹 해제"(도구 막대 단추·Ctrl+G)는 잘라 보이는 묶음을 풀 때 틀을 버린다(entry-paint 260921 Un: clipMask 아닌 자식만 꺼내고
-  // 묶음을 지움 — 외부 SVG의 잘라 보이기용). 확장이 만든 클리핑 마스크면 틀이 사용자 그림이라 통째로 사라졌다(사용자 제보 "클리핑을 풀면
-  // 그림이 사라짐", 실제 엔트리 재현). 고른 것이 확장 마스크 묶음(틀에 색 기록)이면 엔트리 대신 [마스크 풀기]로 푼다. 다른 묶음은 엔트리 그대로.
+  // 묶음을 지움 — 외부 SVG의 잘라 보이기용). 확장이 만든 클리핑 마스크면 틀이 사용자 그림이라 통째로 사라졌다(실제 엔트리 재현).
+  // 고른 것이 확장 마스크 묶음(틀에 색 기록)이면 엔트리 대신 [마스크 풀기]로 푼다. 다른 묶음은 엔트리 그대로.
   let ungroupHooked = false;
   // 엔트리 [그룹 해제](Un)는 자식 행렬에 묶음 행렬을 붙여 모양만 옮기고 칠은 옮기지 않는다(t.matrix.prepend(e.matrix) → transform(null) —
   // 번들 확인). paper는 그라데이션 점을 항목의 부모 좌표로 읽으므로, 옮겨 둔 엔트리 묶음 안 도형의 그라데이션이 풀고 나면 묶음을 옮긴 만큼
@@ -11190,7 +12482,7 @@
     ungroupHooked = true;
     const take = event => {
       const ep = window.Entry?.playground?.painter?.entryPaint;
-      // 기준점 상자(확장 도우미 묶음)만 골려 있으면 풀지 않는다 — 풀면 상자가 1% 점 네 개의 보통 도형이 되어 그림·저장에 섞였다(10-19 시험 중 찾음)
+      // 기준점 상자(확장 도우미 묶음)만 골려 있으면 풀지 않는다 — 풀면 상자가 1% 점 네 개의 보통 도형이 되어 그림·저장에 섞였다(시험 중 찾음)
       const picked = ep?.mode === 'VECTOR' ? selectedPaintItems(ep) : [];
       if (picked.length === 1 && isLayerHelper(picked[0])) {
         event.preventDefault(); event.stopImmediatePropagation();
@@ -11253,16 +12545,18 @@
       ensureLoadHook(painter);
       try { ensureSvgIdFix(painter); } catch (error) { console.warn('[entry-vector-rig] SVG 이름 겹침', error); }
       try { watchVectorPick(); } catch (error) { console.warn('[entry-vector-rig] 레이어 창 고른 줄', error); }
+      try { watchOpacityBox(); } catch (error) { console.warn('[entry-vector-rig] 투명도 상자', error); }
       try { ensurePainterNav(painter); } catch (error) { console.warn('[entry-vector-rig] 편집기 이동·확대', error); }
       try { ensureSmoothBrush(painter); ensureBrushOptions(painter); }
       catch (error) { console.warn('[entry-vector-rig] 부드러운 붓', error); }
       try { ensureSelectKeepsAlpha(painter); } catch (error) { console.warn('[entry-vector-rig] 선택 반투명 지키기', error); }
-      try { ensureRegionFill(painter); ensureFillOptions(painter); ensureGradientTool(); }
+      try { ensureRegionFill(painter); ensureFillOptions(painter); ensureGradientTool(); ensurePerspectiveTool(); }
       catch (error) { console.warn('[entry-vector-rig] 영역 채우기', error); }
       try { ensurePixelPen(painter); ensurePixelPenOptions(painter); }
       catch (error) { console.warn('[entry-vector-rig] 사각 펜·투명 잠금', error); }
       try { normalizeVectorLayers(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 벡터 레이어 정리', error); }
       try { checkFilterPanel(painter); } catch (error) { console.warn('[entry-vector-rig] 필터 창', error); }
+      try { watchPerspective(); } catch (error) { console.warn('[entry-vector-rig] 원근', error); }
       try { refreshLayers(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 레이어', error); }
       try { fixStrayClipMasks(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 클리핑 마스크 정리', error); }
       try { healEntryOutlines(painter.entryPaint); } catch (error) { console.warn('[entry-vector-rig] 선택 윤곽선 맞추기', error); }
@@ -11296,10 +12590,11 @@
     restorePixelFileurls();
     try { ownPixelPictures(); } catch (error) { console.warn('[entry-vector-rig] 모양 자기 파일', error); }
     try { hookLoadRepair(); } catch (error) { console.warn('[entry-vector-rig] 모양 주소 잇기', error); }
+    try { hookPictureClone(); } catch (error) { console.warn('[entry-vector-rig] 모양 복제', error); }
     try { hookDraftMenu(); } catch (error) { console.warn('[entry-vector-rig] 그림 임시저장 메뉴', error); }
     try { checkEntryPicker(); } catch (error) { console.warn('[entry-vector-rig] 엔트리 색 고르기 창', error); }
     // 모양을 바꾸는 틈(context()가 비어 있음)에는 십자·뼈대 버튼·도구 막대를 지우지 않고 그대로 둔다 — 지웠다 다시 만들면 켜 둔
-    // "그림 전체 이동" 같은 모드가 풀렸다(검토로 찾음 2026-10-16)
+    // "그림 전체 이동" 같은 모드가 풀렸다(검토로 찾음)
     if (!pictureSwitching()) {
       if (c) tidyPixelPainter(c);
       refreshPivotUI(c);
@@ -11345,6 +12640,8 @@
         if (selected) openCanvasDialog(selected);
       }, { class: 'evr-tool evr-canvas-open',
         title: '그림판 크기를 960×540보다 크게(최대 4096) · 무한 배경(가로·세로로 이어지는 그림) 그리기' });
+      const perspective = button('원근', () => setPerspectiveOn(!perspectiveOn), { class: 'evr-tool evr-perspective-open',
+        title: '켜 두면 선택 도구로 고른 것의 모서리를 끌어 원근으로 기울이기(꺼 두어도 Ctrl을 누른 채 모서리를 끌면 원근) · Shift = 맞은편 모서리도 같이(대칭)' });
       const align = button('중심 맞추기', () => runButton(align, async () => {
         const selected = context();
         if (selected) await openCenterDialog(selected);
@@ -11389,7 +12686,7 @@
         if (session) close();
         else { const c = context(); if (c) open(c, header); }
       }, { class: 'evr-tool evr-bone-menu', 'aria-pressed': 'false', title: '뼈대 모드(벡터 모양)' });
-      list.append(bone, pixel, split, rename, canvasSize, arrange, align, center, onion, pin);
+      list.append(bone, pixel, split, rename, canvasSize, perspective, arrange, align, center, onion, pin);
       // 접힌 목록에서 하나를 고르면 목록을 닫는다(버튼 동작이 먼저 실행된 뒤).
       list.addEventListener('click', () => { tools.dataset.open = 'false'; });
       tools.append(more, list);
@@ -11447,10 +12744,13 @@
     if (tools.dataset.boneInMenu !== String(narrow)) tools.dataset.boneInMenu = String(narrow);
   }
   setInterval(refresh, 500);
-  // 엔트리의 "비트맵 | 벡터" 버튼을 누르면 뼈대 모드에서 나온다(묶음 안의 버튼이면 무엇이든).
-  // 접힌 도구 목록은 바깥을 누르면 닫는다.
+  // 엔트리의 "비트맵 | 벡터" 버튼을 누르면 뼈대 모드에서 나온다(묶음 안의 버튼이면 무엇이든). 잡기 단계에서 닫아 엔트리가 그 누르기를
+  // 처리하기 전(모드를 바꾸기 전 그림)에 뼈대 작업을 기록한다.
   document.addEventListener('click', event => {
     if (session && event.target.closest?.('#entryPainter .modeSpace button')) close();
+  }, true);
+  // 접힌 도구 목록은 바깥을 누르면 닫는다.
+  document.addEventListener('click', event => {
     const tools = document.querySelector('#entryPainter .evr-tools[data-open="true"]');
     if (tools && !tools.contains(event.target)) tools.dataset.open = 'false';
     // 오브젝트 추가하기 창: 엔트리 탭을 누르면 우리 탭을 내려 놓고(엔트리가 화면을 바꿈), 우리 탭이
